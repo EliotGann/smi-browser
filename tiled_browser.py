@@ -546,25 +546,66 @@ def stream_fields(run, stream: str = "primary") -> dict[str, tuple]:
 
 def stream_fields_fast(run, stream: str = "primary"):
     """
-    Like stream_fields but also returns the already-read xarray Dataset
-    so callers can avoid a second .read().  Returns (fields_dict, dataset).
+    Like stream_fields but also returns the already-read scalar DataFrame
+    so callers can avoid a second .read().
+    Returns (fields_dict, dataset_or_dataframe).
     If the stream cannot be read, returns ({}, None).
+
+    Uses the tiled ``node.base`` container to read the ``internal`` table
+    (scalars only) and discover image arrays separately — no bulk image
+    download.
     """
     try:
         node = run[stream]
     except Exception:
         return {}, None
 
+    # Prefer .base which exposes the raw REST structure:
+    #   base['internal']  → DataFrameClient (scalars)
+    #   base['<det>_image'] → ArrayClient (images)
+    base = getattr(node, "base", None)
+    if base is not None:
+        try:
+            fields = {}
+            df = None
+            for key, child in base.items():
+                ctype = type(child).__name__
+                if ctype == "DataFrameClient":
+                    # Scalar table — read it (cheap, no images)
+                    df = child.read()
+                    for col in df.columns:
+                        fields[col] = (len(df),)
+                elif ctype == "ArrayClient":
+                    fields[key] = child.structure().shape
+                else:
+                    try:
+                        fields[key] = child.structure().shape
+                    except Exception:
+                        pass
+            return fields, df
+        except Exception as exc:
+            log.warning("stream_fields_fast: base read failed for %s: %s", stream, exc)
+
+    # Fallback: get shapes via structure metadata, read scalars individually
     try:
-        ds = node.read()
-        fields = {}
-        for key in ds:
-            arr = ds[key]
-            fields[key] = tuple(arr.shape) if hasattr(arr, "shape") else ()
-        return fields, ds
+        fields = {key: child.structure().shape for key, child in node.items()}
     except Exception as exc:
-        log.warning("stream_fields_fast: bulk read failed for %s: %s", stream, exc)
+        log.warning("stream_fields_fast: structure failed for %s: %s", stream, exc)
         return {}, None
+
+    import xarray as xr
+    scalar_keys = [k for k, sh in fields.items() if len(sh) < IMAGE_NDIM_THRESHOLD]
+    if not scalar_keys:
+        return fields, None
+
+    arrays = {}
+    for key in scalar_keys:
+        try:
+            arrays[key] = np.asarray(node[key].read())
+        except Exception:
+            pass
+    ds = xr.Dataset({k: (["dim_0"], v) for k, v in arrays.items()}) if arrays else None
+    return fields, ds
 
 
 IMAGE_NDIM_THRESHOLD = 3  # ndim >= 3 → treat as image stack
@@ -681,29 +722,52 @@ def fetch_scalars(
     """
     Read all scalar (non-image) fields for a stream.
 
-    Uses a single bulk .read() to get the data and classify fields locally,
-    avoiding the costly per-field .structure() calls.
-
     Parameters
     ----------
     run : tiled run node
     stream : str
     fields : list or None
         Subset of fields to return.  None → all scalars.
-    _dataset : xarray.Dataset or None
-        If the caller already has a .read() result (e.g. from
+    _dataset : xarray.Dataset, pandas.DataFrame, or None
+        If the caller already has a read result (e.g. from
         stream_fields_fast), pass it here to avoid a second read.
     """
+    import pandas as pd
+
     if _dataset is not None:
         ds = _dataset
     else:
-        try:
-            ds = run[stream].read()
-        except Exception as exc:
-            log.warning("fetch_scalars: bulk read failed for %s: %s", stream, exc)
-            return {}
+        # Try the fast .base path first
+        node = run[stream]
+        base = getattr(node, "base", None)
+        if base is not None:
+            try:
+                for child in base.values():
+                    if type(child).__name__ == "DataFrameClient":
+                        ds = child.read()
+                        break
+                else:
+                    ds = node.read()
+            except Exception as exc:
+                log.warning("fetch_scalars: read failed for %s: %s", stream, exc)
+                return {}
+        else:
+            try:
+                ds = node.read()
+            except Exception as exc:
+                log.warning("fetch_scalars: bulk read failed for %s: %s", stream, exc)
+                return {}
 
     result = {}
+    # Handle pandas DataFrame (from .base['internal'])
+    if isinstance(ds, pd.DataFrame):
+        for key in ds.columns:
+            if fields is not None and key not in fields:
+                continue
+            result[key] = np.asarray(ds[key])
+        return result
+
+    # Handle xarray Dataset or similar
     for key in ds:
         arr = ds[key]
         if not hasattr(arr, "shape"):
