@@ -1,0 +1,30 @@
+[project]
+name = "smi-tiled-browser"
+description = "Interactive browser for SMI beamline data on the NSLS-II Tiled catalog"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[dependencies]
+python = "3.11.*"
+numpy = ">=1.26,<3"
+xarray = ">=2025.6,<2027"
+pandas = ">=2.0,<3"
+matplotlib = ">=3.9,<4"
+bokeh = ">=3.9,<4"
+panel = ">=1.8,<2"
+scipy = ">=1.11"
+pyfai = ">=2024.9"
+tiled = "*"
+bluesky-tiled-plugins = "*"
+httpx = "*"
+
+[pypi-dependencies]
+# Local editable install of PyHyperScattering from the feature branch.
+# To switch to a released version:  pyhyperscattering = ">=0.2"
+# To pin to a GitHub fork:
+#   pyhyperscattering = { git = "https://github.com/YOURFORK/PyHyperScattering.git", branch = "feature/smi-tiled-loader" }
+pyhyperscattering = { path = "../../PyHyperScattering", editable = true }
+
+[tasks]
+serve = "panel serve smi_app.py --show --autoreload"
+check = "python -c \"import tiled_browser; print('OK')\""
