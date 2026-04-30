@@ -58,18 +58,43 @@ pn.extension("tabulator", sizing_mode="stretch_width", notifications=True)
 # ---------------------------------------------------------------------------
 
 PAGE_SIZE = 25
-DEFAULT_TILED_URI = "https://tiled.nsls2.bnl.gov"
-DEFAULT_CATALOG = "smi/migration"
 
-# Processing defaults
-DEFAULT_N_Q = 2000
+# Canonical defaults & helpers are owned by PyHyperScattering.smi_defaults.
+# Importing it triggers PyHyperScattering/__init__.py once (which pulls in
+# the heavy integrators), but we need LOADER_DEFAULTS at widget-construct
+# time anyway, so eat the cost here rather than mirroring constants.
+from PyHyperScattering import smi_defaults as smid
+
+DEFAULT_TILED_URI = smid.DEFAULT_TILED_URI
+DEFAULT_CATALOG = smid.DEFAULT_CATALOG
+DEFAULT_SAXS_MASK_NAME = smid.DEFAULT_SAXS_MASK_NAME
+DEFAULT_WAXS_MASK_NAME = smid.DEFAULT_WAXS_MASK_NAME
+
+# Detector-name classification (kept as module aliases for legacy usage).
+SAXS_DETECTOR_NAMES = smid.SAXS_DETECTOR_NAMES
+WAXS_DETECTOR_NAMES = smid.WAXS_DETECTOR_NAMES
+
+# Loader-side calibrated defaults (frozen dataclass exposed by PyHyper).
+_LD = smid.LOADER_DEFAULTS
+DEFAULT_SAXS_ROW_DELTA = _LD.saxs_row_delta_px
+DEFAULT_SAXS_COL_DELTA = _LD.saxs_col_delta_px
+DEFAULT_WAXS_ROW_DELTA = _LD.waxs_row_delta_px
+DEFAULT_WAXS_COL_DELTA = _LD.waxs_col_delta_px
+DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
+
+# Processing defaults  (UI-side; these mirror the upstream PyHyper defaults
+# so the widgets show meaningful numbers even before any override.  When a
+# widget value still equals its default, _on_process passes None so the
+# upstream loader supplies its own calibrated default.)
+DEFAULT_N_Q = 2000          # PyHyper default is 1000; smi-browser used 2000
 DEFAULT_N_CHI = 360
-DEFAULT_SAXS_MASK = "masks/pil2M_mask_polygons.json"
-DEFAULT_WAXS_MASK = "masks/900KW_mask_polygons.json"
-
-# Known SMI detector names for SAXS/WAXS classification
-SAXS_DETECTOR_NAMES = {"pil2m", "pilatus2m", "saxs"}
-WAXS_DETECTOR_NAMES = {"900kw", "waxs"}
+DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
+DEFAULT_WAXS_MASK = ""
+DEFAULT_DEZINGER = 3000.0
+DEFAULT_INCIDENT_ANGLE = 0.0
+DEFAULT_THETA_OFFSET = -0.5
+DEFAULT_N_QXY = 500
+DEFAULT_N_QZ = 500
 
 # Common metadata keys for Like search (user can also type custom keys)
 COMMON_SEARCH_KEYS = [
@@ -428,22 +453,110 @@ def _scalar_stream_to_frame(run, stream: str) -> pd.DataFrame:
     return _scalars_to_dataframe(scalar_data)
 
 
-def _is_waxs_field(field: str) -> bool:
-    """Return True if the field name looks like a WAXS detector."""
-    return "900kw" in field.lower()
+def _detector_for_field(field: str) -> str | None:
+    """Classify a detector field name as ``'saxs'`` / ``'waxs'`` / ``None``."""
+    return smid.classify_detector_field(field)
 
 
 def _orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
-    """Rotate WAXS images CCW 270° then flip LR; leave others unchanged."""
-    if _is_waxs_field(field):
-        arr = np.rot90(arr, k=3)   # CCW 270° (= CW 90°)
-        arr = np.fliplr(arr)       # flip around vertical axis
-    return arr
+    """Re-orient detector frames for display via the canonical PyHyper transform."""
+    detector = _detector_for_field(field)
+    if detector is None:
+        return arr
+    return smid.orient_frame_for_display(arr, detector)
+
+
+# ---------------------------------------------------------------------------
+# Polygon mask helpers (overlay + edit on the Explore image preview)
+#
+# All schema parsing and orientation math lives in PyHyperScattering's
+# smi_defaults module.  The browser keeps only the thin projection between
+# the *normalized* mask dict (PyHyper's canonical shape) and Bokeh's
+# (xs, ys, names, kinds) ColumnDataSource columns.
+# ---------------------------------------------------------------------------
+
+
+def _normalized_mask_to_xs_ys(
+    mask: dict,
+    field: str | None = None,
+    raw_shape: tuple[int, int] | None = None,
+) -> tuple[list, list, list, list]:
+    """Project a normalized mask dict into Bokeh patches columns.
+
+    Input is the dict returned by ``smid.load_mask_polygons`` (always shaped
+    ``{image_shape, static_regions, beamstops}`` in raw detector indexing).
+    When ``field`` and ``raw_shape`` are given, vertices are transformed
+    via ``smid.orient_polygon_xy`` so the polygons overlay the *displayed*
+    image.
+    """
+    xs, ys, names, kinds = [], [], [], []
+    detector = _detector_for_field(field) if field else None
+
+    def _xy(col_raw: float, row_raw: float) -> tuple[float, float]:
+        if detector is not None and raw_shape is not None:
+            return smid.orient_polygon_xy(col_raw, row_raw, detector, raw_shape)
+        return float(col_raw), float(row_raw)
+
+    for kind, bucket in (("static", "static_regions"), ("beamstop", "beamstops")):
+        for name, verts in (mask.get(bucket) or {}).items():
+            if not verts:
+                continue
+            xl, yl = [], []
+            for v in verts:
+                x, y = _xy(v[0], v[1])
+                xl.append(x)
+                yl.append(y)
+            xs.append(xl)
+            ys.append(yl)
+            names.append(str(name))
+            kinds.append(kind)
+    return xs, ys, names, kinds
+
+
+def _xs_ys_to_normalized_mask(
+    xs, ys, names, kinds,
+    field: str | None = None,
+    raw_shape: tuple[int, int] | None = None,
+) -> dict:
+    """Inverse projection — build a normalized mask dict from Bokeh columns."""
+    out: dict = {
+        "image_shape": list(raw_shape) if raw_shape else None,
+        "static_regions": {},
+        "beamstops": {},
+    }
+    detector = _detector_for_field(field) if field else None
+    counters = {"static": 0, "beamstop": 0}
+    for px, py, name, kind in zip(xs, ys, names, kinds):
+        if not px or not py:
+            continue
+        verts = []
+        for x, y in zip(px, py):
+            if detector is not None and raw_shape is not None:
+                col, row = smid.orient_polygon_xy_inverse(
+                    x, y, detector, raw_shape)
+            else:
+                col, row = float(x), float(y)
+            verts.append([col, row])
+        if not name:
+            counters[kind] += 1
+            name = f"{kind}_{counters[kind]}"
+        bucket = "static_regions" if kind == "static" else "beamstops"
+        out[bucket][name] = verts
+    return out
+
+
+def _default_mask_path_for(detector: str):
+    """Resolve the bundled default mask path for a detector."""
+    return (smid.default_waxs_mask_path() if detector == "waxs"
+            else smid.default_saxs_mask_path())
 
 
 def _thumbnail_figure(arr, title):
     from bokeh.plotting import figure as bk_figure
-    from bokeh.models import LogColorMapper, ColorBar, LinearColorMapper, ColumnDataSource
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
+        PolyDrawTool, PolyEditTool,
+    )
 
     h, w = arr.shape
     finite = arr[np.isfinite(arr) & (arr > 0)]
@@ -476,6 +589,55 @@ def _thumbnail_figure(arr, title):
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
     p.xaxis.axis_label = "col (px)"
     p.yaxis.axis_label = "row (px)"
+
+    # ----- Polygon mask overlay (always present; populated/hidden by callers)
+    mask_source = ColumnDataSource(
+        data=dict(xs=[], ys=[], name=[], kind=[],
+                  fill_color=[], line_color=[]),
+    )
+    mask_renderer = p.patches(
+        xs="xs", ys="ys",
+        fill_color="fill_color", fill_alpha=0.25,
+        line_color="line_color", line_width=2,
+        source=mask_source,
+    )
+    # Vertex source for PolyEditTool (shows draggable handles in edit mode)
+    vertex_source = ColumnDataSource(data=dict(x=[], y=[]))
+    vertex_renderer = p.scatter(
+        x="x", y="y", source=vertex_source,
+        size=8, color="white", line_color="black", line_width=1,
+    )
+    draw_tool = PolyDrawTool(renderers=[mask_renderer], num_objects=200)
+    edit_tool = PolyEditTool(renderers=[mask_renderer],
+                             vertex_renderer=vertex_renderer)
+    p.add_tools(draw_tool, edit_tool)
+
+    # ----- Dynamic-mask overlay (rasterised PyHyper mask, optional) -------
+    # Render as an RGBA image; alpha=0 for valid pixels, semi-transparent
+    # red for invalid pixels.  Populated by _render_dynamic_mask().
+    # image_rgba requires a 2D uint32 array (or a uint8 (h,w,4) view as uint32).
+    empty_rgba = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint32)
+    dyn_source = ColumnDataSource(
+        data=dict(image=[empty_rgba], x=[0], y=[0], dw=[w], dh=[h]),
+    )
+    dyn_renderer = p.image_rgba(
+        image="image", x="x", y="y", dw="dw", dh="dh", source=dyn_source,
+    )
+    dyn_renderer.visible = False
+
+    # Stash on image cache so the Explore controls can read/write it
+    _image_cache["mask_source"] = mask_source
+    _image_cache["mask_renderer"] = mask_renderer
+    _image_cache["draw_tool"] = draw_tool
+    _image_cache["edit_tool"] = edit_tool
+    _image_cache["image_height"] = h
+    _image_cache["image_width"] = w
+    _image_cache["dyn_source"] = dyn_source
+    _image_cache["dyn_renderer"] = dyn_renderer
+
+    # Initial visibility follows the Show-mask checkbox state
+    mask_renderer.visible = bool(w_mask_show.value)
+
     return p, source, mapper
 
 
@@ -493,11 +655,41 @@ def _update_image_in_place(arr, title):
         _image_cache["figure"] = fig
         _image_cache["source"] = source
         _image_cache["mapper"] = mapper
+        _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
+        # Auto-load the default mask if Show-mask is enabled (handles the
+        # initial render and detector switches).  Defer to the next tick
+        # so Bokeh has finished syncing the freshly-attached figure before
+        # we push polygon data into its mask source.
+        if w_mask_show.value:
+            def _deferred_reload():
+                try:
+                    _on_mask_reload(None)
+                except Exception as exc:
+                    log.warning("auto mask reload failed: %s", exc)
+            try:
+                doc = pn.state.curdoc
+                if doc is not None:
+                    doc.add_next_tick_callback(_deferred_reload)
+                else:
+                    _deferred_reload()
+            except Exception:
+                _deferred_reload()
         return
 
     h, w = arr.shape
     display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
+
+    # Reset axis ranges only when the *underlying* image dimensions change
+    # (e.g. switching detector/scan).  Comparing against fig.x_range.end
+    # would also fire after the user zooms, clobbering their zoom state.
+    cached_shape = _image_cache.get("fig_image_shape")
+    if cached_shape != (h, w):
+        fig.x_range.start = 0
+        fig.x_range.end = w
+        fig.y_range.start = 0
+        fig.y_range.end = h
+        _image_cache["fig_image_shape"] = (h, w)
 
     # Update color mapper range
     finite = arr[np.isfinite(arr) & (arr > 0)]
@@ -676,15 +868,18 @@ w_table = pn.widgets.Tabulator(
     show_index=False,
     sizing_mode="stretch_width",
     height=600,
-    configuration={"rowHeight": 22, "layout": "fitColumns"},
+    configuration={"rowHeight": 22, "layout": "fitColumns",
+                    "selectableRows": True},
     hidden_columns=["uid"],
     widths={"scan_id": 55, "n_steps": 40, "sample_name": 110, "plan_name": 60,
             "data_session": 65, "detectors": 75, "exit_status": 50, "time": 80},
     text_align="left",
     header_align="left",
+    disabled=True,
     stylesheets=[
         ":host .tabulator {font-size: 10px;}",
         ":host .tabulator .tabulator-header {font-size: 10px;}",
+        ":host .tabulator .tabulator-row {cursor: pointer;}",
     ],
 )
 
@@ -739,10 +934,52 @@ w_image_field = pn.widgets.Select(
 )
 # Linked 1D primary plot for the Explore tab
 w_explore_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=250)
+# Container that hides itself when the line plot has no data, so we don't
+# leave a tall empty band between the slider and the mask card.
+w_explore_plot_container = pn.Column(w_explore_plot, sizing_mode="stretch_width", visible=False)
+
+
+def _sync_explore_plot_visibility(*_):
+    w_explore_plot_container.visible = w_explore_plot.object is not None
+
+
+w_explore_plot.param.watch(_sync_explore_plot_visibility, "object")
 w_explore_x = pn.widgets.Select(name="X", options=[], width=120)
 w_explore_y = pn.widgets.MultiChoice(name="Y", options=[], width=300, max_items=6)
+
+# Mask overlay / edit controls (Explore tab)
+w_mask_show = pn.widgets.Checkbox(
+    name="Show static mask", value=True, width=130,
+)
+w_mask_dynamic = pn.widgets.Checkbox(
+    name="Show dynamic mask", value=False, width=150,
+)
+w_mask_edit = pn.widgets.Checkbox(
+    name="Edit mode", value=False, width=100,
+)
+w_mask_path = pn.widgets.TextInput(
+    name="Save / load path", value="", width=320,
+    placeholder="e.g. ~/my_pil2M_mask.json",
+)
+w_btn_mask_reload = pn.widgets.Button(
+    name="↻ Reload default", button_type="light", width=130,
+    description="Reload the bundled PyHyper default mask for this detector.",
+)
+w_btn_mask_save = pn.widgets.Button(
+    name="💾 Save", button_type="primary", width=80,
+    description="Save the current overlay polygons to the path on the left.",
+)
+w_btn_mask_use = pn.widgets.Button(
+    name="↪ Use in Process", button_type="success", width=140,
+    description="Copy the saved-mask path into the Process tab's mask field.",
+)
+w_mask_status = pn.pane.Markdown("", width=600)
+
 _image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
-                "figure": None, "source": None, "mapper": None}
+                "figure": None, "source": None, "mapper": None,
+                "mask_source": None, "mask_renderer": None,
+                "draw_tool": None, "edit_tool": None,
+                "mask_image_shape": None}
 
 
 def _render_image_frame(field, idx):
@@ -753,9 +990,15 @@ def _render_image_frame(field, idx):
     ds = _image_cache.get("dataset")
     frame = tb.fetch_frame(run, "primary", field, frame_idx=idx, _dataset=ds)
     if frame is not None:
+        # Capture raw detector shape *before* orientation so the polygon
+        # transform knows the original (rows, cols).
+        _image_cache["raw_shape"] = tuple(frame.shape)
         frame = _orient_frame(frame, field)
         _update_image_in_place(frame, f"primary/{field} frame {idx}")
         w_image_status.object = f"**primary/{field}** — frame {idx}"
+        # Refresh the dynamic mask overlay if enabled
+        if w_mask_dynamic.value:
+            _render_dynamic_mask(idx)
 
 
 def _on_image_slider(event):
@@ -774,21 +1017,262 @@ def _on_image_field(event):
         return
     _image_cache["field"] = field
     # Reset persistent figure so a new one is created for the new detector
+    # (different orientation / dimensions / mask).
     _image_cache["figure"] = None
     _image_cache["source"] = None
     _image_cache["mapper"] = None
+    _image_cache["fig_image_shape"] = None
     info = _detail_cache.get("primary_info")
     if info:
         shape = info["fields"].get(field, ())
         n = shape[0] if len(shape) >= 3 else 1
         _image_cache["n_frames"] = n
-        w_image_slider.end = max(0, n - 1)
         w_image_slider.value = 0
+        w_image_slider.end = max(0, n - 1)
     _render_image_frame(field, 0)
 
 
 w_image_slider.param.watch(_on_image_slider, "value")
 w_image_field.param.watch(_on_image_field, "value")
+
+
+# ---------------------------------------------------------------------------
+# Mask-overlay callbacks (Explore tab)
+# ---------------------------------------------------------------------------
+
+def _current_detector_kind() -> str:
+    field = w_image_field.value
+    return _detector_for_field(field) or "saxs" if field else "saxs"
+
+
+def _apply_mask_to_overlay(mask_dict: dict, *, source_label: str = ""):
+    """Push polygons from a normalized mask dict into the live overlay source.
+
+    The on-disk polygon coordinates are in *raw* detector indexing.  We
+    transform them to match the displayed (oriented) image via
+    ``_normalized_mask_to_xs_ys(field, raw_shape)``.
+    """
+    src = _image_cache.get("mask_source")
+    if src is None:
+        w_mask_status.object = (
+            "*Load a frame first — the overlay attaches to the image figure.*"
+        )
+        return
+
+    field = _image_cache.get("field")
+    raw_shape = _image_cache.get("raw_shape")
+    if raw_shape is None:
+        # Fall back to the mask file's own declaration so the overlay at
+        # least has *some* coordinate system (may be slightly off).
+        shape = mask_dict.get("image_shape")
+        raw_shape = tuple(shape) if shape else None
+
+    xs, ys, names, kinds = _normalized_mask_to_xs_ys(
+        mask_dict, field=field, raw_shape=raw_shape,
+    )
+    fill_colors = ["#888888" if k == "static" else "#ff5555" for k in kinds]
+    line_colors = ["#222222" if k == "static" else "#aa0000" for k in kinds]
+    src.data = dict(xs=xs, ys=ys, name=names, kind=kinds,
+                    fill_color=fill_colors, line_color=line_colors)
+    _image_cache["mask_image_shape"] = mask_dict.get("image_shape")
+    suffix = f" ({source_label})" if source_label else ""
+    w_mask_status.object = f"*Loaded {len(xs)} polygon(s){suffix}.*"
+
+
+def _on_mask_show(event):
+    """Toggle visibility of the mask overlay."""
+    renderer = _image_cache.get("mask_renderer")
+    if renderer is None:
+        if event.new:
+            w_mask_status.object = "*Load a frame first.*"
+        return
+    renderer.visible = bool(event.new)
+    if event.new and not renderer.data_source.data["xs"]:
+        # First show — auto-load default for current detector
+        _on_mask_reload(None)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic mask overlay (rasterised PyHyper mask, per-frame)
+# ---------------------------------------------------------------------------
+
+
+def _render_dynamic_mask(idx: int | None = None):
+    """Compute & push the per-frame dynamic mask into the overlay source."""
+    src = _image_cache.get("dyn_source")
+    renderer = _image_cache.get("dyn_renderer")
+    if src is None or renderer is None:
+        return
+    if not w_mask_dynamic.value:
+        renderer.visible = False
+        return
+
+    field = _image_cache.get("field")
+    if not field:
+        renderer.visible = False
+        return
+    detector = _detector_for_field(field)
+    if detector is None:
+        renderer.visible = False
+        return
+    raw_shape = _image_cache.get("raw_shape")
+    if raw_shape is None:
+        renderer.visible = False
+        return
+    if idx is None:
+        idx = int(w_image_slider.value or 0)
+
+    run = _ensure_run()
+    if run is None:
+        renderer.visible = False
+        return
+
+    try:
+        from PyHyperScattering.SMISWAXSIntegrator import mask_for_frame
+        mask = mask_for_frame(
+            run, idx, detector,
+            raw_shape=raw_shape,
+            orient_for_display=True,
+        )
+    except Exception as exc:
+        log.warning("dynamic mask build failed (%s): %s", detector, exc)
+        renderer.visible = False
+        return
+
+    h, w = mask.shape
+    # Build RGBA as (h,w,4) uint8, then view as uint32 for Bokeh.
+    rgba8 = np.zeros((h, w, 4), dtype=np.uint8)
+    invalid = ~mask
+    rgba8[invalid, 0] = 255   # R
+    rgba8[invalid, 3] = 110   # A (~43%)
+    rgba = np.ascontiguousarray(rgba8).view(dtype=np.uint32).reshape(h, w)
+
+    src.data = dict(image=[rgba], x=[0], y=[0], dw=[w], dh=[h])
+    renderer.visible = True
+
+
+def _on_mask_dynamic(event):
+    """Toggle visibility of the dynamic mask overlay."""
+    if event.new:
+        _render_dynamic_mask()
+        if _image_cache.get("dyn_renderer") is None:
+            w_mask_status.object = "*Load a frame first.*"
+    else:
+        renderer = _image_cache.get("dyn_renderer")
+        if renderer is not None:
+            renderer.visible = False
+
+
+def _on_mask_edit(event):
+    """Activate the PolyDraw tool so the user can draw new polygons.
+
+    PolyDraw is a *tap* tool (tap to add vertices, double-tap to finish);
+    PolyEdit is also added so users can switch via the toolbar icon.
+    """
+    fig = _image_cache.get("figure")
+    draw_tool = _image_cache.get("draw_tool")
+    edit_tool = _image_cache.get("edit_tool")
+    if fig is None or draw_tool is None:
+        w_mask_status.object = "*Load a frame first.*"
+        return
+    if event.new:
+        renderer = _image_cache.get("mask_renderer")
+        if renderer is not None and not renderer.visible:
+            w_mask_show.value = True
+        try:
+            # PolyDraw is a tap tool — don't touch active_drag (that would
+            # disable panning).  Activating it via active_tap arms the tool
+            # immediately so the user can start clicking.
+            fig.toolbar.active_tap = draw_tool
+        except Exception as exc:
+            log.warning("could not activate draw tool: %s", exc)
+        w_mask_status.object = (
+            "*Edit mode on. **Draw a new polygon**: tap to place each "
+            "vertex, double-tap to finish (or press Esc to cancel). "
+            "**Edit existing polygons**: click the PolyEdit icon "
+            "(square-with-handles) in the toolbar, tap a polygon, then "
+            "drag its vertices.*"
+        )
+    else:
+        try:
+            fig.toolbar.active_tap = "auto"
+        except Exception:
+            pass
+        w_mask_status.object = "*Edit mode off.*"
+
+
+def _on_mask_reload(_event):
+    """Reload the bundled PyHyper default mask for the current detector."""
+    detector = _current_detector_kind()
+    path = _default_mask_path_for(detector)
+    try:
+        mask = smid.load_mask_polygons(path)
+    except Exception as exc:
+        log.warning("mask load failed (%s): %s", path, exc)
+        mask = None
+    if not mask or not (mask.get("static_regions") or mask.get("beamstops")):
+        w_mask_status.object = f"*No default mask available for {detector.upper()}.*"
+        return
+    _apply_mask_to_overlay(mask, source_label=f"default {detector.upper()}")
+
+
+def _on_mask_save(_event):
+    """Save the current overlay polygons to JSON at w_mask_path."""
+    src = _image_cache.get("mask_source")
+    if src is None:
+        w_mask_status.object = "*Load a frame first.*"
+        return
+    path_str = (w_mask_path.value or "").strip()
+    if not path_str:
+        w_mask_status.object = "*Enter a save path first.*"
+        return
+
+    from pathlib import Path
+    out_path = Path(path_str).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = src.data
+    field = _image_cache.get("field")
+    raw_shape = _image_cache.get("raw_shape")
+    if raw_shape is None:
+        shape = _image_cache.get("mask_image_shape")
+        raw_shape = tuple(shape) if shape else None
+    out_dict = _xs_ys_to_normalized_mask(
+        data["xs"], data["ys"], data["name"], data["kind"],
+        field=field, raw_shape=raw_shape,
+    )
+    try:
+        smid.save_mask_polygons(out_dict, out_path)
+    except Exception as exc:
+        log.exception("mask save failed")
+        w_mask_status.object = f"**Save failed:** `{exc}`"
+        return
+    w_mask_status.object = f"*Saved {len(data['xs'])} polygon(s) → `{out_path}`.*"
+
+
+def _on_mask_use(_event):
+    """Copy the mask path into the corresponding Process-tab mask field."""
+    path_str = (w_mask_path.value or "").strip()
+    if not path_str:
+        w_mask_status.object = "*Save first, then click Use in Process.*"
+        return
+    detector = _current_detector_kind()
+    if detector == "saxs":
+        w_proc_saxs_mask.value = path_str
+    else:
+        w_proc_waxs_mask.value = path_str
+    w_mask_status.object = (
+        f"*Set Process tab {detector.upper()} mask path to `{path_str}`.*"
+    )
+
+
+w_mask_show.param.watch(_on_mask_show, "value")
+w_mask_dynamic.param.watch(_on_mask_dynamic, "value")
+w_mask_edit.param.watch(_on_mask_edit, "value")
+w_btn_mask_reload.on_click(_on_mask_reload)
+w_btn_mask_save.on_click(_on_mask_save)
+w_btn_mask_use.on_click(_on_mask_use)
+
 
 # ---------------------------------------------------------------------------
 # Widgets — Processing
@@ -807,45 +1291,51 @@ w_proc_nchi = pn.widgets.IntInput(
     name="n_χ", value=DEFAULT_N_CHI, start=36, end=720, step=36, width=90,
 )
 w_proc_saxs_mask = pn.widgets.TextInput(
-    name="SAXS mask", value=DEFAULT_SAXS_MASK, width=220,
+    name="SAXS mask",
+    value=DEFAULT_SAXS_MASK,
+    placeholder=f"(default: {DEFAULT_SAXS_MASK_NAME})",
+    width=320,
 )
 w_proc_waxs_mask = pn.widgets.TextInput(
-    name="WAXS mask", value=DEFAULT_WAXS_MASK, width=220,
+    name="WAXS mask",
+    value=DEFAULT_WAXS_MASK,
+    placeholder=f"(default: {DEFAULT_WAXS_MASK_NAME})",
+    width=320,
 )
 w_proc_saxs_row_delta = pn.widgets.FloatInput(
-    name="SAXS Δrow", value=2.0, step=0.5, width=80,
+    name="SAXS Δrow", value=DEFAULT_SAXS_ROW_DELTA, step=0.5, width=80,
 )
 w_proc_saxs_col_delta = pn.widgets.FloatInput(
-    name="SAXS Δcol", value=3.0, step=0.5, width=80,
+    name="SAXS Δcol", value=DEFAULT_SAXS_COL_DELTA, step=0.5, width=80,
 )
 w_proc_waxs_row_delta = pn.widgets.FloatInput(
-    name="WAXS Δrow", value=0.0, step=0.5, width=80,
+    name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.5, width=80,
 )
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
-    name="WAXS Δcol", value=-2.0, step=0.5, width=80,
+    name="WAXS Δcol", value=DEFAULT_WAXS_COL_DELTA, step=0.5, width=80,
 )
 w_proc_dist_delta = pn.widgets.FloatInput(
-    name="SAXS Δdist (mm)", value=-20.0, step=1.0, width=110,
+    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.0, width=110,
 )
 w_proc_dezinger = pn.widgets.FloatInput(
-    name="Dezinger σ", value=3000.0, step=100.0, width=100,
+    name="Dezinger σ", value=DEFAULT_DEZINGER, step=100.0, width=100,
 )
 
 # GI-specific parameters (shown only when geometry == "grazing")
 w_proc_nqxy = pn.widgets.IntInput(
-    name="n_qxy", value=500, start=100, end=2000, step=50, width=90,
+    name="n_qxy", value=DEFAULT_N_QXY, start=100, end=2000, step=50, width=90,
 )
 w_proc_nqz = pn.widgets.IntInput(
-    name="n_qz", value=500, start=100, end=2000, step=50, width=90,
+    name="n_qz", value=DEFAULT_N_QZ, start=100, end=2000, step=50, width=90,
 )
 w_proc_incident_angle = pn.widgets.FloatInput(
-    name="α_i (°)", value=0.0, step=0.01, width=90,
+    name="α_i (°)", value=DEFAULT_INCIDENT_ANGLE, step=0.01, width=90,
 )
 w_proc_incident_angle_auto = pn.widgets.Checkbox(
     name="Auto α_i", value=True, width=80,
 )
 w_proc_theta_offset = pn.widgets.FloatInput(
-    name="θ offset (°)", value=-0.5, step=0.1, width=90,
+    name="θ offset (°)", value=DEFAULT_THETA_OFFSET, step=0.1, width=90,
 )
 w_gi_row = pn.Row(
     w_proc_nqxy, w_proc_nqz, w_proc_incident_angle,
@@ -944,6 +1434,7 @@ def _plot_2d_transmission(result, frame_idx=None):
         x_range=(q0, q1), y_range=(c0, c1),
         tools="pan,wheel_zoom,box_zoom,reset,save",
         active_scroll="wheel_zoom",
+        match_aspect=True,
     )
     p.image(image=[display], x=q0, y=c0, dw=q1 - q0, dh=c1 - c0, color_mapper=mapper)
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
@@ -1101,7 +1592,7 @@ def _on_reset(_event=None):
     search_card.collapsed = False  # expand so user can start a new search
 
 
-def _reset_detail():
+def _reset_detail(preserve_figure=False):
     w_detail_title.object = "### Select a scan"
     w_meta_json.object = {}
     w_primary_table.value = pd.DataFrame()
@@ -1110,13 +1601,23 @@ def _reset_detail():
     w_primary_plot.object = None
     w_baseline_table.value = pd.DataFrame(columns=["field", "before", "after"])
     w_baseline_status.object = "*Click tab to load.*"
-    w_image_thumb.object = None
+    if not preserve_figure:
+        # Full reset — destroy the Bokeh figure and all overlays
+        w_image_thumb.object = None
+        _image_cache.update(
+            figure=None, source=None, mapper=None,
+            fig_image_shape=None,
+            mask_source=None, mask_renderer=None,
+            draw_tool=None, edit_tool=None,
+            mask_image_shape=None,
+            dyn_source=None, dyn_renderer=None,
+        )
     w_image_status.object = ""
     w_image_slider.value = 0
     w_image_slider.end = 0
     # Don't clear image_field options — preserve detector selection
     _image_cache.update(n_frames=0, dataset=None, fields=[],
-                        figure=None, source=None, mapper=None)
+                        raw_shape=None)
     w_explore_plot.object = None
     w_proc_status.object = "*Select a scan and click Process.*"
     w_proc_spinner.value = False
@@ -1294,13 +1795,22 @@ def _load_images():
         image_fields = info["images"]
         ds = _detail_cache.get("primary_dataset")
 
-        # Populate field selector — preserve previous detector if available
+        # Populate field selector — preserve previous detector if available.
+        # Force a re-push of options by clearing first; otherwise Panel may
+        # skip the update when the option set differs only by additions
+        # (e.g. switching from a WAXS-only scan to a SAXS+WAXS one).
         prev_field = _image_cache.get("field")
-        w_image_field.options = image_fields
+        if list(w_image_field.options) != list(image_fields):
+            w_image_field.options = []
+            w_image_field.options = list(image_fields)
         if prev_field in image_fields:
             field = prev_field
         else:
             field = image_fields[0]
+        # If the value is unchanged, _on_image_field won't fire — we still
+        # need to refresh the displayed image for the new scan, so call it
+        # explicitly below regardless.
+        value_changed = w_image_field.value != field
         w_image_field.value = field
 
         shape = info["fields"].get(field, ())
@@ -1311,18 +1821,16 @@ def _load_images():
         _image_cache["n_frames"] = n_frames
         _image_cache["dataset"] = ds
         _image_cache["fields"] = image_fields
-        # Reset persistent figure for new scan/detector
-        _image_cache["figure"] = None
-        _image_cache["source"] = None
-        _image_cache["mapper"] = None
 
-        # Configure slider
-        w_image_slider.end = max(0, n_frames - 1)
+        # Configure slider — set value before end to avoid spurious
+        # callbacks when the old value exceeds the new range.
         w_image_slider.value = 0
+        w_image_slider.end = max(0, n_frames - 1)
 
         # Show first frame
         frame = tb.fetch_frame(run, "primary", field, frame_idx=0, _dataset=ds)
         if frame is not None:
+            _image_cache["raw_shape"] = tuple(frame.shape)
             frame = _orient_frame(frame, field)
             _update_image_in_place(frame, f"primary/{field} frame 0")
             dt_ms = (time.perf_counter() - t0) * 1000
@@ -1331,6 +1839,9 @@ def _load_images():
             w_image_status.object = (
                 f"**primary/{field}** — {n_frames} frames ({dt_ms:.0f} ms)"
             )
+            # Refresh dynamic mask if it was already enabled by the user
+            if w_mask_dynamic.value:
+                _render_dynamic_mask(0)
             # Build linked explore plot if primary data is available
             if _detail_cache.get("primary_loaded"):
                 _build_explore_plot()
@@ -1356,7 +1867,7 @@ def _on_row_select(event):
     # Preserve current tab and reload
     active_tab = w_detail_tabs.active
     _state["selected_uid"] = uid
-    _reset_detail()
+    _reset_detail(preserve_figure=True)
     _state["selected_uid"] = uid  # re-set after _reset_detail clears it
     try:
         _load_metadata(uid)
@@ -1556,18 +2067,24 @@ def _on_process(event):
         if geometry == "grazing":
             from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
 
-            gi_params = dict(
+            # Build kwargs, omitting (or sending None for) any value that
+            # still matches the upstream PyHyper default.
+            gi_params: dict[str, Any] = dict(
                 uid=uid,
                 tiled_uri=DEFAULT_TILED_URI,
                 catalog=DEFAULT_CATALOG,
                 waxs_mask_path=w_proc_waxs_mask.value or None,
-                n_qxy=w_proc_nqxy.value,
-                n_qz=w_proc_nqz.value,
-                theta_offset=w_proc_theta_offset.value,
-                dezinger_threshold=(
-                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                ),
             )
+            if w_proc_nqxy.value != DEFAULT_N_QXY:
+                gi_params["n_qxy"] = w_proc_nqxy.value
+            if w_proc_nqz.value != DEFAULT_N_QZ:
+                gi_params["n_qz"] = w_proc_nqz.value
+            if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
+                gi_params["theta_offset"] = w_proc_theta_offset.value
+            if w_proc_dezinger.value != DEFAULT_DEZINGER:
+                gi_params["dezinger_threshold"] = (
+                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+                )
             if not w_proc_incident_angle_auto.value:
                 gi_params["incident_angle_deg"] = w_proc_incident_angle.value
 
@@ -1603,29 +2120,47 @@ def _on_process(event):
             # Transmission mode
             from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
 
-            params = dict(
+            # Build kwargs, omitting (or sending None for) any value that
+            # still matches the upstream PyHyper / loader default so the
+            # loader can fill in its own calibrated values.
+            params: dict[str, Any] = dict(
                 uid=uid,
                 tiled_uri=DEFAULT_TILED_URI,
                 catalog=DEFAULT_CATALOG,
-                n_q=w_proc_nq.value,
-                n_chi=w_proc_nchi.value,
                 solid_angle_correction=True,
+                geometry=geometry,
                 saxs_mask_path=w_proc_saxs_mask.value or None,
                 waxs_mask_path=w_proc_waxs_mask.value or None,
-                geometry=geometry,
-                saxs_beam_delta_px=(
+            )
+            if w_proc_nq.value != DEFAULT_N_Q:
+                params["n_q"] = w_proc_nq.value
+            else:
+                params["n_q"] = DEFAULT_N_Q  # smi-browser keeps 2000 default
+            if w_proc_nchi.value != DEFAULT_N_CHI:
+                params["n_chi"] = w_proc_nchi.value
+
+            # Beam-centre Δ — only send if the user changed at least one
+            # axis from the loader's calibrated default.
+            saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
+            saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
+            if saxs_row_changed or saxs_col_changed:
+                params["saxs_beam_delta_px"] = (
                     w_proc_saxs_row_delta.value,
                     w_proc_saxs_col_delta.value,
-                ),
-                waxs_beam_delta_px=(
+                )
+            waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
+            waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
+            if waxs_row_changed or waxs_col_changed:
+                params["waxs_beam_delta_px"] = (
                     w_proc_waxs_row_delta.value,
                     w_proc_waxs_col_delta.value,
-                ),
-                saxs_distance_delta_mm=w_proc_dist_delta.value,
-                dezinger_threshold=(
+                )
+            if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
+                params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
+            if w_proc_dezinger.value != DEFAULT_DEZINGER:
+                params["dezinger_threshold"] = (
                     w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                ),
-            )
+                )
 
             result = reduce_smi_combined(**params)
             dt = time.perf_counter() - t0
@@ -1709,7 +2244,7 @@ def _on_add_to_collection(event):
     params = _last_result.get("params") or {}
     _collection.add(result, summary, params)
     _refresh_collection()
-    collection_card.collapsed = False  # pop open to show the new item
+    _open_collection_panel()  # pop open the floating panel
     pn.state.notifications.success(
         f"Added {result.uid[:8]} to collection ({len(_collection)} scans)"
     )
@@ -1767,7 +2302,7 @@ def _on_coll_compare(event):
         return
     fig = _collection.iq_comparison_figure()
     w_coll_compare_plot.object = fig
-    collection_card.collapsed = False  # ensure visible when comparing
+    _open_collection_panel()  # ensure the floating panel is visible
 
 
 w_btn_coll_remove.on_click(_on_coll_remove)
@@ -1849,29 +2384,72 @@ w_detail_tabs = pn.Tabs(
             pn.Row(w_image_status, w_image_spinner),
             pn.Row(w_image_field, w_image_slider, sizing_mode="stretch_width"),
             pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
-            pn.Row(
-                pn.Column(w_explore_plot, sizing_mode="stretch_both", min_width=300),
-                pn.Column(w_image_thumb, sizing_mode="stretch_both", min_width=300),
-                sizing_mode="stretch_both",
+            # Line plot stays compact at the top; auto-hidden when empty.
+            w_explore_plot_container,
+            # Mask overlay controls — open by default so users see the
+            # default mask is loaded; collapse if they don't want it.
+            pn.Card(
+                pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit, w_btn_mask_reload),
+                pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
+                w_mask_status,
+                title="Mask overlay",
+                collapsed=False, sizing_mode="stretch_width",
             ),
+            # Image takes the full remaining width / height below
+            pn.Column(w_image_thumb, sizing_mode="stretch_both", min_height=500),
             sizing_mode="stretch_both",
         ),
     ),
     (
         "Process",
         pn.Column(
-            pn.Row(w_proc_geometry),
-            w_trans_row,
-            w_gi_row,
-            pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
-            "**Beam center deltas (px)**",
-            pn.Row(
-                w_proc_saxs_row_delta, w_proc_saxs_col_delta,
-                w_proc_waxs_row_delta, w_proc_waxs_col_delta,
-            ),
-            pn.Row(w_proc_dist_delta, w_proc_dezinger),
-            pn.Row(w_btn_process, w_btn_add_collection, w_proc_spinner),
+            # Quick controls — geometry selector + run button
+            pn.Row(w_proc_geometry, w_btn_process, w_btn_add_collection,
+                   w_proc_spinner),
             w_proc_status,
+            # Advanced parameter expanders — collapsed by default; widgets
+            # remain at their PyHyper defaults unless the user opens an
+            # expander and changes a value.  Unchanged values are sent as
+            # None so the upstream loader fills in its calibrated default.
+            pn.Card(
+                w_trans_row,
+                w_gi_row,
+                title="Output grid",
+                collapsed=True, sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
+                pn.pane.Markdown(
+                    "*Leave blank to use the bundled PyHyperScattering "
+                    "defaults shown in the placeholder text.  Use the "
+                    "Explore tab to view or edit a mask interactively.*",
+                ),
+                title="Masks",
+                collapsed=True, sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                pn.pane.Markdown("**Beam-centre Δ (px)**"),
+                pn.Row(
+                    w_proc_saxs_row_delta, w_proc_saxs_col_delta,
+                    w_proc_waxs_row_delta, w_proc_waxs_col_delta,
+                ),
+                pn.Row(w_proc_dist_delta),
+                pn.pane.Markdown(
+                    "*Defaults match the SMI loader's calibrated values "
+                    "(SAXS Δrow=2, Δcol=3, Δdist=−20 mm; WAXS Δrow=0, "
+                    "Δcol=−2).  Change only if you know the calibration "
+                    "has shifted.*",
+                ),
+                title="Geometry overrides",
+                collapsed=True, sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                pn.Row(w_proc_dezinger),
+                pn.pane.Markdown("*Set to 0 to disable hot-pixel rejection.*"),
+                title="Hot-pixel rejection",
+                collapsed=True, sizing_mode="stretch_width",
+            ),
+            # Results
             w_proc_frame_slider,
             w_proc_2d_plot,
             w_proc_iq_plot,
@@ -1897,8 +2475,13 @@ collection_card = pn.Card(
     title="📊 Scan Collection",
     collapsed=True,
     sizing_mode="stretch_width",
-    margin=(10, 0),
+    margin=(0, 0, 10, 0),
 )
+
+
+def _open_collection_panel(_event=None):
+    """Pop the Scan Collection card open (called after add / compare)."""
+    collection_card.collapsed = False
 
 browse_row = pn.Row(
     left_panel,
@@ -1911,9 +2494,11 @@ dashboard = pn.Column(
     pn.pane.Markdown(
         "# SMI Tiled Browser — NSLS-II",
     ),
-    browse_row,
-    w_coll_summary,
+    # Collection card sits ABOVE the browse area so it can never overlap
+    # tall scrolling content (e.g. a full-resolution detector image).
+    pn.Row(w_coll_summary, sizing_mode="stretch_width"),
     collection_card,
+    browse_row,
     sizing_mode="stretch_width",
 )
 

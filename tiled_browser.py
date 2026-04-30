@@ -102,6 +102,13 @@ def _build_rest_params(
                 value = f"%{value}%"
             params.append(("filter[like][condition][key]", f"start.{key}"))
             params.append(("filter[like][condition][pattern]", f'"{value}"'))
+        elif ftype == "contains":
+            key = key.strip()
+            if not key:
+                continue
+            full_key = key if "." in key else f"start.{key}"
+            params.append(("filter[contains][condition][key]", full_key))
+            params.append(("filter[contains][condition][value]", f'"{value}"'))
         elif ftype == "exact":
             key = key.strip()
             if not key:
@@ -232,15 +239,18 @@ def build_query(cat, text: str = "", filters: dict[str, Any] | None = None,
         anywhere in the string.
     unified_filters : list of (type, key_or_text, value) or None
         Unified stackable filters.  Each tuple is (search_type, key, value):
-        - ("anywhere", "", text)   → FullText search
-        - ("like", key, pattern)   → SQL LIKE on metadata key
-        - ("exact", key, value)    → exact-match Eq on metadata key
+        - ("anywhere", "", text)    → FullText search
+        - ("like", key, pattern)    → SQL LIKE on metadata key (case-sensitive,
+          auto-wrapped with %...% if no wildcards present)
+        - ("contains", key, value)  → substring match on metadata key
+          (case-sensitive; cleaner syntax — no % needed)
+        - ("exact", key, value)     → exact-match Eq on metadata key
 
     Returns
     -------
     Filtered (still lazy) catalog node, sorted newest-first.
     """
-    from tiled.queries import Eq, FullText, Like
+    from tiled.queries import Contains, Eq, FullText, Like
 
     results = cat.sort(("time", -1))
     if text.strip():
@@ -274,6 +284,12 @@ def build_query(cat, text: str = "", filters: dict[str, Any] | None = None,
                 if "%" not in value and "_" not in value:
                     value = f"%{value}%"
                 results = results.search(Like(key, value))
+            elif ftype == "contains":
+                key = key.strip()
+                if not key:
+                    continue
+                full_key = key if "." in key else f"start.{key}"
+                results = results.search(Contains(full_key, value))
             elif ftype == "exact":
                 key = key.strip()
                 if not key:

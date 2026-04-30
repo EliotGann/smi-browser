@@ -62,12 +62,15 @@ CATALOG_PATH = "smi/migration"
 smi-browser/
 ├── smi_app.py          # Main Panel application
 ├── tiled_browser.py    # Tiled REST helpers (search, fetch, metadata)
-├── masks/              # Default detector mask polygons
-│   ├── 900KW_mask_polygons.json
-│   └── pil2M_mask_polygons.json
 ├── pixi.toml           # Pixi environment & dependencies
 └── README.md
 ```
+
+> Default detector masks (`pil2M_mask_polygons.json`, `900KW_mask_polygons.json`)
+> are now bundled with PyHyperScattering and loaded automatically; the Process
+> tab "Masks" expander shows the default name in its placeholder. Use the
+> Explore tab's *Mask overlay* card to view, edit (PolyDraw / PolyEdit), or
+> save a custom mask, then click *Use in Process* to apply it.
 
 ## Development
 
