@@ -44,6 +44,7 @@ import pandas as pd
 import panel as pn
 
 import tiled_browser as tb
+from live_stream import LiveStreamManager
 
 log = logging.getLogger(__name__)
 
@@ -601,16 +602,47 @@ def _thumbnail_figure(arr, title):
         line_color="line_color", line_width=2,
         source=mask_source,
     )
+    # ----- Separate "new polygons" overlay --------------------------------
+    # PolyDrawTool draws into its own dedicated source so:
+    #   (a) new polygons get a visually distinct colour (cyan), and
+    #   (b) the tool isn't confused by the many pre-loaded static-mask
+    #       polygons (which carry extra columns and can prevent draw
+    #       activation in some Bokeh versions).
+    new_mask_source = ColumnDataSource(data=dict(xs=[], ys=[]))
+    new_mask_renderer = p.patches(
+        xs="xs", ys="ys",
+        fill_color="#00e5ff", fill_alpha=0.30,
+        line_color="#0066ff", line_width=2,
+        source=new_mask_source,
+    )
     # Vertex source for PolyEditTool (shows draggable handles in edit mode)
     vertex_source = ColumnDataSource(data=dict(x=[], y=[]))
     vertex_renderer = p.scatter(
         x="x", y="y", source=vertex_source,
         size=8, color="white", line_color="black", line_width=1,
     )
-    draw_tool = PolyDrawTool(renderers=[mask_renderer], num_objects=200)
-    edit_tool = PolyEditTool(renderers=[mask_renderer],
+    # PolyDrawTool only sees the *new* renderer; PolyEditTool can edit both.
+    draw_tool = PolyDrawTool(renderers=[new_mask_renderer], num_objects=200)
+    edit_tool = PolyEditTool(renderers=[mask_renderer, new_mask_renderer],
                              vertex_renderer=vertex_renderer)
     p.add_tools(draw_tool, edit_tool)
+
+    # ----- Tap-position debug readout -------------------------------------
+    # Reports the (x, y) of every tap on the figure, so we can verify the
+    # PolyDrawTool is actually being reached by tap events.
+    from bokeh.models import CustomJS
+
+    tap_cb = CustomJS(
+        args=dict(),
+        code="""
+        const x = cb_obj.x;
+        const y = cb_obj.y;
+        const ev = (cb_obj.event_name || 'tap');
+        console.log('[mask-debug]', ev, 'x=', x.toFixed(1), 'y=', y.toFixed(1));
+        """,
+    )
+    p.js_on_event("tap", tap_cb)
+    p.js_on_event("doubletap", tap_cb)
 
     # ----- Dynamic-mask overlay (rasterised PyHyper mask, optional) -------
     # Render as an RGBA image; alpha=0 for valid pixels, semi-transparent
@@ -627,7 +659,9 @@ def _thumbnail_figure(arr, title):
 
     # Stash on image cache so the Explore controls can read/write it
     _image_cache["mask_source"] = mask_source
+    _image_cache["new_mask_source"] = new_mask_source
     _image_cache["mask_renderer"] = mask_renderer
+    _image_cache["new_mask_renderer"] = new_mask_renderer
     _image_cache["draw_tool"] = draw_tool
     _image_cache["edit_tool"] = edit_tool
     _image_cache["image_height"] = h
@@ -1187,11 +1221,23 @@ def _on_mask_edit(event):
         except Exception as exc:
             log.warning("could not activate draw tool: %s", exc)
         w_mask_status.object = (
-            "*Edit mode on. **Draw a new polygon**: tap to place each "
-            "vertex, double-tap to finish (or press Esc to cancel). "
-            "**Edit existing polygons**: click the PolyEdit icon "
-            "(square-with-handles) in the toolbar, tap a polygon, then "
-            "drag its vertices.*"
+            "*Edit mode on. **Draw a new polygon** (cyan): **long-press** "
+            "on the image to place the first vertex, then **single-tap** "
+            "to add each next vertex, and **long-press** again to "
+            "finish (Esc cancels). New polygons go into a separate cyan "
+            "layer; on Save they are appended to the static-mask file as "
+            "additional `static_regions` — i.e. they **add to** (do not "
+            "replace) the existing grey static polygons, and at "
+            "processing time the static mask is combined with the "
+            "**dynamic mask** (red overlay). **Edit existing static "
+            "polygons**: click the PolyEdit icon (square-with-handles) "
+            "in the toolbar, tap a grey or cyan polygon, then drag its "
+            "vertices. The **dynamic mask is not editable here** — it "
+            "is recomputed per-frame by PyHyper from the live beamstop "
+            "position, so its shape can only be changed indirectly "
+            "(e.g. by adjusting beam-centre Δ in the Process tab). "
+            "Open the browser console (F12) to see `[mask-debug]` tap "
+            "coordinates.*"
         )
     else:
         try:
@@ -1219,6 +1265,7 @@ def _on_mask_reload(_event):
 def _on_mask_save(_event):
     """Save the current overlay polygons to JSON at w_mask_path."""
     src = _image_cache.get("mask_source")
+    new_src = _image_cache.get("new_mask_source")
     if src is None:
         w_mask_status.object = "*Load a frame first.*"
         return
@@ -1231,14 +1278,30 @@ def _on_mask_save(_event):
     out_path = Path(path_str).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = src.data
     field = _image_cache.get("field")
     raw_shape = _image_cache.get("raw_shape")
     if raw_shape is None:
         shape = _image_cache.get("mask_image_shape")
         raw_shape = tuple(shape) if shape else None
+
+    # Combine the loaded static-mask polygons with any newly-drawn ones.
+    data = src.data
+    xs = list(data["xs"])
+    ys = list(data["ys"])
+    names = list(data["name"])
+    kinds = list(data["kind"])
+    n_existing = len(xs)
+    if new_src is not None:
+        new_data = new_src.data
+        for i, (px, py) in enumerate(zip(new_data["xs"], new_data["ys"])):
+            xs.append(list(px))
+            ys.append(list(py))
+            names.append(f"user_{i + 1}")
+            kinds.append("static")  # treat user-drawn as static-mask regions
+    n_new = len(xs) - n_existing
+
     out_dict = _xs_ys_to_normalized_mask(
-        data["xs"], data["ys"], data["name"], data["kind"],
+        xs, ys, names, kinds,
         field=field, raw_shape=raw_shape,
     )
     try:
@@ -1247,7 +1310,10 @@ def _on_mask_save(_event):
         log.exception("mask save failed")
         w_mask_status.object = f"**Save failed:** `{exc}`"
         return
-    w_mask_status.object = f"*Saved {len(data['xs'])} polygon(s) → `{out_path}`.*"
+    w_mask_status.object = (
+        f"*Saved {len(xs)} polygon(s) "
+        f"({n_existing} existing + {n_new} new) → `{out_path}`.*"
+    )
 
 
 def _on_mask_use(_event):
@@ -1608,6 +1674,7 @@ def _reset_detail(preserve_figure=False):
             figure=None, source=None, mapper=None,
             fig_image_shape=None,
             mask_source=None, mask_renderer=None,
+            new_mask_source=None, new_mask_renderer=None,
             draw_tool=None, edit_tool=None,
             mask_image_shape=None,
             dyn_source=None, dyn_renderer=None,
@@ -2310,6 +2377,296 @@ w_btn_coll_compare.on_click(_on_coll_compare)
 
 
 # ---------------------------------------------------------------------------
+# Live mode — tiled streaming subscriptions
+# ---------------------------------------------------------------------------
+#
+# When live mode is enabled:
+#   * The catalog is subscribed for new-run events (auto-switch to newest run).
+#   * The active run's primary table is streamed → explore plot refreshes.
+#   * Each image array is streamed → slider end advances + frame auto-renders.
+#   * Search / pagination / non-Explore tabs / Process / Collection are locked
+#     so the user can't accidentally navigate away mid-stream.
+# Toggling live mode off restores all widgets to their pre-live state.
+
+EXPLORE_TAB_INDEX = 3
+
+_live: dict[str, Any] = {
+    "manager": None,
+    "active": False,
+    "saved": {},  # widget -> {param_name: prev_value}
+}
+
+w_btn_live = pn.widgets.Toggle(
+    name="🔴 Go Live", value=False,
+    button_type="danger", width=140,
+)
+w_live_banner = pn.pane.Markdown(
+    "", visible=False,
+    styles={
+        "background": "#fff3cd",
+        "border": "2px solid #d62728",
+        "padding": "8px 12px",
+        "border-radius": "6px",
+        "font-size": "13px",
+        "color": "#5a1a1a",
+    },
+    sizing_mode="stretch_width",
+)
+
+
+def _dispatch_to_doc(fn):
+    """Schedule ``fn`` (zero-arg) on the Bokeh document thread.
+
+    Streaming callbacks fire on tiled's ThreadPoolExecutor; UI mutations
+    must hop onto the Panel/Bokeh document.  Falls back to inline call
+    if no document is available (e.g. unit tests).
+    """
+    doc = pn.state.curdoc
+    if doc is None:
+        try:
+            fn()
+        except Exception:
+            log.exception("live: inline dispatch failed")
+        return
+    try:
+        doc.add_next_tick_callback(fn)
+    except Exception:
+        log.exception("live: add_next_tick_callback failed")
+
+
+def _live_save(widget, *params):
+    """Snapshot widget params into _live['saved'] (idempotent per session)."""
+    bucket = _live["saved"].setdefault(widget, {})
+    for p in params:
+        if p not in bucket:
+            try:
+                bucket[p] = getattr(widget, p)
+            except Exception:
+                pass
+
+
+def _live_restore_all():
+    """Restore all snapshotted widget params."""
+    for widget, params in _live["saved"].items():
+        for p, v in params.items():
+            try:
+                setattr(widget, p, v)
+            except Exception:
+                pass
+    _live["saved"].clear()
+
+
+def _live_set_lockout(on: bool) -> None:
+    """Disable / re-enable widgets that aren't safe to use mid-stream."""
+    if on:
+        # Snapshot before mutating.
+        for w in (w_btn_search, w_btn_reset, w_btn_add_filter,
+                  w_btn_first, w_btn_prev, w_btn_next, w_btn_last,
+                  w_btn_process, w_btn_add_collection,
+                  w_btn_coll_remove, w_btn_coll_compare):
+            _live_save(w, "disabled")
+            w.disabled = True
+        for rd in _filter_rows:
+            for key in ("type", "key", "val", "suggest", "remove"):
+                wgt = rd.get(key)
+                if wgt is not None:
+                    _live_save(wgt, "disabled")
+                    wgt.disabled = True
+        # Lock the table (no row selection mid-stream).
+        _live_save(w_table, "selectable")
+        w_table.selectable = False
+        # Snapshot current tab + force Explore.
+        _live_save(w_detail_tabs, "active")
+        w_detail_tabs.active = EXPLORE_TAB_INDEX
+        # Hide collection/search cards so they don't tempt clicks.
+        _live_save(search_card, "collapsed")
+        search_card.collapsed = True
+        _live_save(collection_card, "collapsed")
+        collection_card.collapsed = True
+    else:
+        _live_restore_all()
+
+
+def _live_set_banner(text: str) -> None:
+    w_live_banner.object = text
+    w_live_banner.visible = bool(text)
+
+
+def _live_pick_initial_uid() -> str | None:
+    """Return the most recent run uid in the catalog, or None."""
+    try:
+        summaries, _total = tb.fetch_page_fast(
+            _get_cat(), unified_filters=[], offset=0, limit=1,
+        )
+    except Exception as exc:
+        log.warning("live: initial uid fetch failed: %s", exc)
+        return None
+    if not summaries:
+        return None
+    return summaries[0].get("uid")
+
+
+def _live_switch_to(uid: str) -> None:
+    """Switch the detail panel to ``uid`` and (re)subscribe to its streams.
+
+    Runs on the Bokeh document thread.
+    """
+    if not uid or uid == _state.get("selected_uid"):
+        # Same uid (or empty) — nothing to do beyond keeping the watch alive.
+        if uid and _live["manager"] is not None:
+            try:
+                run = _ensure_run()
+                if run is not None and _live["manager"].watched_uid != uid:
+                    _live["manager"].watch_run(uid, run)
+            except Exception as exc:
+                log.warning("live: re-watch failed: %s", exc)
+        return
+
+    _state["selected_uid"] = uid
+    _reset_detail(preserve_figure=True)
+    _state["selected_uid"] = uid  # _reset_detail clears it
+    try:
+        _load_metadata(uid)
+        _load_primary()
+        _load_images()
+    except Exception as exc:
+        log.exception("live: switch_to load failed")
+        _live_set_banner(f"🔴 LIVE — error loading `{uid[:8]}`: `{exc}`")
+        return
+
+    summary = _detail_cache.get("summary") or {}
+    _live_set_banner(
+        f"🔴 **LIVE** — watching `{uid[:8]}` · "
+        f"scan {summary.get('scan_id', '?')} · "
+        f"{summary.get('sample_name', '?')} · "
+        f"{summary.get('detectors', '?')}"
+    )
+
+    mgr = _live["manager"]
+    if mgr is not None:
+        run = _ensure_run()
+        if run is not None:
+            try:
+                mgr.watch_run(uid, run)
+            except Exception as exc:
+                log.exception("live: watch_run failed")
+                _live_set_banner(
+                    f"🔴 LIVE — `{uid[:8]}` (subscribe failed: `{exc}`)"
+                )
+
+
+# --- Streaming callbacks (always dispatched onto the document thread) -----
+
+def _live_on_new_run(uid: str) -> None:
+    log.info("live: new run %s", uid)
+    _live_switch_to(uid)
+
+
+def _live_on_primary_extended(uid: str) -> None:
+    if uid != _state.get("selected_uid"):
+        return
+    # Force a re-fetch of the primary scalars table by clearing the cache flag.
+    _detail_cache["primary_loaded"] = False
+    try:
+        _load_primary()
+    except Exception:
+        log.exception("live: primary refresh failed")
+        return
+    # Rebuild explore plot so the line shows the latest points.
+    try:
+        _build_explore_plot()
+    except Exception:
+        log.exception("live: explore plot rebuild failed")
+
+
+def _live_on_frame_extended(uid: str, field: str, n_total: int) -> None:
+    if uid != _state.get("selected_uid"):
+        return
+    # Drop the cached dataset so the next fetch sees the new frames.
+    _detail_cache["primary_dataset"] = None
+    _image_cache["dataset"] = None
+    if n_total <= 0:
+        return
+    # Extend slider range; auto-advance to the latest frame iff this field
+    # is the one currently displayed.
+    new_end = max(0, n_total - 1)
+    if w_image_slider.end != new_end:
+        w_image_slider.end = new_end
+    if field == _image_cache.get("field"):
+        # Setting .value triggers _on_image_slider → re-renders + cursor sync.
+        if w_image_slider.value != new_end:
+            w_image_slider.value = new_end
+        else:
+            # Same index, but the underlying frame changed — force re-render.
+            try:
+                _render_image_frame(field, new_end)
+            except Exception:
+                log.exception("live: frame re-render failed")
+
+
+def _live_on_error(stage: str, exc: Exception) -> None:
+    log.warning("live %s: %s", stage, exc)
+
+
+# --- Toggle handler --------------------------------------------------------
+
+def _on_live_toggle(event) -> None:
+    if event.new and not _live["active"]:
+        _enter_live_mode()
+    elif (not event.new) and _live["active"]:
+        _exit_live_mode()
+
+
+def _enter_live_mode() -> None:
+    log.info("live: entering live mode")
+    _live["active"] = True
+    w_btn_live.name = "■ Stop Live"
+    _live_set_lockout(True)
+    _live_set_banner("🔴 **LIVE** — connecting to tiled stream…")
+
+    mgr = LiveStreamManager(
+        _get_cat(),
+        on_new_run=_live_on_new_run,
+        on_primary_extended=_live_on_primary_extended,
+        on_frame_extended=_live_on_frame_extended,
+        on_error=_live_on_error,
+        dispatcher=_dispatch_to_doc,
+    )
+    _live["manager"] = mgr
+    try:
+        mgr.start()
+    except Exception as exc:
+        log.exception("live: manager.start failed")
+        _live_set_banner(f"🔴 LIVE — start failed: `{exc}`")
+        return
+
+    # Auto-select most recent run as the initial live target.
+    initial_uid = _live_pick_initial_uid()
+    if initial_uid:
+        _live_switch_to(initial_uid)
+    else:
+        _live_set_banner("🔴 **LIVE** — waiting for first run…")
+
+
+def _exit_live_mode() -> None:
+    log.info("live: exiting live mode")
+    _live["active"] = False
+    w_btn_live.name = "🔴 Go Live"
+    mgr = _live["manager"]
+    _live["manager"] = None
+    if mgr is not None:
+        try:
+            mgr.stop()
+        except Exception:
+            log.exception("live: manager.stop failed")
+    _live_set_lockout(False)
+    _live_set_banner("")
+
+
+w_btn_live.param.watch(_on_live_toggle, "value")
+
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
@@ -2491,9 +2848,13 @@ browse_row = pn.Row(
 )
 
 dashboard = pn.Column(
-    pn.pane.Markdown(
-        "# SMI Tiled Browser — NSLS-II",
+    pn.Row(
+        pn.pane.Markdown("# SMI Tiled Browser — NSLS-II"),
+        pn.layout.HSpacer(),
+        w_btn_live,
+        sizing_mode="stretch_width",
     ),
+    w_live_banner,
     # Collection card sits ABOVE the browse area so it can never overlap
     # tall scrolling content (e.g. a full-resolution detector image).
     pn.Row(w_coll_summary, sizing_mode="stretch_width"),
