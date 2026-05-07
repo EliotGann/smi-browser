@@ -64,6 +64,26 @@ from smi_browser.data.masks import (  # noqa: F401
     default_mask_path_for as _default_mask_path_for_impl,
     classify_detector_field,
 )
+from smi_browser.figures.image import (  # noqa: F401
+    thumbnail_figure as _thumbnail_figure_impl,
+    update_image_data as _update_image_data_impl,
+)
+from smi_browser.figures.multiview import (  # noqa: F401
+    grid_dims as _mv_grid_dims_impl,
+    compute_data_range as _mv_compute_data_range_impl,
+)
+from smi_browser.figures.cuts import (  # noqa: F401
+    cuts_to_source_data as _cuts_to_source_data_impl,
+    source_data_to_cuts as _source_data_to_cuts_impl,
+    compute_cross_section as _compute_cross_section_impl,
+    format_cut_label as _format_cut_label_impl,
+    _CUT_FILL, _CUT_LINE,
+)
+from smi_browser.figures.process_2d import (  # noqa: F401
+    plot_2d_transmission as _plot_2d_transmission_impl,
+    plot_2d_gi as _plot_2d_gi_impl,
+)
+from smi_browser.processing import build_proc_params as _build_proc_params_impl
 from smi_browser.config import (  # noqa: F401
     PAGE_SIZE,
     COMMON_SEARCH_KEYS,
@@ -72,6 +92,7 @@ from smi_browser.config import (  # noqa: F401
     SEARCH_TYPES as SEARCH_TYPES_pkg,
     SEARCH_TYPE_MAP as SEARCH_TYPE_MAP_pkg,
 )
+from smi_browser.state import AppState
 
 log = logging.getLogger(__name__)
 
@@ -127,42 +148,26 @@ _EMPTY_DF = _EMPTY_DF_pkg
 
 
 # ---------------------------------------------------------------------------
-# Global state
+# Global state  (canonical source: smi_browser.state.AppState)
 # ---------------------------------------------------------------------------
 
-_cat = None          # migration catalog (for data access / processing)
-_collection = ScanCollection()
+_app = AppState()
 
-_state = {
-    "unified_filters": [],  # list of (type, key, value) tuples
-    "page":         0,
-    "page_size":    PAGE_SIZE,
-    "total":        0,
-    "selected_uid": None,
-}
-
-_detail_cache = {
-    "uid":              None,
-    "run":              None,
-    "summary":          None,
-    "primary_loaded":   False,
-    "baseline_loaded":  False,
-    "images_loaded":    False,
-    "primary_info":     None,
-    "primary_dataset":  None,
-}
-
-_last_result = {"result": None, "params": None}
+# Convenience aliases for the transition period — these point into _app
+# so existing code can be migrated incrementally.
+_collection = _app.collection
+_state = _app.search
+_detail_cache = _app.detail_cache
+_last_result = _app.last_result
 
 
 def _get_cat():
     """Return the migration catalog (used for data access / processing)."""
-    global _cat
-    if _cat is None:
+    if _app.cat is None:
         t0 = time.time()
-        _cat = tb.connect(DEFAULT_TILED_URI, DEFAULT_CATALOG)
+        _app.cat = tb.connect(DEFAULT_TILED_URI, DEFAULT_CATALOG)
         log.info("tiled connect (migration) took %.2fs", time.time() - t0)
-    return _cat
+    return _app.cat
 
 
 def _n_pages() -> int:
@@ -256,132 +261,17 @@ def _default_mask_path_for(detector: str):
 
 
 def _thumbnail_figure(arr, title):
-    from bokeh.plotting import figure as bk_figure
-    from bokeh.models import (
-        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
-        PolyDrawTool, PolyEditTool,
+    """Build an interactive Bokeh image figure (delegates to smi_browser.figures.image)."""
+    p, source, mapper, extras = _thumbnail_figure_impl(
+        arr, title, mask_visible=bool(w_mask_show.value),
     )
-
-    h, w = arr.shape
-    finite = arr[np.isfinite(arr) & (arr > 0)]
-    if finite.size:
-        vlo = max(float(np.percentile(finite, 1)), 1e-3)
-        vhi = float(np.percentile(finite, 99.5))
-        vhi = max(vhi, vlo + 1.0)
-        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=vhi)
-    else:
-        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
-        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
-        mapper = LinearColorMapper(palette="Greys256", low=lo, high=hi)
-
-    pw = 600
-    ph = 600
-
-    display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
-    source = ColumnDataSource(data=dict(image=[display], x=[0], y=[0], dw=[w], dh=[h]))
-
-    p = bk_figure(
-        title=title, width=pw, height=ph,
-        x_range=(0, w), y_range=(0, h),
-        tools="pan,wheel_zoom,box_zoom,reset,save",
-        active_scroll="wheel_zoom",
-        match_aspect=True,
-        sizing_mode="stretch_both",
-    )
-    p.image(image="image", x="x", y="y", dw="dw", dh="dh",
-            color_mapper=mapper, source=source)
-    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
-    p.xaxis.axis_label = "col (px)"
-    p.yaxis.axis_label = "row (px)"
-
-    # ----- Polygon mask overlay (always present; populated/hidden by callers)
-    mask_source = ColumnDataSource(
-        data=dict(xs=[], ys=[], name=[], kind=[],
-                  fill_color=[], line_color=[]),
-    )
-    mask_renderer = p.patches(
-        xs="xs", ys="ys",
-        fill_color="fill_color", fill_alpha=0.25,
-        line_color="line_color", line_width=2,
-        source=mask_source,
-    )
-    # ----- Separate "new polygons" overlay --------------------------------
-    # PolyDrawTool draws into its own dedicated source so:
-    #   (a) new polygons get a visually distinct colour (cyan), and
-    #   (b) the tool isn't confused by the many pre-loaded static-mask
-    #       polygons (which carry extra columns and can prevent draw
-    #       activation in some Bokeh versions).
-    new_mask_source = ColumnDataSource(data=dict(xs=[], ys=[]))
-    new_mask_renderer = p.patches(
-        xs="xs", ys="ys",
-        fill_color="#00e5ff", fill_alpha=0.30,
-        line_color="#0066ff", line_width=2,
-        source=new_mask_source,
-    )
-    # Vertex source for PolyEditTool (shows draggable handles in edit mode)
-    vertex_source = ColumnDataSource(data=dict(x=[], y=[]))
-    vertex_renderer = p.scatter(
-        x="x", y="y", source=vertex_source,
-        size=8, color="white", line_color="black", line_width=1,
-    )
-    # PolyDrawTool only sees the *new* renderer; PolyEditTool can edit both.
-    draw_tool = PolyDrawTool(renderers=[new_mask_renderer], num_objects=200)
-    edit_tool = PolyEditTool(renderers=[mask_renderer, new_mask_renderer],
-                             vertex_renderer=vertex_renderer)
-    p.add_tools(draw_tool, edit_tool)
-
-    # ----- Tap-position debug readout -------------------------------------
-    # Reports the (x, y) of every tap on the figure, so we can verify the
-    # PolyDrawTool is actually being reached by tap events.
-    from bokeh.models import CustomJS
-
-    tap_cb = CustomJS(
-        args=dict(),
-        code="""
-        const x = cb_obj.x;
-        const y = cb_obj.y;
-        const ev = (cb_obj.event_name || 'tap');
-        console.log('[mask-debug]', ev, 'x=', x.toFixed(1), 'y=', y.toFixed(1));
-        """,
-    )
-    p.js_on_event("tap", tap_cb)
-    p.js_on_event("doubletap", tap_cb)
-
-    # ----- Dynamic-mask overlay (rasterised PyHyper mask, optional) -------
-    # Render as an RGBA image; alpha=0 for valid pixels, semi-transparent
-    # red for invalid pixels.  Populated by _render_dynamic_mask().
-    # image_rgba requires a 2D uint32 array (or a uint8 (h,w,4) view as uint32).
-    empty_rgba = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint32)
-    dyn_source = ColumnDataSource(
-        data=dict(image=[empty_rgba], x=[0], y=[0], dw=[w], dh=[h]),
-    )
-    dyn_renderer = p.image_rgba(
-        image="image", x="x", y="y", dw="dw", dh="dh", source=dyn_source,
-    )
-    dyn_renderer.visible = False
-
-    # Stash on image cache so the Explore controls can read/write it
-    _image_cache["mask_source"] = mask_source
-    _image_cache["new_mask_source"] = new_mask_source
-    _image_cache["mask_renderer"] = mask_renderer
-    _image_cache["new_mask_renderer"] = new_mask_renderer
-    _image_cache["draw_tool"] = draw_tool
-    _image_cache["edit_tool"] = edit_tool
-    _image_cache["image_height"] = h
-    _image_cache["image_width"] = w
-    _image_cache["dyn_source"] = dyn_source
-    _image_cache["dyn_renderer"] = dyn_renderer
-
-    # Initial visibility follows the Show-mask checkbox state
-    mask_renderer.visible = bool(w_mask_show.value)
-
+    # Stash extras on image cache so the Explore controls can read/write them
+    _image_cache.update(extras)
     return p, source, mapper
 
 
 def _update_image_in_place(arr, title):
     """Update the existing image figure in-place, preserving zoom/pan state."""
-    from bokeh.models import LogColorMapper, LinearColorMapper
-
     fig = _image_cache.get("figure")
     source = _image_cache.get("source")
     mapper = _image_cache.get("mapper")
@@ -394,10 +284,6 @@ def _update_image_in_place(arr, title):
         _image_cache["mapper"] = mapper
         _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
-        # Auto-load the default mask if Show-mask is enabled (handles the
-        # initial render and detector switches).  Defer to the next tick
-        # so Bokeh has finished syncing the freshly-attached figure before
-        # we push polygon data into its mask source.
         if w_mask_show.value:
             def _deferred_reload():
                 try:
@@ -414,37 +300,9 @@ def _update_image_in_place(arr, title):
                 _deferred_reload()
         return
 
-    h, w = arr.shape
-    display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
-
-    # Reset axis ranges only when the *underlying* image dimensions change
-    # (e.g. switching detector/scan).  Comparing against fig.x_range.end
-    # would also fire after the user zooms, clobbering their zoom state.
     cached_shape = _image_cache.get("fig_image_shape")
-    if cached_shape != (h, w):
-        fig.x_range.start = 0
-        fig.x_range.end = w
-        fig.y_range.start = 0
-        fig.y_range.end = h
-        _image_cache["fig_image_shape"] = (h, w)
-
-    # Update color mapper range
-    finite = arr[np.isfinite(arr) & (arr > 0)]
-    if finite.size:
-        vlo = max(float(np.percentile(finite, 1)), 1e-3)
-        vhi = float(np.percentile(finite, 99.5))
-        vhi = max(vhi, vlo + 1.0)
-        mapper.low = vlo
-        mapper.high = vhi
-    else:
-        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
-        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
-        mapper.low = lo
-        mapper.high = hi
-
-    # Update image data (keeps zoom/pan state)
-    source.data = dict(image=[display], x=[0], y=[0], dw=[w], dh=[h])
-    fig.title.text = title
+    h, w = _update_image_data_impl(fig, source, mapper, arr, title, cached_shape)
+    _image_cache["fig_image_shape"] = (h, w)
 
 
 # ---------------------------------------------------------------------------
@@ -452,17 +310,16 @@ def _update_image_in_place(arr, title):
 # ---------------------------------------------------------------------------
 
 # Dynamic filter rows: each is a dict {type, key, val, suggest, remove}
-_filter_rows: list[dict] = []
+_filter_rows = _app.filter_rows
 w_filter_column = pn.Column(sizing_mode="stretch_width")
 
 # Cancellation flag — set by Reset to abort in-flight queries
-_cancel = threading.Event()
+_cancel = _app.cancel
 
 # ---------------------------------------------------------------------------
 # Debounced live count — lightweight count query while typing
 # ---------------------------------------------------------------------------
 
-_live_count_timer: threading.Timer | None = None
 _LIVE_COUNT_DEBOUNCE_S = 0.4  # seconds after last keystroke before firing
 
 
@@ -512,12 +369,11 @@ def _live_count_fire():
 
 def _schedule_live_count(*_events):
     """Debounce: reset the timer on each keystroke, fire after the delay."""
-    global _live_count_timer
-    if _live_count_timer is not None:
-        _live_count_timer.cancel()
-    _live_count_timer = threading.Timer(_LIVE_COUNT_DEBOUNCE_S, _live_count_fire)
-    _live_count_timer.daemon = True
-    _live_count_timer.start()
+    if _app.live_count_timer is not None:
+        _app.live_count_timer.cancel()
+    _app.live_count_timer = threading.Timer(_LIVE_COUNT_DEBOUNCE_S, _live_count_fire)
+    _app.live_count_timer.daemon = True
+    _app.live_count_timer.start()
 
 
 def _make_filter_row(ftype: str = "Text in field", key: str = "", val: str = "") -> dict:
@@ -777,11 +633,7 @@ w_btn_mask_use = pn.widgets.Button(
 )
 w_mask_status = pn.pane.Markdown("", width=600)
 
-_image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
-                "figure": None, "source": None, "mapper": None,
-                "mask_source": None, "mask_renderer": None,
-                "draw_tool": None, "edit_tool": None,
-                "mask_image_shape": None}
+_image_cache = _app.image_cache
 
 
 def _render_image_frame(field, idx):
@@ -866,45 +718,15 @@ w_mv_label = pn.widgets.Select(
 )
 w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
 
-_multiview_cache: dict = {
-    "uid": None, "field": None, "n_frames": 0,
-    "frames": None, "renderers": None, "mapper": None,
-    "log": None, "data_lo": None, "data_hi": None,
-    "suspend_range_cb": False,
-}
+_multiview_cache = _app.multiview_cache
 
 
 def _mv_grid_dims(n: int) -> tuple[int, int]:
-    """Pick (rows, cols) so cols/rows ≈ 2 (approx 2:1 grid aspect)."""
-    if n <= 0:
-        return 1, 1
-    rows = max(1, int(round(np.sqrt(n / 2.0))))
-    cols = int(np.ceil(n / rows))
-    # Make sure it actually fits
-    while rows * cols < n:
-        cols += 1
-    return rows, cols
+    return _mv_grid_dims_impl(n)
 
 
 def _mv_compute_data_range(frames):
-    """Return (lo, hi) finite-positive percentile bounds across all frames."""
-    lo, hi = None, None
-    for arr in frames:
-        finite = arr[np.isfinite(arr) & (arr > 0)]
-        if not finite.size:
-            continue
-        flo = float(np.percentile(finite, 1))
-        fhi = float(np.percentile(finite, 99.5))
-        if lo is None or flo < lo:
-            lo = flo
-        if hi is None or fhi > hi:
-            hi = fhi
-    if lo is None:
-        return 1e-3, 1.0
-    lo = max(lo, 1e-6)
-    if hi <= lo:
-        hi = lo * 10
-    return lo, hi
+    return _mv_compute_data_range_impl(frames)
 
 
 def _build_multiview_grid(frames, field):
@@ -1566,10 +1388,10 @@ w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=
 w_proc_frame_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, width=400,
 )
-_proc_result_cache = {"result": None, "gi_result": None}
+_proc_result_cache = _app.proc_result_cache
 
 # Guard: suppress _update_proc_2d while _on_process is building its own plot
-_processing_guard = {"active": False}
+_processing_guard = _app.processing_guard
 
 # ---------------------------------------------------------------------------
 # Geometry cache monitoring / control
@@ -1624,125 +1446,38 @@ w_btn_cache_clear.on_click(_clear_cache)
 #   {"kind": "h"|"v", "center": float, "width": float}
 # For an h-cut, ``center`` is in y-units (chi or qz) and ``width`` is the
 # slice extent along y.  For a v-cut, both are in x-units (q or qxy).
-_persisted_cuts: list[dict] = []
+_persisted_cuts = _app.persisted_cuts
 
 # Cache of the data currently rendered in the Process tab's 2D plot, used
 # to recompute cross sections when cuts move/resize or the frame changes.
-_proc_2d_cache: dict[str, Any] = {
-    "x": None, "y": None, "image": None,
-    "x_label": "", "y_label": "",
-    "title": "",
-    "cuts_source": None,
-    "cut_renderer": None,
-}
+_proc_2d_cache = _app.proc_2d_cache
 
 # Recursion guard for the cuts ColumnDataSource.on_change callback —
 # avoids feedback loops when we snap rectangles back to canonical extents.
-_cuts_guard = {"in_progress": False}
+_cuts_guard = _app.cuts_guard
 
 _CUT_FILL = {"h": "#1f77b4", "v": "#d62728"}
 _CUT_LINE = {"h": "#0a3a6e", "v": "#7a1414"}
 
 
 def _cuts_to_source_data(cuts: list[dict]) -> dict:
-    """Project the persisted cuts list into Bokeh Rect glyph columns."""
-    cache = _proc_2d_cache
-    x = cache["x"]
-    y = cache["y"]
-    if x is None or y is None or len(x) == 0 or len(y) == 0:
-        return dict(x=[], y=[], width=[], height=[],
-                    kind=[], fill_color=[], line_color=[])
-    xmin, xmax = float(np.min(x)), float(np.max(x))
-    ymin, ymax = float(np.min(y)), float(np.max(y))
-    xc = (xmin + xmax) / 2.0
-    yc = (ymin + ymax) / 2.0
-    xw = xmax - xmin
-    yh = ymax - ymin
-    cx, cy, w, h, kinds, fc, lc = [], [], [], [], [], [], []
-    for cut in cuts:
-        k = cut["kind"]
-        if k == "h":
-            cx.append(xc)
-            cy.append(float(cut["center"]))
-            w.append(xw)
-            h.append(float(cut["width"]))
-        else:
-            cx.append(float(cut["center"]))
-            cy.append(yc)
-            w.append(float(cut["width"]))
-            h.append(yh)
-        kinds.append(k)
-        fc.append(_CUT_FILL[k])
-        lc.append(_CUT_LINE[k])
-    return dict(x=cx, y=cy, width=w, height=h,
-                kind=kinds, fill_color=fc, line_color=lc)
+    return _cuts_to_source_data_impl(cuts, _proc_2d_cache["x"], _proc_2d_cache["y"])
 
 
 def _source_data_to_cuts(data: dict) -> list[dict]:
-    """Inverse of ``_cuts_to_source_data`` — also classifies any newly drawn
-    boxes (which lack a ``kind``) by aspect ratio against the plot extents."""
-    cache = _proc_2d_cache
-    x = cache["x"]
-    y = cache["y"]
-    if x is None or y is None or len(x) == 0 or len(y) == 0:
-        return []
-    xspan = float(np.max(x) - np.min(x)) or 1.0
-    yspan = float(np.max(y) - np.min(y)) or 1.0
-    cuts = []
-    kinds = list(data.get("kind", []))
-    xs = list(data.get("x", []))
-    ys = list(data.get("y", []))
-    ws = list(data.get("width", []))
-    hs = list(data.get("height", []))
-    for i, (cx, cy, w, h) in enumerate(zip(xs, ys, ws, hs)):
-        k = kinds[i] if i < len(kinds) and kinds[i] else None
-        if not k:
-            # New box drawn via shift-drag in the toolbar — classify by
-            # how it compares to the data span on each axis.
-            k = "h" if (w / xspan) >= (h / yspan) else "v"
-        if k == "h":
-            cuts.append({"kind": "h",
-                         "center": float(cy),
-                         "width": float(abs(h))})
-        else:
-            cuts.append({"kind": "v",
-                         "center": float(cx),
-                         "width": float(abs(w))})
-    return cuts
+    return _source_data_to_cuts_impl(data, _proc_2d_cache["x"], _proc_2d_cache["y"])
 
 
 def _compute_cross_section(cut: dict):
-    """Return ``(axis, intensity, axis_label)`` for one cut, or ``None``."""
-    cache = _proc_2d_cache
-    x = cache["x"]
-    y = cache["y"]
-    img = cache["image"]
-    if x is None or y is None or img is None:
-        return None
-    c = float(cut["center"])
-    w = float(cut["width"]) or 0.0
-    half = max(w / 2.0, 0.0)
-    if cut["kind"] == "h":
-        mask = (y >= c - half) & (y <= c + half)
-        if not np.any(mask):
-            # Fall back to nearest single row
-            idx = int(np.argmin(np.abs(y - c)))
-            section = img[idx, :].astype(float)
-        else:
-            section = np.nanmean(img[mask, :], axis=0)
-        return x, section, cache["x_label"]
-    mask = (x >= c - half) & (x <= c + half)
-    if not np.any(mask):
-        idx = int(np.argmin(np.abs(x - c)))
-        section = img[:, idx].astype(float)
-    else:
-        section = np.nanmean(img[:, mask], axis=1)
-    return y, section, cache["y_label"]
+    return _compute_cross_section_impl(
+        cut, _proc_2d_cache["x"], _proc_2d_cache["y"],
+        _proc_2d_cache["image"],
+        _proc_2d_cache["x_label"], _proc_2d_cache["y_label"],
+    )
 
 
 def _format_cut_label(i: int, cut: dict) -> str:
-    arrow = "─" if cut["kind"] == "h" else "│"
-    return f"{arrow} #{i + 1}: c={cut['center']:.3g}, Δ={cut['width']:.3g}"
+    return _format_cut_label_impl(i, cut)
 
 
 def _refresh_cuts_table():
@@ -2024,92 +1759,19 @@ w_coll_compare_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_both")
 
 def _plot_2d_transmission(result, frame_idx=None):
     """Plot q-vs-chi as an interactive Bokeh figure."""
-    from bokeh.plotting import figure as bk_figure
-    from bokeh.models import LogColorMapper, LinearColorMapper, ColorBar
-
-    qchi = result.merged_qchi
-    if frame_idx is not None and "frame" in qchi.dims:
-        img = qchi["intensity"].isel(frame=frame_idx).values
-        title = f"q vs χ — frame {frame_idx}"
-    else:
-        img = qchi["intensity"].values
-        title = "q vs χ (merged)"
-    q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
-    chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
-
-    # Ensure img has shape (n_chi, n_q) so Bokeh renders chi on y, q on x.
-    if img.shape == (len(q), len(chi)):
-        img = img.T
-
-    display = np.where(np.isfinite(img), img, 0).astype(np.float32)
-    finite = img[np.isfinite(img) & (img > 0)]
-    if finite.size:
-        vlo = max(float(np.percentile(finite, 2)), 1e-6)
-        vhi = float(np.percentile(finite, 99.5))
-        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=max(vhi, vlo * 2))
-    else:
-        mapper = LinearColorMapper(palette="Greys256", low=float(np.nanmin(display)), high=max(float(np.nanmax(display)), 1))
-
-    q0, q1 = float(q.min()), float(q.max())
-    c0, c1 = float(chi.min()), float(chi.max())
-    p = bk_figure(
-        title=title, height=500,
-        sizing_mode="stretch_width",
-        x_range=(q0, q1), y_range=(c0, c1),
-        tools="pan,wheel_zoom,box_zoom,reset,save",
-        active_scroll="wheel_zoom",
-    )
-    p.image(image=[display], x=q0, y=c0, dw=q1 - q0, dh=c1 - c0, color_mapper=mapper)
-    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
-    p.xaxis.axis_label = "q (nm⁻¹)"
-    p.yaxis.axis_label = "χ (°)"
+    p, q, chi, display, x_label, y_label, title = _plot_2d_transmission_impl(
+        result, frame_idx)
     _attach_cuts_to_figure(p, q, chi, display,
-                           x_label="q (nm⁻¹)", y_label="χ (°)", title=title)
+                           x_label=x_label, y_label=y_label, title=title)
     return p
 
 
 def _plot_2d_gi(gi_result, frame_idx=None):
     """Plot qxy-vs-qz as an interactive Bokeh figure."""
-    from bokeh.plotting import figure as bk_figure
-    from bokeh.models import LogColorMapper, LinearColorMapper, ColorBar
-
-    if frame_idx is not None and frame_idx < len(gi_result.frames):
-        img = gi_result.frames[frame_idx]
-        ai = gi_result.alpha_i_deg[frame_idx]
-        title = f"qxy vs qz — frame {frame_idx} (α_i={ai:.3f}°)"
-    else:
-        img = gi_result.summed
-        title = "qxy vs qz (summed)"
-
-    qxy = gi_result.qxy_grid
-    qz = gi_result.qz_grid
-
-    display = np.where(np.isfinite(img), img, 0).astype(np.float32)
-    finite = img[np.isfinite(img) & (img > 0)]
-    if finite.size:
-        vlo = max(float(np.percentile(finite, 2)), 1e-6)
-        vhi = float(np.percentile(finite, 99.5))
-        mapper = LogColorMapper(palette="Viridis256", low=vlo, high=max(vhi, vlo * 2))
-    else:
-        mapper = LinearColorMapper(palette="Greys256", low=float(np.nanmin(display)), high=max(float(np.nanmax(display)), 1))
-
-    # qxy/qz are 1-D grids; image is (n_qxy, n_qz), displayed transposed
-    x0, x1 = float(qxy.min()), float(qxy.max())
-    y0, y1 = float(qz.min()), float(qz.max())
-    p = bk_figure(
-        title=title, height=500,
-        sizing_mode="stretch_width",
-        x_range=(x0, x1), y_range=(y0, y1),
-        tools="pan,wheel_zoom,box_zoom,reset,save",
-        active_scroll="wheel_zoom",
-    )
-    p.image(image=[display.T], x=x0, y=y0, dw=x1 - x0, dh=y1 - y0, color_mapper=mapper)
-    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
-    p.xaxis.axis_label = "q_xy (nm⁻¹)"
-    p.yaxis.axis_label = "q_z (nm⁻¹)"
-    _attach_cuts_to_figure(p, qxy, qz, display.T,
-                           x_label="q_xy (nm⁻¹)", y_label="q_z (nm⁻¹)",
-                           title=title)
+    p, qxy, qz, display, x_label, y_label, title = _plot_2d_gi_impl(
+        gi_result, frame_idx)
+    _attach_cuts_to_figure(p, qxy, qz, display,
+                           x_label=x_label, y_label=y_label, title=title)
     return p
 
 
@@ -2584,15 +2246,12 @@ def _update_primary_plot(*_events):
 # --- Linked explore plot (1D primary + cursor synced with image slider) ---
 
 _EXPLORE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
-_explore_cursor_source = None  # ColumnDataSource for vertical cursor line
 
 
 def _build_explore_plot():
     """Build / rebuild the Bokeh 1D line plot with a vertical cursor."""
     from bokeh.plotting import figure as bk_figure
     from bokeh.models import ColumnDataSource, Span, Label
-
-    global _explore_cursor_source
 
     df = w_primary_table.value
     x_col = w_explore_x.value
@@ -2638,7 +2297,7 @@ def _build_explore_plot():
     )
     p.add_layout(cursor_label)
 
-    _explore_cursor_source = {
+    _app.explore_cursor_source = {
         "span": cursor, "label": cursor_label,
         "x_values": x, "y_data": y_data, "y_cols": y_cols,
     }
@@ -2648,13 +2307,13 @@ def _build_explore_plot():
 
 def _update_explore_cursor(idx):
     """Move the vertical cursor and update the value label."""
-    if _explore_cursor_source is None:
+    if _app.explore_cursor_source is None:
         return
-    span = _explore_cursor_source.get("span")
-    label = _explore_cursor_source.get("label")
-    x_arr = _explore_cursor_source.get("x_values")
-    y_data = _explore_cursor_source.get("y_data", {})
-    y_cols = _explore_cursor_source.get("y_cols", [])
+    span = _app.explore_cursor_source.get("span")
+    label = _app.explore_cursor_source.get("label")
+    x_arr = _app.explore_cursor_source.get("x_values")
+    y_data = _app.explore_cursor_source.get("y_data", {})
+    y_cols = _app.explore_cursor_source.get("y_cols", [])
     if span is not None and x_arr is not None and idx < len(x_arr):
         x_val = float(x_arr[idx])
         span.location = x_val
@@ -2710,37 +2369,15 @@ def _on_process(event):
 
     try:
         t0 = time.perf_counter()
+        run_fn, params, geometry = _build_proc_params(uid)
 
         if geometry == "grazing":
-            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
-
-            # Build kwargs, omitting (or sending None for) any value that
-            # still matches the upstream PyHyper default.
-            gi_params: dict[str, Any] = dict(
-                uid=uid,
-                tiled_uri=DEFAULT_TILED_URI,
-                catalog=DEFAULT_CATALOG,
-                waxs_mask_path=w_proc_waxs_mask.value or None,
-            )
-            if w_proc_nqxy.value != DEFAULT_N_QXY:
-                gi_params["n_qxy"] = w_proc_nqxy.value
-            if w_proc_nqz.value != DEFAULT_N_QZ:
-                gi_params["n_qz"] = w_proc_nqz.value
-            if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
-                gi_params["theta_offset"] = w_proc_theta_offset.value
-            if w_proc_dezinger.value != DEFAULT_DEZINGER:
-                gi_params["dezinger_threshold"] = (
-                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                )
-            if not w_proc_incident_angle_auto.value:
-                gi_params["incident_angle_deg"] = w_proc_incident_angle.value
-
-            gi_result = reduce_smi_gi(**gi_params)
+            gi_result = run_fn(**params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["gi_result"] = gi_result
             _last_result["result"] = gi_result
-            _last_result["params"] = gi_params
+            _last_result["params"] = params
 
             # Configure frame slider for GI result
             n_fr = len(gi_result.frames)
@@ -2764,53 +2401,7 @@ def _on_process(event):
             w_btn_add_collection.disabled = True  # GI not in collection yet
 
         else:
-            # Transmission mode
-            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
-
-            # Build kwargs, omitting (or sending None for) any value that
-            # still matches the upstream PyHyper / loader default so the
-            # loader can fill in its own calibrated values.
-            params: dict[str, Any] = dict(
-                uid=uid,
-                tiled_uri=DEFAULT_TILED_URI,
-                catalog=DEFAULT_CATALOG,
-                solid_angle_correction=True,
-                geometry=geometry,
-                saxs_mask_path=w_proc_saxs_mask.value or None,
-                waxs_mask_path=w_proc_waxs_mask.value or None,
-                cache_geometry=w_cache_enabled.value,
-            )
-            if w_proc_nq.value != DEFAULT_N_Q:
-                params["n_q"] = w_proc_nq.value
-            else:
-                params["n_q"] = DEFAULT_N_Q  # smi-browser keeps 2000 default
-            if w_proc_nchi.value != DEFAULT_N_CHI:
-                params["n_chi"] = w_proc_nchi.value
-
-            # Beam-centre Δ — only send if the user changed at least one
-            # axis from the loader's calibrated default.
-            saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
-            saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
-            if saxs_row_changed or saxs_col_changed:
-                params["saxs_beam_delta_px"] = (
-                    w_proc_saxs_row_delta.value,
-                    w_proc_saxs_col_delta.value,
-                )
-            waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
-            waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
-            if waxs_row_changed or waxs_col_changed:
-                params["waxs_beam_delta_px"] = (
-                    w_proc_waxs_row_delta.value,
-                    w_proc_waxs_col_delta.value,
-                )
-            if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
-                params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
-            if w_proc_dezinger.value != DEFAULT_DEZINGER:
-                params["dezinger_threshold"] = (
-                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                )
-
-            result = reduce_smi_combined(**params)
+            result = run_fn(**params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["result"] = result
@@ -3062,78 +2653,71 @@ w_btn_batch_clear = pn.widgets.Button(
     name="Clear log", button_type="light", disabled=True,
 )
 
-_batch_state: dict[str, Any] = {"doc": None, "processor": None}
+_batch_state = _app.batch_state
+
+
+def _snapshot_proc_widgets() -> dict[str, Any]:
+    """Read current Process-tab widget values into a plain dict."""
+    return dict(
+        geometry=w_proc_geometry.value,
+        saxs_mask_path=w_proc_saxs_mask.value,
+        waxs_mask_path=w_proc_waxs_mask.value,
+        n_q=w_proc_nq.value,
+        n_chi=w_proc_nchi.value,
+        n_qxy=w_proc_nqxy.value,
+        n_qz=w_proc_nqz.value,
+        theta_offset=w_proc_theta_offset.value,
+        dezinger=w_proc_dezinger.value,
+        incident_angle_auto=w_proc_incident_angle_auto.value,
+        incident_angle=w_proc_incident_angle.value,
+        saxs_row_delta=w_proc_saxs_row_delta.value,
+        saxs_col_delta=w_proc_saxs_col_delta.value,
+        waxs_row_delta=w_proc_waxs_row_delta.value,
+        waxs_col_delta=w_proc_waxs_col_delta.value,
+        saxs_dist_delta=w_proc_dist_delta.value,
+        cache_geometry=w_cache_enabled.value,
+    )
 
 
 def _build_proc_params(uid: str) -> tuple:
     """Snapshot current Process-tab widget values into reduction params.
 
-    Mirrors the param-construction in :func:`_on_process` so a batch job
-    runs with whatever the user has configured in the Parameters sub-tab.
     Returns ``(callable, params_dict, geometry_label)``.
     """
-    geometry = w_proc_geometry.value
-    if geometry == "grazing":
-        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
-
-        gi_params: dict[str, Any] = dict(
-            uid=uid,
-            tiled_uri=DEFAULT_TILED_URI,
-            catalog=DEFAULT_CATALOG,
-            waxs_mask_path=w_proc_waxs_mask.value or None,
-        )
-        if w_proc_nqxy.value != DEFAULT_N_QXY:
-            gi_params["n_qxy"] = w_proc_nqxy.value
-        if w_proc_nqz.value != DEFAULT_N_QZ:
-            gi_params["n_qz"] = w_proc_nqz.value
-        if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
-            gi_params["theta_offset"] = w_proc_theta_offset.value
-        if w_proc_dezinger.value != DEFAULT_DEZINGER:
-            gi_params["dezinger_threshold"] = (
-                w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-            )
-        if not w_proc_incident_angle_auto.value:
-            gi_params["incident_angle_deg"] = w_proc_incident_angle.value
-        return reduce_smi_gi, gi_params, geometry
-
-    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
-
-    params: dict[str, Any] = dict(
-        uid=uid,
+    snap = _snapshot_proc_widgets()
+    fn_name, params = _build_proc_params_impl(
+        uid, snap["geometry"],
         tiled_uri=DEFAULT_TILED_URI,
         catalog=DEFAULT_CATALOG,
-        solid_angle_correction=True,
-        geometry=geometry,
-        saxs_mask_path=w_proc_saxs_mask.value or None,
-        waxs_mask_path=w_proc_waxs_mask.value or None,
-        cache_geometry=w_cache_enabled.value,
+        saxs_mask_path=snap["saxs_mask_path"],
+        waxs_mask_path=snap["waxs_mask_path"],
+        n_q=snap["n_q"], n_chi=snap["n_chi"],
+        n_qxy=snap["n_qxy"], n_qz=snap["n_qz"],
+        theta_offset=snap["theta_offset"],
+        dezinger=snap["dezinger"],
+        incident_angle_auto=snap["incident_angle_auto"],
+        incident_angle=snap["incident_angle"],
+        saxs_row_delta=snap["saxs_row_delta"],
+        saxs_col_delta=snap["saxs_col_delta"],
+        waxs_row_delta=snap["waxs_row_delta"],
+        waxs_col_delta=snap["waxs_col_delta"],
+        saxs_dist_delta=snap["saxs_dist_delta"],
+        cache_geometry=snap["cache_geometry"],
+        default_n_q=DEFAULT_N_Q, default_n_chi=DEFAULT_N_CHI,
+        default_n_qxy=DEFAULT_N_QXY, default_n_qz=DEFAULT_N_QZ,
+        default_theta_offset=DEFAULT_THETA_OFFSET,
+        default_dezinger=DEFAULT_DEZINGER,
+        default_saxs_row_delta=DEFAULT_SAXS_ROW_DELTA,
+        default_saxs_col_delta=DEFAULT_SAXS_COL_DELTA,
+        default_waxs_row_delta=DEFAULT_WAXS_ROW_DELTA,
+        default_waxs_col_delta=DEFAULT_WAXS_COL_DELTA,
+        default_saxs_dist_delta=DEFAULT_SAXS_DIST_DELTA,
     )
-    if w_proc_nq.value != DEFAULT_N_Q:
-        params["n_q"] = w_proc_nq.value
-    else:
-        params["n_q"] = DEFAULT_N_Q
-    if w_proc_nchi.value != DEFAULT_N_CHI:
-        params["n_chi"] = w_proc_nchi.value
-
-    saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
-    saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
-    if saxs_row_changed or saxs_col_changed:
-        params["saxs_beam_delta_px"] = (
-            w_proc_saxs_row_delta.value, w_proc_saxs_col_delta.value,
-        )
-    waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
-    waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
-    if waxs_row_changed or waxs_col_changed:
-        params["waxs_beam_delta_px"] = (
-            w_proc_waxs_row_delta.value, w_proc_waxs_col_delta.value,
-        )
-    if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
-        params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
-    if w_proc_dezinger.value != DEFAULT_DEZINGER:
-        params["dezinger_threshold"] = (
-            w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-        )
-    return reduce_smi_combined, params, geometry
+    if fn_name == "reduce_smi_gi":
+        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+        return reduce_smi_gi, params, snap["geometry"]
+    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+    return reduce_smi_combined, params, snap["geometry"]
 
 
 def _batch_process_fn(uid: str):
@@ -3390,12 +2974,7 @@ batch_panel = pn.Column(
 
 EXPLORE_TAB_INDEX = 3
 
-_live: dict[str, Any] = {
-    "manager": None,
-    "active": False,
-    "saved": {},  # widget -> {param_name: prev_value}
-    "doc": None,  # captured Bokeh document for cross-thread dispatch
-}
+_live = _app.live
 
 # ---------------------------------------------------------------------------
 # Tiled authentication (login / logout / status)
@@ -3455,8 +3034,7 @@ def _tiled_login(username: str, password: str) -> str:
     ctx.configure_auth(tokens, remember_me=True)
 
     # Drop the cached catalog so the next access uses the refreshed tokens.
-    global _cat
-    _cat = None
+    _app.cat = None
 
     info = ctx.whoami()
     identities = (info or {}).get("identities") or []
@@ -3478,8 +3056,7 @@ def _tiled_logout() -> None:
         except Exception:
             pass
     finally:
-        global _cat
-        _cat = None
+        _app.cat = None
 
 
 w_login_status = pn.pane.Markdown("*checking…*", width=220)
