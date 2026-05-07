@@ -47,6 +47,32 @@ import tiled_browser as tb
 from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 
+# Re-export relocated modules so internal references still work
+from smi_browser.models.summary import enhanced_summary  # noqa: F401
+from smi_browser.models.collection import ScanCollection  # noqa: F401
+from smi_browser.data.scalars import (  # noqa: F401
+    scalars_to_dataframe as _scalars_to_dataframe_impl,
+    scalar_stream_to_frame as _scalar_stream_to_frame_impl,
+)
+from smi_browser.data.frames import (  # noqa: F401
+    detector_for_field as _detector_for_field_impl,
+    orient_frame as _orient_frame_impl,
+)
+from smi_browser.data.masks import (  # noqa: F401
+    normalized_mask_to_xs_ys as _normalized_mask_to_xs_ys_impl,
+    xs_ys_to_normalized_mask as _xs_ys_to_normalized_mask_impl,
+    default_mask_path_for as _default_mask_path_for_impl,
+    classify_detector_field,
+)
+from smi_browser.config import (  # noqa: F401
+    PAGE_SIZE,
+    COMMON_SEARCH_KEYS,
+    RESULT_COLS,
+    EMPTY_DF as _EMPTY_DF_pkg,
+    SEARCH_TYPES as SEARCH_TYPES_pkg,
+    SEARCH_TYPE_MAP as SEARCH_TYPE_MAP_pkg,
+)
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -56,15 +82,12 @@ log = logging.getLogger(__name__)
 pn.extension("tabulator", sizing_mode="stretch_width", notifications=True)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration  (canonical source: smi_browser.config)
 # ---------------------------------------------------------------------------
 
-PAGE_SIZE = 25
+# PAGE_SIZE, COMMON_SEARCH_KEYS, RESULT_COLS imported from smi_browser.config above.
 
-# Canonical defaults & helpers are owned by PyHyperScattering.smi_defaults.
-# Importing it triggers PyHyperScattering/__init__.py once (which pulls in
-# the heavy integrators), but we need LOADER_DEFAULTS at widget-construct
-# time anyway, so eat the cost here rather than mirroring constants.
+# PyHyperScattering imports still needed directly in this file.
 from PyHyperScattering import smi_defaults as smid
 from PyHyperScattering.SMISWAXSIntegrator import (
     clear_geometry_cache,
@@ -76,11 +99,9 @@ DEFAULT_CATALOG = smid.DEFAULT_CATALOG
 DEFAULT_SAXS_MASK_NAME = smid.DEFAULT_SAXS_MASK_NAME
 DEFAULT_WAXS_MASK_NAME = smid.DEFAULT_WAXS_MASK_NAME
 
-# Detector-name classification (kept as module aliases for legacy usage).
 SAXS_DETECTOR_NAMES = smid.SAXS_DETECTOR_NAMES
 WAXS_DETECTOR_NAMES = smid.WAXS_DETECTOR_NAMES
 
-# Loader-side calibrated defaults (frozen dataclass exposed by PyHyper).
 _LD = smid.LOADER_DEFAULTS
 DEFAULT_SAXS_ROW_DELTA = _LD.saxs_row_delta_px
 DEFAULT_SAXS_COL_DELTA = _LD.saxs_col_delta_px
@@ -88,13 +109,9 @@ DEFAULT_WAXS_ROW_DELTA = _LD.waxs_row_delta_px
 DEFAULT_WAXS_COL_DELTA = _LD.waxs_col_delta_px
 DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 
-# Processing defaults  (UI-side; these mirror the upstream PyHyper defaults
-# so the widgets show meaningful numbers even before any override.  When a
-# widget value still equals its default, _on_process passes None so the
-# upstream loader supplies its own calibrated default.)
-DEFAULT_N_Q = 2000          # PyHyper default is 1000; smi-browser used 2000
+DEFAULT_N_Q = 2000
 DEFAULT_N_CHI = 360
-DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
+DEFAULT_SAXS_MASK = ""
 DEFAULT_WAXS_MASK = ""
 DEFAULT_DEZINGER = 3000.0
 DEFAULT_INCIDENT_ANGLE = 0.0
@@ -102,440 +119,11 @@ DEFAULT_THETA_OFFSET = -0.5
 DEFAULT_N_QXY = 500
 DEFAULT_N_QZ = 500
 
-# Common metadata keys for Like search (user can also type custom keys)
-COMMON_SEARCH_KEYS = [
-    "sample_name",
-    "plan_name",
-    "data_session",
-    "proposal.first_name",
-    "proposal.last_name",
-    "project_name",
-    "institution",
-    "scan_id",
-    "uid",
-    "detectors",
-]
-
-RESULT_COLS = [
-    "scan_id", "n_steps", "sample_name", "plan_name",
-    "data_session", "detectors", "exit_status", "time", "uid",
-]
-
-_EMPTY_DF = pd.DataFrame(columns=RESULT_COLS)
+_EMPTY_DF = _EMPTY_DF_pkg
 
 
-# ---------------------------------------------------------------------------
-# Enhanced run summary  (metadata-only, adds detector + institution fields)
-# ---------------------------------------------------------------------------
-
-def enhanced_summary(run) -> dict:
-    """
-    Build a lightweight summary from a tiled run node.
-    Only reads .metadata — zero array I/O.  Extends tb.run_summary with
-    detector classification and institution info.
-    """
-    md = run.metadata
-    start = md.get("start", {})
-    stop = md.get("stop", {})
-
-    t0 = start.get("time")
-    time_str = (
-        datetime.datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M")
-        if t0 else "?"
-    )
-
-    # Detectors
-    det_list = start.get("detectors", [])
-    if isinstance(det_list, str):
-        det_list = [det_list]
-    det_lower = {d.lower() for d in det_list}
-    has_saxs = bool(det_lower & SAXS_DETECTOR_NAMES)
-    has_waxs = bool(det_lower & WAXS_DETECTOR_NAMES)
-    if has_saxs and has_waxs:
-        det_str = "SAXS+WAXS"
-    elif has_saxs:
-        det_str = "SAXS"
-    elif has_waxs:
-        det_str = "WAXS"
-    else:
-        det_str = ", ".join(det_list) if det_list else "?"
-
-    # Steps
-    num_events = stop.get("num_events", {})
-    if isinstance(num_events, dict):
-        n_steps = num_events.get("primary", "?")
-    else:
-        n_steps = num_events
-
-    # Institution / data session
-    institution = start.get(
-        "institution",
-        start.get("data_session", start.get("proposal_id", "?")),
-    )
-
-    exit_status = stop.get("exit_status", "?")
-
-    return {
-        "uid":          start.get("uid", "?"),
-        "scan_id":      start.get("scan_id", "?"),
-        "time":         time_str,
-        "plan_name":    start.get("plan_name", "?"),
-        "sample_name":  start.get(
-            "sample_name",
-            start.get("sample", start.get("Sample", "?")),
-        ),
-        "exit_status":  exit_status,
-        "n_steps":      n_steps,
-        "institution":  str(institution),
-        "detectors":    det_str,
-        "has_saxs":     has_saxs,
-        "has_waxs":     has_waxs,
-        "detector_list": det_list,
-    }
-
-
-# ---------------------------------------------------------------------------
-# ScanCollection — holds processed results for comparison
-# ---------------------------------------------------------------------------
-
-class ScanCollection:
-    """
-    Manages a set of processed CombinedReductionResults for comparison
-    and parameter-sweep analysis.
-
-    Within-scan variation (e.g. waxs_arc angle per frame) is already
-    handled by reduce_smi_combined.  Between-scan variation (sample,
-    temperature, etc.) is tracked here.
-
-    Usage
-    -----
-        coll = ScanCollection()
-        coll.add(result, metadata, params)
-        coll.varying_parameters()      # which metadata fields differ
-        coll.iq_comparison_figure()    # matplotlib overlay
-        ds = coll.stack_iq("sample")   # xr.Dataset along a new dim
-    """
-
-    _PALETTE = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    ]
-
-    def __init__(self):
-        self._results: dict[str, Any] = {}           # uid -> CombinedReductionResult
-        self._metadata: dict[str, dict] = {}         # uid -> enhanced_summary dict
-        self._processing: dict[str, dict] = {}       # uid -> processing kwargs
-        self._colors: dict[str, str] = {}            # uid -> hex color
-        self._color_idx = 0
-        self._primary_dfs: dict[str, pd.DataFrame] = {}   # uid -> primary scalars
-        self._baseline_dfs: dict[str, pd.DataFrame] = {}  # uid -> baseline scalars
-        self._raw_metadata: dict[str, dict] = {}          # uid -> full tiled metadata
-
-    @property
-    def uids(self) -> list[str]:
-        return list(self._results.keys())
-
-    def __len__(self):
-        return len(self._results)
-
-    def __contains__(self, uid: str):
-        return uid in self._results
-
-    def add(self, result, metadata: dict, params: dict | None = None,
-             primary_df: pd.DataFrame | None = None,
-             baseline_df: pd.DataFrame | None = None,
-             raw_metadata: dict | None = None):
-        """Add a processed scan to the collection.
-
-        Parameters
-        ----------
-        primary_df : DataFrame, optional
-            Primary stream scalar data (for label columns / export).
-        baseline_df : DataFrame, optional
-            Baseline stream scalar data (for label columns / export).
-        raw_metadata : dict, optional
-            Full tiled metadata dict (for export).
-        """
-        self._results[result.uid] = result
-        self._metadata[result.uid] = metadata
-        if params:
-            self._processing[result.uid] = params
-        if primary_df is not None:
-            self._primary_dfs[result.uid] = primary_df
-        if baseline_df is not None:
-            self._baseline_dfs[result.uid] = baseline_df
-        if raw_metadata is not None:
-            self._raw_metadata[result.uid] = raw_metadata
-        if result.uid not in self._colors:
-            self._colors[result.uid] = self._PALETTE[
-                self._color_idx % len(self._PALETTE)
-            ]
-            self._color_idx += 1
-
-    def remove(self, uid: str):
-        self._results.pop(uid, None)
-        self._metadata.pop(uid, None)
-        self._processing.pop(uid, None)
-        self._colors.pop(uid, None)
-        self._primary_dfs.pop(uid, None)
-        self._baseline_dfs.pop(uid, None)
-        self._raw_metadata.pop(uid, None)
-
-    def get_color(self, uid: str) -> str:
-        return self._colors.get(uid, "#888888")
-
-    def set_color(self, uid: str, color: str) -> None:
-        if uid in self._results:
-            self._colors[uid] = color
-
-    def get_result(self, uid: str):
-        return self._results.get(uid)
-
-    def available_label_columns(self) -> list[str]:
-        """Return sorted list of numeric column names from stored primary/baseline data."""
-        cols: set[str] = set()
-        for df in self._primary_dfs.values():
-            cols.update(c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]))
-        for df in self._baseline_dfs.values():
-            cols.update(
-                f"baseline:{c}" for c in df.columns
-                if pd.api.types.is_numeric_dtype(df[c])
-            )
-        return sorted(cols)
-
-    def get_label_value(self, uid: str, column: str) -> str:
-        """Get a representative label value for a scan from primary or baseline."""
-        if column.startswith("baseline:"):
-            field = column[len("baseline:"):]
-            df = self._baseline_dfs.get(uid)
-            if df is not None and field in df.columns:
-                vals = df[field].dropna()
-                if len(vals):
-                    return f"{vals.iloc[0]:.6g}"
-        else:
-            df = self._primary_dfs.get(uid)
-            if df is not None and column in df.columns:
-                vals = df[column].dropna()
-                if len(vals):
-                    # Use median as representative value for multi-frame scans
-                    return f"{vals.median():.6g}"
-        return "?"
-
-    def get_primary_df(self, uid: str) -> pd.DataFrame | None:
-        return self._primary_dfs.get(uid)
-
-    def get_baseline_df(self, uid: str) -> pd.DataFrame | None:
-        return self._baseline_dfs.get(uid)
-
-    def get_raw_metadata(self, uid: str) -> dict | None:
-        return self._raw_metadata.get(uid)
-
-    def summary_table(self, label_column: str | None = None) -> pd.DataFrame:
-        """DataFrame summary of all scans in the collection.
-
-        Parameters
-        ----------
-        label_column : str, optional
-            A primary or baseline field name (baseline fields prefixed with
-            ``baseline:``) to include as an extra column in the table.
-        """
-        rows = []
-        for uid in self._results:
-            res = self._results[uid]
-            meta = self._metadata.get(uid, {})
-            timing = res.timing or {}
-            det_list = meta.get("detector_list")
-            if det_list and isinstance(det_list, list):
-                detectors = ", ".join(det_list)
-            else:
-                detectors = meta.get("detectors", "?")
-            row = {
-                "color":     self._colors.get(uid, "#888888"),
-                "uid_short": uid[:8],
-                "sample":    meta.get("sample_name", "?"),
-                "plan":      meta.get("plan_name", "?"),
-                "detectors": detectors,
-                "geometry":  res.geometry,
-                "total_s":   f"{sum(timing.values()):.1f}" if timing else "?",
-                "uid":       uid,
-            }
-            if label_column:
-                row["label_val"] = self.get_label_value(uid, label_column)
-            rows.append(row)
-        cols = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
-        if label_column:
-            cols.insert(3, "label_val")
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-    def varying_parameters(self) -> dict[str, list]:
-        """
-        Identify metadata fields that differ across scans in the collection.
-        Skips fields that are inherently unique per-scan (uid, scan_id, time).
-        """
-        if len(self._metadata) < 2:
-            return {}
-        all_metas = list(self._metadata.values())
-        all_keys: set[str] = set()
-        for m in all_metas:
-            all_keys.update(m.keys())
-
-        skip = {
-            "uid", "scan_id", "time", "exit_status", "streams",
-            "detector_list", "has_saxs", "has_waxs", "n_steps",
-        }
-        varying = {}
-        for key in sorted(all_keys - skip):
-            vals = [str(m.get(key, "")) for m in all_metas]
-            if len(set(vals)) > 1:
-                varying[key] = vals
-        return varying
-
-    def iq_comparison_figure(self, figsize=(9, 5)):
-        """Matplotlib figure overlaying I(q) from every scan."""
-        if not self._results:
-            return None
-        fig, ax = plt.subplots(figsize=figsize)
-        for uid, res in self._results.items():
-            meta = self._metadata.get(uid, {})
-            label = f"{uid[:8]} — {meta.get('sample_name', '?')}"
-            iq = res.merged_iq
-            q = iq["q"].values
-            I = iq["I"].values
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                ax.plot(q[mask], I[mask], linewidth=0.8, label=label)
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("q (nm⁻¹)")
-        ax.set_ylabel("I(q)")
-        ax.set_title("Processed Collection — I(q) Comparison")
-        ax.legend(fontsize=8, loc="best")
-        fig.tight_layout()
-        return fig
-
-    def iq_comparison_bokeh(self, uids: list[str] | None = None,
-                            label_column: str | None = None):
-        """Bokeh figure overlaying I(q) for selected uids (or all).
-
-        Uses stored per-scan colours (matching the table swatch) and
-        omits the legend — the table serves as the interactive legend.
-        Hovering highlights the nearest curve and dims the others.
-
-        Parameters
-        ----------
-        label_column : str, optional
-            If given, the chosen primary/baseline value is appended to
-            the hover tooltip label for each curve.
-        """
-        from bokeh.events import MouseLeave
-        from bokeh.models import CustomJS, HoverTool
-        from bokeh.models.glyphs import Line as BkLine
-        from bokeh.plotting import figure as bk_figure
-
-        subset = uids if uids else list(self._results.keys())
-        subset = [u for u in subset if u in self._results]
-        if not subset:
-            return None
-
-        p = bk_figure(
-            title="Processed Collection — I(q) Comparison",
-            width=1000, height=500,
-            x_axis_type="log", y_axis_type="log",
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            active_scroll="wheel_zoom",
-            sizing_mode="stretch_both",
-        )
-
-        renderers = []
-        for uid in subset:
-            res = self._results[uid]
-            meta = self._metadata.get(uid, {})
-            label_parts = [uid[:8], meta.get('sample_name', '?')]
-            if label_column:
-                label_parts.append(f"{label_column}={self.get_label_value(uid, label_column)}")
-            label = " — ".join(label_parts)
-            color = self._colors.get(uid, "#888888")
-            iq = res.merged_iq
-            q = iq["q"].values
-            I = iq["I"].values
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                r = p.line(
-                    q[mask], I[mask],
-                    line_width=1.2, line_alpha=0.4,
-                    color=color, name=label,
-                )
-                r.hover_glyph = BkLine(
-                    line_color=color, line_alpha=1.0, line_width=3.5,
-                )
-                renderers.append(r)
-
-        p.xaxis.axis_label = "q (nm⁻¹)"
-        p.yaxis.axis_label = "I(q)"
-        if p.legend:
-            p.legend.visible = False
-
-        if renderers:
-            # Hover on nearest line: brightens it, tooltip shows scan info.
-            # A JS callback dims all OTHER lines while one is inspected.
-            hover_cb = CustomJS(args=dict(renderers=renderers), code="""
-                const r = cb_obj.renderers;
-                const inspected = r.filter(
-                    rend => rend.inspected && rend.inspected.indices.length > 0
-                );
-                if (inspected.length > 0) {
-                    for (const rend of renderers) {
-                        if (inspected.includes(rend)) {
-                            rend.glyph.line_alpha = 1.0;
-                            rend.glyph.line_width = 3.5;
-                        } else {
-                            rend.glyph.line_alpha = 0.08;
-                            rend.glyph.line_width = 0.7;
-                        }
-                    }
-                }
-            """)
-            reset_cb = CustomJS(args=dict(renderers=renderers), code="""
-                for (const r of renderers) {
-                    r.glyph.line_alpha = 0.4;
-                    r.glyph.line_width = 1.2;
-                }
-            """)
-            hover = HoverTool(
-                renderers=renderers,
-                tooltips=[
-                    ("scan", "$name"),
-                    ("q", "$x{0.000}"),
-                    ("I", "$y{0.00e+0}"),
-                ],
-                line_policy="nearest",
-                mode="mouse",
-                callback=hover_cb,
-            )
-            p.add_tools(hover)
-            p.js_on_event(MouseLeave, reset_cb)
-
-        return p
-
-    def stack_iq(self, dim_name: str = "scan", dim_values=None):
-        """
-        Stack merged I(q) datasets into a single xr.Dataset along a new dim.
-        If dim_values is given, use those as the coordinate; otherwise use
-        short UID + sample_name labels.
-        """
-        import xarray as xr
-        if not self._results:
-            return xr.Dataset()
-        datasets = []
-        labels = []
-        for i, (uid, res) in enumerate(self._results.items()):
-            if dim_values is not None and i < len(dim_values):
-                labels.append(dim_values[i])
-            else:
-                meta = self._metadata.get(uid, {})
-                labels.append(f"{uid[:8]}_{meta.get('sample_name', '?')}")
-            datasets.append(res.merged_iq)
-        return xr.concat(datasets, dim=pd.Index(labels, name=dim_name))
+# enhanced_summary is imported from smi_browser.models.summary above.
+# ScanCollection is imported from smi_browser.models.collection above.
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +173,8 @@ def _n_pages() -> int:
 # Search / data helpers
 # ---------------------------------------------------------------------------
 
-SEARCH_TYPES = ["Anywhere", "Text in field", "Contains", "Exact"]
-SEARCH_TYPE_MAP = {"Anywhere": "anywhere", "Text in field": "like", "Contains": "contains", "Exact": "exact"}
+SEARCH_TYPES = SEARCH_TYPES_pkg
+SEARCH_TYPE_MAP = SEARCH_TYPE_MAP_pkg
 
 
 def _collect_unified_filters() -> list[tuple[str, str, str]]:
@@ -635,140 +223,36 @@ def _count_total() -> int:
 
 
 def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
-    """Convert a {field: ndarray} dict of scalars into a DataFrame."""
-    if not scalar_data:
-        return pd.DataFrame()
-
-    columns = {}
-    max_len = 0
-    for key, arr in scalar_data.items():
-        arr = np.asarray(arr)
-        if arr.ndim == 0:
-            arr = np.array([arr.item()])
-        if arr.ndim != 1:
-            continue
-        columns[key] = arr
-        max_len = max(max_len, len(arr))
-
-    if not columns:
-        return pd.DataFrame()
-
-    data = {}
-    for key, arr in columns.items():
-        if len(arr) < max_len:
-            padded = np.full(
-                max_len, np.nan,
-                dtype=float if np.issubdtype(arr.dtype, np.number) else object,
-            )
-            padded[:len(arr)] = arr
-            data[key] = padded
-        else:
-            data[key] = arr
-    return pd.DataFrame(data)
+    return _scalars_to_dataframe_impl(scalar_data)
 
 
 def _scalar_stream_to_frame(run, stream: str) -> pd.DataFrame:
-    """Read scalar fields from a stream into a DataFrame."""
-    scalar_data = tb.fetch_scalars(run, stream)
-    return _scalars_to_dataframe(scalar_data)
+    return _scalar_stream_to_frame_impl(run, stream)
 
 
 def _detector_for_field(field: str) -> str | None:
-    """Classify a detector field name as ``'saxs'`` / ``'waxs'`` / ``None``."""
-    return smid.classify_detector_field(field)
+    return classify_detector_field(field)
 
 
 def _orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
-    """Re-orient detector frames for display via the canonical PyHyper transform."""
-    detector = _detector_for_field(field)
-    if detector is None:
-        return arr
-    return smid.orient_frame_for_display(arr, detector)
+    return _orient_frame_impl(arr, field)
 
 
 # ---------------------------------------------------------------------------
-# Polygon mask helpers (overlay + edit on the Explore image preview)
-#
-# All schema parsing and orientation math lives in PyHyperScattering's
-# smi_defaults module.  The browser keeps only the thin projection between
-# the *normalized* mask dict (PyHyper's canonical shape) and Bokeh's
-# (xs, ys, names, kinds) ColumnDataSource columns.
+# Polygon mask helpers  (canonical source: smi_browser.data.masks)
 # ---------------------------------------------------------------------------
 
 
-def _normalized_mask_to_xs_ys(
-    mask: dict,
-    field: str | None = None,
-    raw_shape: tuple[int, int] | None = None,
-) -> tuple[list, list, list, list]:
-    """Project a normalized mask dict into Bokeh patches columns.
-
-    Input is the dict returned by ``smid.load_mask_polygons`` (always shaped
-    ``{image_shape, static_regions, beamstops}`` in raw detector indexing).
-    When ``field`` and ``raw_shape`` are given, vertices are transformed
-    via ``smid.orient_polygon_xy`` so the polygons overlay the *displayed*
-    image.
-    """
-    xs, ys, names, kinds = [], [], [], []
-    detector = _detector_for_field(field) if field else None
-
-    def _xy(col_raw: float, row_raw: float) -> tuple[float, float]:
-        if detector is not None and raw_shape is not None:
-            return smid.orient_polygon_xy(col_raw, row_raw, detector, raw_shape)
-        return float(col_raw), float(row_raw)
-
-    for kind, bucket in (("static", "static_regions"), ("beamstop", "beamstops")):
-        for name, verts in (mask.get(bucket) or {}).items():
-            if not verts:
-                continue
-            xl, yl = [], []
-            for v in verts:
-                x, y = _xy(v[0], v[1])
-                xl.append(x)
-                yl.append(y)
-            xs.append(xl)
-            ys.append(yl)
-            names.append(str(name))
-            kinds.append(kind)
-    return xs, ys, names, kinds
+def _normalized_mask_to_xs_ys(mask, field=None, raw_shape=None):
+    return _normalized_mask_to_xs_ys_impl(mask, field, raw_shape)
 
 
-def _xs_ys_to_normalized_mask(
-    xs, ys, names, kinds,
-    field: str | None = None,
-    raw_shape: tuple[int, int] | None = None,
-) -> dict:
-    """Inverse projection — build a normalized mask dict from Bokeh columns."""
-    out: dict = {
-        "image_shape": list(raw_shape) if raw_shape else None,
-        "static_regions": {},
-        "beamstops": {},
-    }
-    detector = _detector_for_field(field) if field else None
-    counters = {"static": 0, "beamstop": 0}
-    for px, py, name, kind in zip(xs, ys, names, kinds):
-        if not px or not py:
-            continue
-        verts = []
-        for x, y in zip(px, py):
-            if detector is not None and raw_shape is not None:
-                col, row = smid.orient_polygon_xy_inverse(
-                    x, y, detector, raw_shape)
-            else:
-                col, row = float(x), float(y)
-            verts.append([col, row])
-        if not name:
-            counters[kind] += 1
-            name = f"{kind}_{counters[kind]}"
-        bucket = "static_regions" if kind == "static" else "beamstops"
-        out[bucket][name] = verts
-    return out
+def _xs_ys_to_normalized_mask(xs, ys, names, kinds, field=None, raw_shape=None):
+    return _xs_ys_to_normalized_mask_impl(xs, ys, names, kinds, field, raw_shape)
 
 
 def _default_mask_path_for(detector: str):
-    """Resolve the bundled default mask path for a detector."""
-    return (smid.default_waxs_mask_path() if detector == "waxs"
-            else smid.default_saxs_mask_path())
+    return _default_mask_path_for_impl(detector)
 
 
 def _thumbnail_figure(arr, title):

@@ -27,4 +27,5 @@ pyhyperscattering = { path = "../../PyHyperScattering", editable = true }
 
 [tasks]
 serve = "panel serve smi_app.py --show --autoreload"
-check = "python -c \"import tiled_browser; print('OK')\""
+check = "python -c \"import tiled_browser; import smi_browser; print('OK')\""
+test = "python -m pytest tests/ -q"
