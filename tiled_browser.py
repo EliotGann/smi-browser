@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import json
 import logging
+import pathlib
 from typing import Any
 
 import numpy as np
@@ -38,6 +40,29 @@ log = logging.getLogger(__name__)
 TILED_URI  = "https://tiled.nsls2.bnl.gov"
 CATALOG    = "smi/migration"
 PAGE_SIZE  = 25    # safe default – avoids hammering tiled with huge requests
+
+_COUNT_CACHE_PATH = pathlib.Path.home() / ".smi_browser_count_cache.json"
+
+
+def load_cached_count(catalog: str = CATALOG) -> int | None:
+    """Load the cached total count for a catalog, or None if unavailable."""
+    try:
+        data = json.loads(_COUNT_CACHE_PATH.read_text())
+        return data.get(catalog)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def save_cached_count(total: int, catalog: str = CATALOG) -> None:
+    """Persist the latest known total count for fast startup next time."""
+    try:
+        data = {}
+        if _COUNT_CACHE_PATH.exists():
+            data = json.loads(_COUNT_CACHE_PATH.read_text())
+        data[catalog] = total
+        _COUNT_CACHE_PATH.write_text(json.dumps(data))
+    except OSError:
+        pass  # non-critical
 
 
 # ---------------------------------------------------------------------------
@@ -75,47 +100,55 @@ def connect(uri: str = TILED_URI, catalog: str = CATALOG):
 # ---------------------------------------------------------------------------
 
 def _build_rest_params(
-    unified_filters: list[tuple[str, str, str]] | None = None,
     offset: int = 0,
     limit: int = PAGE_SIZE,
 ) -> list[tuple[str, str]]:
-    """Build query parameters for the tiled REST search endpoint."""
-    params: list[tuple[str, str]] = [
+    """Build pagination parameters for the tiled REST search endpoint."""
+    return [
         ("page[offset]", str(offset)),
         ("page[limit]", str(limit)),
     ]
-    if not unified_filters:
-        return params
 
+
+def _apply_filters(cat, unified_filters: list[tuple[str, str, str]] | None = None):
+    """
+    Apply search filters to a catalog node using tiled's Python query API.
+
+    Returns the filtered catalog node (or original if no filters).
+    """
+    if not unified_filters:
+        return cat
+
+    from tiled.queries import Contains, Eq, FullText, Like
+
+    node = cat
     for ftype, key, value in unified_filters:
         value = value.strip()
         if not value:
             continue
         ftype = ftype.strip().lower()
         if ftype == "anywhere":
-            params.append(("filter[fulltext][condition][text]", value))
+            node = node.search(FullText(value))
         elif ftype == "like":
+            # "like" = SQL LIKE substring match (case-insensitive for lowercase)
             key = key.strip()
             if not key:
                 continue
-            if "%" not in value and "_" not in value:
-                value = f"%{value}%"
-            params.append(("filter[like][condition][key]", f"start.{key}"))
-            params.append(("filter[like][condition][pattern]", f'"{value}"'))
+            # Auto-add wildcards if not present
+            pattern = value if ("%" in value or "_" in value) else f"%{value}%"
+            node = node.search(Like(key, pattern))
         elif ftype == "contains":
+            # "contains" = check if value is contained in a list/array field
             key = key.strip()
             if not key:
                 continue
-            full_key = key if "." in key else f"start.{key}"
-            params.append(("filter[contains][condition][key]", full_key))
-            params.append(("filter[contains][condition][value]", f'"{value}"'))
+            node = node.search(Contains(key, value))
         elif ftype == "exact":
             key = key.strip()
             if not key:
                 continue
-            params.append(("filter[eq][condition][key]", f"start.{key}"))
-            params.append(("filter[eq][condition][value]", value))
-    return params
+            node = node.search(Eq(key, value))
+    return node
 
 
 def _summary_from_rest_item(item: dict) -> dict:
@@ -164,12 +197,13 @@ def fetch_page_fast(
     unified_filters: list[tuple[str, str, str]] | None = None,
     offset: int = 0,
     limit: int = PAGE_SIZE,
+    count_hint: int | None = None,
 ) -> tuple[list[dict], int]:
     """
     Fetch one page of scan summaries via the REST API, newest first.
 
-    The tiled server ignores ``sort=-time``, so we fetch from the *end*
-    of the result set and reverse the items to get newest-first ordering.
+    Uses tiled's Python query API to apply filters (FullText, Contains, Eq),
+    then paginates the result node via REST for efficient metadata retrieval.
 
     Parameters
     ----------
@@ -177,37 +211,103 @@ def fetch_page_fast(
         Logical offset in newest-first order (0 = most recent page).
     limit : int
         Page size.
+    count_hint : int or None
+        If provided for unfiltered queries, skip the expensive count and
+        use this as the approximate total.  The response ``meta.count``
+        still returns the real count.
 
     Returns (summaries, total_count).
     """
-    http_client = cat.context.http_client
-    search_url = cat.item["links"]["search"]
+    # Apply search filters via tiled Python client
+    node = _apply_filters(cat, unified_filters)
+    http_client = node.context.http_client
+    search_url = node.item["links"]["search"]
 
-    # Step 1: get total count (cheap: limit=0, no fields)
-    count_params = _build_rest_params(unified_filters, 0, 0)
-    count_resp = http_client.get(search_url, params=count_params)
-    count_resp.raise_for_status()
-    total = count_resp.json().get("meta", {}).get("count", 0)
+    # Extract filter params from the node so REST calls include them.
+    # Without this, REST pagination on a filtered node returns unfiltered data.
+    filter_params = getattr(node, "_queries_as_params", {})
 
-    if total == 0 or offset >= total:
-        return [], total
+    # Determine total count
+    if count_hint is not None and count_hint > 0 and not unified_filters:
+        # Fast path: use cached count, fetch directly from estimated end.
+        total_estimate = count_hint
+    else:
+        # For both filtered and unfiltered: use REST count with filter params.
+        params = _build_rest_params(0, 0)
+        params.append(("fields", "count"))
+        resp = http_client.get(search_url, params={
+            **dict(params), **filter_params,
+        })
+        resp.raise_for_status()
+        total_estimate = resp.json().get("meta", {}).get("count", 0)
 
-    # Step 2: convert newest-first offset to oldest-first offset from end
-    # "page 0" in our UI = last `limit` items in the catalog
-    real_offset = max(0, total - offset - limit)
-    real_limit = min(limit, total - offset)
+    if total_estimate == 0:
+        return [], 0
 
-    data_params = _build_rest_params(unified_filters, real_offset, real_limit)
-    data_params.append(("fields", "metadata"))
-    resp = http_client.get(search_url, params=data_params)
+    if offset >= total_estimate:
+        return [], total_estimate
+
+    # Fetch from end (newest-first)
+    real_offset = max(0, total_estimate - offset - limit)
+    real_limit = min(limit, total_estimate - offset)
+
+    params = {
+        "page[offset]": str(real_offset),
+        "page[limit]": str(real_limit),
+        "fields": "metadata",
+        **filter_params,
+    }
+    resp = http_client.get(search_url, params=params)
     resp.raise_for_status()
-    items = resp.json().get("data", [])
+    resp_json = resp.json()
+    # Server bug: meta.count from data response ignores filters (returns
+    # unfiltered total).  Only trust it for unfiltered queries (corrects hints).
+    if unified_filters:
+        total = total_estimate
+    else:
+        total = resp_json.get("meta", {}).get("count", total_estimate)
+    items = resp_json.get("data", [])
+
+    # If hint was off (got 0 items), correct with real total
+    if not items and total > 0 and total != total_estimate:
+        real_offset = max(0, total - offset - limit)
+        real_limit = min(limit, total - offset)
+        params = {
+            "page[offset]": str(real_offset),
+            "page[limit]": str(real_limit),
+            "fields": "metadata",
+            **filter_params,
+        }
+        resp = http_client.get(search_url, params=params)
+        resp.raise_for_status()
+        items = resp.json().get("data", [])
 
     # Reverse so newest is first
     items.reverse()
 
     summaries = [_summary_from_rest_item(item) for item in items]
     return summaries, total
+
+
+def count_fast(
+    cat,
+    unified_filters: list[tuple[str, str, str]] | None = None,
+) -> int:
+    """
+    Return total matching scan count via REST with proper filter params.
+    """
+    node = _apply_filters(cat, unified_filters)
+    http_client = node.context.http_client
+    search_url = node.item["links"]["search"]
+    filter_params = getattr(node, "_queries_as_params", {})
+    params = {
+        "page[offset]": "0",
+        "page[limit]": "0",
+        **filter_params,
+    }
+    resp = http_client.get(search_url, params=params)
+    resp.raise_for_status()
+    return resp.json().get("meta", {}).get("count", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +352,7 @@ def build_query(cat, text: str = "", filters: dict[str, Any] | None = None,
     """
     from tiled.queries import Contains, Eq, FullText, Like
 
-    results = cat.sort(("time", -1))
+    results = cat.sort(("scan_id", -1))
     if text.strip():
         results = results.search(FullText(text.strip()))
     if filters:

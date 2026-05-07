@@ -44,6 +44,7 @@ import pandas as pd
 import panel as pn
 
 import tiled_browser as tb
+from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 
 log = logging.getLogger(__name__)
@@ -65,6 +66,10 @@ PAGE_SIZE = 25
 # the heavy integrators), but we need LOADER_DEFAULTS at widget-construct
 # time anyway, so eat the cost here rather than mirroring constants.
 from PyHyperScattering import smi_defaults as smid
+from PyHyperScattering.SMISWAXSIntegrator import (
+    clear_geometry_cache,
+    geometry_cache_info,
+)
 
 DEFAULT_TILED_URI = smid.DEFAULT_TILED_URI
 DEFAULT_CATALOG = smid.DEFAULT_CATALOG
@@ -211,10 +216,20 @@ class ScanCollection:
         ds = coll.stack_iq("sample")   # xr.Dataset along a new dim
     """
 
+    _PALETTE = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
+
     def __init__(self):
         self._results: dict[str, Any] = {}           # uid -> CombinedReductionResult
         self._metadata: dict[str, dict] = {}         # uid -> enhanced_summary dict
         self._processing: dict[str, dict] = {}       # uid -> processing kwargs
+        self._colors: dict[str, str] = {}            # uid -> hex color
+        self._color_idx = 0
+        self._primary_dfs: dict[str, pd.DataFrame] = {}   # uid -> primary scalars
+        self._baseline_dfs: dict[str, pd.DataFrame] = {}  # uid -> baseline scalars
+        self._raw_metadata: dict[str, dict] = {}          # uid -> full tiled metadata
 
     @property
     def uids(self) -> list[str]:
@@ -226,37 +241,130 @@ class ScanCollection:
     def __contains__(self, uid: str):
         return uid in self._results
 
-    def add(self, result, metadata: dict, params: dict | None = None):
-        """Add a processed scan to the collection."""
+    def add(self, result, metadata: dict, params: dict | None = None,
+             primary_df: pd.DataFrame | None = None,
+             baseline_df: pd.DataFrame | None = None,
+             raw_metadata: dict | None = None):
+        """Add a processed scan to the collection.
+
+        Parameters
+        ----------
+        primary_df : DataFrame, optional
+            Primary stream scalar data (for label columns / export).
+        baseline_df : DataFrame, optional
+            Baseline stream scalar data (for label columns / export).
+        raw_metadata : dict, optional
+            Full tiled metadata dict (for export).
+        """
         self._results[result.uid] = result
         self._metadata[result.uid] = metadata
         if params:
             self._processing[result.uid] = params
+        if primary_df is not None:
+            self._primary_dfs[result.uid] = primary_df
+        if baseline_df is not None:
+            self._baseline_dfs[result.uid] = baseline_df
+        if raw_metadata is not None:
+            self._raw_metadata[result.uid] = raw_metadata
+        if result.uid not in self._colors:
+            self._colors[result.uid] = self._PALETTE[
+                self._color_idx % len(self._PALETTE)
+            ]
+            self._color_idx += 1
 
     def remove(self, uid: str):
         self._results.pop(uid, None)
         self._metadata.pop(uid, None)
         self._processing.pop(uid, None)
+        self._colors.pop(uid, None)
+        self._primary_dfs.pop(uid, None)
+        self._baseline_dfs.pop(uid, None)
+        self._raw_metadata.pop(uid, None)
+
+    def get_color(self, uid: str) -> str:
+        return self._colors.get(uid, "#888888")
+
+    def set_color(self, uid: str, color: str) -> None:
+        if uid in self._results:
+            self._colors[uid] = color
 
     def get_result(self, uid: str):
         return self._results.get(uid)
 
-    def summary_table(self) -> pd.DataFrame:
-        """DataFrame summary of all scans in the collection."""
+    def available_label_columns(self) -> list[str]:
+        """Return sorted list of numeric column names from stored primary/baseline data."""
+        cols: set[str] = set()
+        for df in self._primary_dfs.values():
+            cols.update(c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]))
+        for df in self._baseline_dfs.values():
+            cols.update(
+                f"baseline:{c}" for c in df.columns
+                if pd.api.types.is_numeric_dtype(df[c])
+            )
+        return sorted(cols)
+
+    def get_label_value(self, uid: str, column: str) -> str:
+        """Get a representative label value for a scan from primary or baseline."""
+        if column.startswith("baseline:"):
+            field = column[len("baseline:"):]
+            df = self._baseline_dfs.get(uid)
+            if df is not None and field in df.columns:
+                vals = df[field].dropna()
+                if len(vals):
+                    return f"{vals.iloc[0]:.6g}"
+        else:
+            df = self._primary_dfs.get(uid)
+            if df is not None and column in df.columns:
+                vals = df[column].dropna()
+                if len(vals):
+                    # Use median as representative value for multi-frame scans
+                    return f"{vals.median():.6g}"
+        return "?"
+
+    def get_primary_df(self, uid: str) -> pd.DataFrame | None:
+        return self._primary_dfs.get(uid)
+
+    def get_baseline_df(self, uid: str) -> pd.DataFrame | None:
+        return self._baseline_dfs.get(uid)
+
+    def get_raw_metadata(self, uid: str) -> dict | None:
+        return self._raw_metadata.get(uid)
+
+    def summary_table(self, label_column: str | None = None) -> pd.DataFrame:
+        """DataFrame summary of all scans in the collection.
+
+        Parameters
+        ----------
+        label_column : str, optional
+            A primary or baseline field name (baseline fields prefixed with
+            ``baseline:``) to include as an extra column in the table.
+        """
         rows = []
         for uid in self._results:
             res = self._results[uid]
             meta = self._metadata.get(uid, {})
             timing = res.timing or {}
-            rows.append({
+            det_list = meta.get("detector_list")
+            if det_list and isinstance(det_list, list):
+                detectors = ", ".join(det_list)
+            else:
+                detectors = meta.get("detectors", "?")
+            row = {
+                "color":     self._colors.get(uid, "#888888"),
                 "uid_short": uid[:8],
                 "sample":    meta.get("sample_name", "?"),
                 "plan":      meta.get("plan_name", "?"),
+                "detectors": detectors,
                 "geometry":  res.geometry,
                 "total_s":   f"{sum(timing.values()):.1f}" if timing else "?",
                 "uid":       uid,
-            })
-        cols = ["uid_short", "sample", "plan", "geometry", "total_s", "uid"]
+            }
+            if label_column:
+                row["label_val"] = self.get_label_value(uid, label_column)
+            rows.append(row)
+        cols = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
+        if label_column:
+            cols.insert(3, "label_val")
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
     def varying_parameters(self) -> dict[str, list]:
@@ -300,10 +408,114 @@ class ScanCollection:
         ax.set_yscale("log")
         ax.set_xlabel("q (nm⁻¹)")
         ax.set_ylabel("I(q)")
-        ax.set_title("Scan Collection — I(q) Comparison")
+        ax.set_title("Processed Collection — I(q) Comparison")
         ax.legend(fontsize=8, loc="best")
         fig.tight_layout()
         return fig
+
+    def iq_comparison_bokeh(self, uids: list[str] | None = None,
+                            label_column: str | None = None):
+        """Bokeh figure overlaying I(q) for selected uids (or all).
+
+        Uses stored per-scan colours (matching the table swatch) and
+        omits the legend — the table serves as the interactive legend.
+        Hovering highlights the nearest curve and dims the others.
+
+        Parameters
+        ----------
+        label_column : str, optional
+            If given, the chosen primary/baseline value is appended to
+            the hover tooltip label for each curve.
+        """
+        from bokeh.events import MouseLeave
+        from bokeh.models import CustomJS, HoverTool
+        from bokeh.models.glyphs import Line as BkLine
+        from bokeh.plotting import figure as bk_figure
+
+        subset = uids if uids else list(self._results.keys())
+        subset = [u for u in subset if u in self._results]
+        if not subset:
+            return None
+
+        p = bk_figure(
+            title="Processed Collection — I(q) Comparison",
+            width=1000, height=500,
+            x_axis_type="log", y_axis_type="log",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+            sizing_mode="stretch_both",
+        )
+
+        renderers = []
+        for uid in subset:
+            res = self._results[uid]
+            meta = self._metadata.get(uid, {})
+            label_parts = [uid[:8], meta.get('sample_name', '?')]
+            if label_column:
+                label_parts.append(f"{label_column}={self.get_label_value(uid, label_column)}")
+            label = " — ".join(label_parts)
+            color = self._colors.get(uid, "#888888")
+            iq = res.merged_iq
+            q = iq["q"].values
+            I = iq["I"].values
+            mask = np.isfinite(I) & (I > 0)
+            if mask.any():
+                r = p.line(
+                    q[mask], I[mask],
+                    line_width=1.2, line_alpha=0.4,
+                    color=color, name=label,
+                )
+                r.hover_glyph = BkLine(
+                    line_color=color, line_alpha=1.0, line_width=3.5,
+                )
+                renderers.append(r)
+
+        p.xaxis.axis_label = "q (nm⁻¹)"
+        p.yaxis.axis_label = "I(q)"
+        if p.legend:
+            p.legend.visible = False
+
+        if renderers:
+            # Hover on nearest line: brightens it, tooltip shows scan info.
+            # A JS callback dims all OTHER lines while one is inspected.
+            hover_cb = CustomJS(args=dict(renderers=renderers), code="""
+                const r = cb_obj.renderers;
+                const inspected = r.filter(
+                    rend => rend.inspected && rend.inspected.indices.length > 0
+                );
+                if (inspected.length > 0) {
+                    for (const rend of renderers) {
+                        if (inspected.includes(rend)) {
+                            rend.glyph.line_alpha = 1.0;
+                            rend.glyph.line_width = 3.5;
+                        } else {
+                            rend.glyph.line_alpha = 0.08;
+                            rend.glyph.line_width = 0.7;
+                        }
+                    }
+                }
+            """)
+            reset_cb = CustomJS(args=dict(renderers=renderers), code="""
+                for (const r of renderers) {
+                    r.glyph.line_alpha = 0.4;
+                    r.glyph.line_width = 1.2;
+                }
+            """)
+            hover = HoverTool(
+                renderers=renderers,
+                tooltips=[
+                    ("scan", "$name"),
+                    ("q", "$x{0.000}"),
+                    ("I", "$y{0.00e+0}"),
+                ],
+                line_policy="nearest",
+                mode="mouse",
+                callback=hover_cb,
+            )
+            p.add_tools(hover)
+            p.js_on_event(MouseLeave, reset_cb)
+
+        return p
 
     def stack_iq(self, dim_name: str = "scan", dim_values=None):
         """
@@ -330,7 +542,7 @@ class ScanCollection:
 # Global state
 # ---------------------------------------------------------------------------
 
-_cat = None
+_cat = None          # migration catalog (for data access / processing)
 _collection = ScanCollection()
 
 _state = {
@@ -356,9 +568,12 @@ _last_result = {"result": None, "params": None}
 
 
 def _get_cat():
+    """Return the migration catalog (used for data access / processing)."""
     global _cat
     if _cat is None:
+        t0 = time.time()
         _cat = tb.connect(DEFAULT_TILED_URI, DEFAULT_CATALOG)
+        log.info("tiled connect (migration) took %.2fs", time.time() - t0)
     return _cat
 
 
@@ -370,8 +585,8 @@ def _n_pages() -> int:
 # Search / data helpers
 # ---------------------------------------------------------------------------
 
-SEARCH_TYPES = ["Anywhere", "Text in field", "Exact"]
-SEARCH_TYPE_MAP = {"Anywhere": "anywhere", "Text in field": "like", "Exact": "exact"}
+SEARCH_TYPES = ["Anywhere", "Text in field", "Contains", "Exact"]
+SEARCH_TYPE_MAP = {"Anywhere": "anywhere", "Text in field": "like", "Contains": "contains", "Exact": "exact"}
 
 
 def _collect_unified_filters() -> list[tuple[str, str, str]]:
@@ -398,6 +613,10 @@ def _fetch_page() -> pd.DataFrame:
     )
     # Update total from REST response (avoids a separate count query)
     _state["total"] = total
+
+    # Persist unfiltered count for next startup
+    if total > 0 and not unified:
+        tb.save_cached_count(total)
 
     if not summaries:
         return _EMPTY_DF.copy()
@@ -755,6 +974,67 @@ w_filter_column = pn.Column(sizing_mode="stretch_width")
 # Cancellation flag — set by Reset to abort in-flight queries
 _cancel = threading.Event()
 
+# ---------------------------------------------------------------------------
+# Debounced live count — lightweight count query while typing
+# ---------------------------------------------------------------------------
+
+_live_count_timer: threading.Timer | None = None
+_LIVE_COUNT_DEBOUNCE_S = 0.4  # seconds after last keystroke before firing
+
+
+def _collect_unified_filters_from_input() -> list[tuple[str, str, str]]:
+    """Like _collect_unified_filters but reads value_input (live typing)."""
+    filters = []
+    for row in _filter_rows:
+        ftype = SEARCH_TYPE_MAP.get(row["type"].value, "like")
+        key = row["key"].value.strip() if ftype != "anywhere" else ""
+        # Use value_input if the user is actively typing; fall back to
+        # committed value (useful after Enter when value_input resets).
+        val = row["val"].value_input or row["val"].value or ""
+        val = val.strip()
+        if val:
+            filters.append((ftype, key, val))
+    return filters
+
+
+def _live_count_fire():
+    """Execute a lightweight count-only query and update the status line."""
+    if _cancel.is_set():
+        return
+    unified = _collect_unified_filters_from_input()
+    # Don't fire if nothing is typed
+    if not unified:
+        return
+    try:
+        total = tb.count_fast(
+            _get_cat(), unified_filters=unified,
+        )
+    except Exception:
+        return  # silently ignore errors during live count
+    if _cancel.is_set():
+        return
+    # Schedule the widget update on the Bokeh document thread to avoid
+    # cross-thread issues with Panel/Bokeh state management.
+    msg = f"~**{total} scan{'s' if total != 1 else ''}** matching (press Enter to load)"
+    try:
+        doc = pn.state.curdoc
+        if doc is not None:
+            doc.add_next_tick_callback(lambda: setattr(w_status, "object", msg))
+        else:
+            w_status.object = msg
+    except Exception:
+        w_status.object = msg
+
+
+def _schedule_live_count(*_events):
+    """Debounce: reset the timer on each keystroke, fire after the delay."""
+    global _live_count_timer
+    if _live_count_timer is not None:
+        _live_count_timer.cancel()
+    _live_count_timer = threading.Timer(_LIVE_COUNT_DEBOUNCE_S, _live_count_fire)
+    _live_count_timer.daemon = True
+    _live_count_timer.start()
+
 
 def _make_filter_row(ftype: str = "Text in field", key: str = "", val: str = "") -> dict:
     """Create one unified filter row: type selector + key + value + suggest + remove."""
@@ -856,6 +1136,10 @@ def _make_filter_row(ftype: str = "Text in field", key: str = "", val: str = "")
         _do_search(0)
     w_val.param.watch(_on_enter, "value")
 
+    # Live count while typing: fires lightweight count query after debounce.
+    w_val.param.watch(_schedule_live_count, "value_input")
+    w_key.param.watch(_schedule_live_count, "value_input")
+
     return row_dict
 
 
@@ -887,8 +1171,8 @@ w_btn_add_filter.on_click(_add_filter)
 w_btn_search = pn.widgets.Button(name="Search", button_type="primary", width=80)
 w_btn_reset = pn.widgets.Button(name="Reset", button_type="warning", width=70)
 
-w_status = pn.pane.Markdown("*Ready*", width=700)
-w_search_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
+w_status = pn.pane.Markdown("*Connecting to catalog…*", width=700)
+w_search_spinner = pn.indicators.LoadingSpinner(value=True, size=20, visible=True)
 w_btn_first = pn.widgets.Button(name="⏮", width=40, button_type="light")
 w_btn_prev = pn.widgets.Button(name="◀", width=40, button_type="light")
 w_btn_next = pn.widgets.Button(name="▶", width=40, button_type="light")
@@ -961,7 +1245,7 @@ w_image_thumb = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_heigh
 w_image_status = pn.pane.Markdown("")
 w_image_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
 w_image_slider = pn.widgets.IntSlider(
-    name="Frame", start=0, end=0, value=0, step=1, sizing_mode="stretch_width",
+    name="Frame", start=0, end=1, value=0, step=1, sizing_mode="stretch_width",
 )
 w_image_field = pn.widgets.Select(
     name="Detector", options=[], width=200,
@@ -1068,6 +1352,364 @@ def _on_image_field(event):
 
 w_image_slider.param.watch(_on_image_slider, "value")
 w_image_field.param.watch(_on_image_field, "value")
+
+
+# ---------------------------------------------------------------------------
+# Grid (multi-frame) tab — facet grid of all frames for one detector,
+# with linked axes, colormap / log / range controls, and intensity hover.
+# ---------------------------------------------------------------------------
+
+MV_PALETTES = [
+    "Turbo256", "Viridis256", "Plasma256", "Inferno256",
+    "Magma256", "Cividis256", "Greys256",
+]
+MV_MAX_FRAMES = 64  # safety cap so we don't spawn hundreds of figures
+
+w_mv_field = pn.widgets.Select(name="Detector", options=[], width=200)
+w_mv_cmap = pn.widgets.Select(
+    name="Colormap", value="Turbo256", options=MV_PALETTES, width=140,
+)
+w_mv_log = pn.widgets.Checkbox(name="Log color scale", value=True, width=140)
+w_mv_range = pn.widgets.RangeSlider(
+    name="Intensity (log10)", start=-2.0, end=6.0, value=(-1.0, 4.0),
+    step=0.05, sizing_mode="stretch_width", format="0.00",
+    tooltips=True,
+)
+w_mv_status = pn.pane.Markdown("*Click tab to load.*")
+w_mv_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
+w_mv_label = pn.widgets.Select(
+    name="Frame label", options=["(frame #)"], value="(frame #)", width=180,
+)
+w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
+
+_multiview_cache: dict = {
+    "uid": None, "field": None, "n_frames": 0,
+    "frames": None, "renderers": None, "mapper": None,
+    "log": None, "data_lo": None, "data_hi": None,
+    "suspend_range_cb": False,
+}
+
+
+def _mv_grid_dims(n: int) -> tuple[int, int]:
+    """Pick (rows, cols) so cols/rows ≈ 2 (approx 2:1 grid aspect)."""
+    if n <= 0:
+        return 1, 1
+    rows = max(1, int(round(np.sqrt(n / 2.0))))
+    cols = int(np.ceil(n / rows))
+    # Make sure it actually fits
+    while rows * cols < n:
+        cols += 1
+    return rows, cols
+
+
+def _mv_compute_data_range(frames):
+    """Return (lo, hi) finite-positive percentile bounds across all frames."""
+    lo, hi = None, None
+    for arr in frames:
+        finite = arr[np.isfinite(arr) & (arr > 0)]
+        if not finite.size:
+            continue
+        flo = float(np.percentile(finite, 1))
+        fhi = float(np.percentile(finite, 99.5))
+        if lo is None or flo < lo:
+            lo = flo
+        if hi is None or fhi > hi:
+            hi = fhi
+    if lo is None:
+        return 1e-3, 1.0
+    lo = max(lo, 1e-6)
+    if hi <= lo:
+        hi = lo * 10
+    return lo, hi
+
+
+def _build_multiview_grid(frames, field):
+    """Build the Bokeh gridplot of all frames with linked axes."""
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.layouts import gridplot
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, HoverTool,
+        LinearColorMapper, LogColorMapper,
+    )
+
+    if not frames:
+        w_mv_grid.object = None
+        return
+
+    # Build per-frame labels from primary scalar column if selected
+    label_col = w_mv_label.value
+    frame_labels: list[str] = []
+    if label_col and label_col != "(frame #)":
+        df = w_primary_table.value
+        if df is not None and label_col in df.columns:
+            vals = df[label_col].values
+            for i in range(len(frames)):
+                if i < len(vals):
+                    v = vals[i]
+                    try:
+                        frame_labels.append(f"{label_col}={float(v):.4g}")
+                    except (ValueError, TypeError):
+                        frame_labels.append(f"{label_col}={v}")
+                else:
+                    frame_labels.append(f"frame {i}")
+    if not frame_labels:
+        frame_labels = [f"frame {i}" for i in range(len(frames))]
+
+    # Per-frame display arrays + global data range
+    displays = [np.where(np.isfinite(a), a, 0).astype(np.float32) for a in frames]
+    data_lo, data_hi = _mv_compute_data_range(frames)
+    _multiview_cache["data_lo"] = data_lo
+    _multiview_cache["data_hi"] = data_hi
+
+    # Sync the range slider bounds to the data range (in log10 space)
+    log10_lo = float(np.log10(data_lo))
+    log10_hi = float(np.log10(data_hi))
+    # Suspend the slider callback while we reconfigure it
+    _multiview_cache["suspend_range_cb"] = True
+    try:
+        w_mv_range.start = log10_lo - 0.5
+        w_mv_range.end = log10_hi + 0.5
+        # Clamp current value into new bounds
+        cur_lo, cur_hi = w_mv_range.value
+        cur_lo = max(min(cur_lo, w_mv_range.end - 0.05), w_mv_range.start)
+        cur_hi = max(min(cur_hi, w_mv_range.end), cur_lo + 0.05)
+        # On a fresh detector load, snap to data percentiles
+        if (_multiview_cache.get("field") != field
+                or _multiview_cache.get("mapper") is None):
+            cur_lo, cur_hi = log10_lo, log10_hi
+        w_mv_range.value = (cur_lo, cur_hi)
+    finally:
+        _multiview_cache["suspend_range_cb"] = False
+
+    lo_val = 10 ** w_mv_range.value[0]
+    hi_val = 10 ** w_mv_range.value[1]
+    palette = w_mv_cmap.value
+    use_log = bool(w_mv_log.value)
+    if use_log:
+        mapper = LogColorMapper(palette=palette,
+                                low=max(lo_val, 1e-9),
+                                high=max(hi_val, lo_val * 1.1))
+    else:
+        mapper = LinearColorMapper(palette=palette, low=lo_val, high=hi_val)
+
+    rows, cols = _mv_grid_dims(len(frames))
+    figs = []
+    renderers = []
+    shared_x = None
+    shared_y = None
+    for i, disp in enumerate(displays):
+        h, w = disp.shape
+        kwargs = dict(
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+            match_aspect=True,
+            sizing_mode="stretch_both",
+            min_height=180,
+        )
+        if shared_x is not None:
+            kwargs["x_range"] = shared_x
+            kwargs["y_range"] = shared_y
+        else:
+            kwargs["x_range"] = (0, w)
+            kwargs["y_range"] = (0, h)
+        p = bk_figure(title=frame_labels[i], **kwargs)
+        if shared_x is None:
+            shared_x = p.x_range
+            shared_y = p.y_range
+        src = ColumnDataSource(
+            data=dict(image=[disp], x=[0], y=[0], dw=[w], dh=[h]),
+        )
+        r = p.image(image="image", x="x", y="y", dw="dw", dh="dh",
+                    color_mapper=mapper, source=src)
+        hover = HoverTool(
+            renderers=[r],
+            tooltips=[
+                ("label", frame_labels[i]),
+                ("frame", str(i)),
+                ("(col, row)", "($x{0}, $y{0})"),
+                ("intensity", "@image{0.000}"),
+            ],
+            point_policy="follow_mouse",
+        )
+        p.add_tools(hover)
+        p.xaxis.visible = False
+        p.yaxis.visible = False
+        p.title.text_font_size = "9pt"
+        # Add colorbar to the rightmost column, top row only — keeps grid tidy
+        if i == cols - 1 or (i == len(displays) - 1 and i < cols):
+            p.add_layout(
+                ColorBar(color_mapper=mapper, label_standoff=6, width=10),
+                "right",
+            )
+        figs.append(p)
+        renderers.append(r)
+
+    # Pad with None so gridplot fills the rectangle cleanly
+    grid_cells = [figs[r * cols:(r + 1) * cols] for r in range(rows)]
+    for row in grid_cells:
+        while len(row) < cols:
+            row.append(None)
+
+    grid = gridplot(grid_cells, sizing_mode="stretch_both",
+                    toolbar_location="above", merge_tools=True)
+    w_mv_grid.object = grid
+    _multiview_cache["renderers"] = renderers
+    _multiview_cache["mapper"] = mapper
+    _multiview_cache["log"] = use_log
+    _multiview_cache["field"] = field
+
+
+def _load_multiview():
+    """Fetch all frames for the current detector and build the grid."""
+    run = _ensure_run()
+    if not run:
+        return
+    # Re-use primary stream info (loaded by Explore / Primary tabs too)
+    info = _detail_cache.get("primary_info")
+    if info is None and "primary" in tb.stream_names(run):
+        info = tb.stream_info_for(run, "primary")
+        _detail_cache["primary_info"] = info
+        _detail_cache["primary_dataset"] = info.get("dataset")
+
+    if not info or not info["images"]:
+        w_mv_status.object = "*No image fields found.*"
+        w_mv_grid.object = None
+        return
+
+    # Ensure primary scalars are loaded so the label dropdown has options
+    if not _detail_cache.get("primary_loaded"):
+        _load_primary()
+    df = w_primary_table.value
+    label_options = ["(frame #)"]
+    if df is not None and not df.empty:
+        label_options += [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    prev_label = w_mv_label.value
+    w_mv_label.options = label_options
+    if prev_label in label_options:
+        w_mv_label.value = prev_label
+    else:
+        w_mv_label.value = "(frame #)"
+
+    image_fields = list(info["images"])
+    # Populate detector dropdown (preserve previous choice if present)
+    prev = w_mv_field.value
+    if list(w_mv_field.options) != image_fields:
+        w_mv_field.options = []
+        w_mv_field.options = image_fields
+    field = prev if prev in image_fields else image_fields[0]
+    if w_mv_field.value != field:
+        # Setting value will trigger _on_mv_field which does the fetch.
+        w_mv_field.value = field
+        return
+
+    _fetch_and_build_multiview(field)
+
+
+def _fetch_and_build_multiview(field: str):
+    """Fetch every frame of `field` and (re)build the grid."""
+    run = _ensure_run()
+    if not run or not field:
+        return
+    info = _detail_cache.get("primary_info")
+    if not info:
+        return
+    shape = info["fields"].get(field, ())
+    n_frames = shape[0] if len(shape) >= 3 else 1
+    if n_frames > MV_MAX_FRAMES:
+        capped_n = MV_MAX_FRAMES
+        cap_msg = f" (showing first {MV_MAX_FRAMES} of {n_frames})"
+    else:
+        capped_n = n_frames
+        cap_msg = ""
+
+    w_mv_spinner.value = True
+    w_mv_spinner.visible = True
+    w_mv_status.object = f"*Loading {capped_n} frames…*"
+    t0 = time.perf_counter()
+    ds = _detail_cache.get("primary_dataset")
+    frames = []
+    for i in range(capped_n):
+        arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
+        if arr is None:
+            continue
+        frames.append(_orient_frame(arr, field))
+    _multiview_cache["frames"] = frames
+    _multiview_cache["n_frames"] = capped_n
+    _multiview_cache["uid"] = _state.get("selected_uid")
+    _build_multiview_grid(frames, field)
+    dt_ms = (time.perf_counter() - t0) * 1000
+    w_mv_spinner.value = False
+    w_mv_spinner.visible = False
+    w_mv_status.object = (
+        f"**primary/{field}** — {len(frames)} frames{cap_msg} ({dt_ms:.0f} ms)"
+    )
+
+
+def _on_mv_field(event):
+    field = event.new
+    if not field:
+        return
+    _fetch_and_build_multiview(field)
+
+
+def _on_mv_cmap(event):
+    mapper = _multiview_cache.get("mapper")
+    if mapper is None:
+        return
+    try:
+        mapper.palette = event.new
+    except Exception as exc:
+        log.warning("multiview palette update failed: %s", exc)
+
+
+def _on_mv_log(event):
+    # Switching between Linear / Log mapper requires a rebuild
+    field = _multiview_cache.get("field")
+    frames = _multiview_cache.get("frames")
+    if not field or not frames:
+        return
+    _build_multiview_grid(frames, field)
+
+
+def _on_mv_range(event):
+    if _multiview_cache.get("suspend_range_cb"):
+        return
+    mapper = _multiview_cache.get("mapper")
+    if mapper is None:
+        return
+    lo, hi = event.new
+    lo_v = 10 ** float(lo)
+    hi_v = 10 ** float(hi)
+    if hi_v <= lo_v:
+        hi_v = lo_v * 1.0001
+    try:
+        mapper.low = max(lo_v, 1e-9) if isinstance(mapper.low, (int, float)) else lo_v
+        mapper.high = hi_v
+    except Exception as exc:
+        log.warning("multiview range update failed: %s", exc)
+
+
+w_mv_field.param.watch(_on_mv_field, "value")
+w_mv_cmap.param.watch(_on_mv_cmap, "value")
+w_mv_log.param.watch(_on_mv_log, "value")
+# Watch value_throttled — Panel streams this continuously during drag but
+# coalesces events so we only process the most recent position, avoiding
+# a backlog of Python round-trips.
+w_mv_range.param.watch(_on_mv_range, "value_throttled")
+# Also watch 'value' (fires on mouse-up) as a final sync to ensure the
+# mapper is always exactly at the released position.
+w_mv_range.param.watch(_on_mv_range, "value")
+
+
+def _on_mv_label(event):
+    """Rebuild grid with updated frame labels when the label column changes."""
+    field = _multiview_cache.get("field")
+    frames = _multiview_cache.get("frames")
+    if field and frames:
+        _build_multiview_grid(frames, field)
+
+
+w_mv_label.param.watch(_on_mv_label, "value")
 
 
 # ---------------------------------------------------------------------------
@@ -1435,34 +2077,461 @@ w_btn_add_collection = pn.widgets.Button(
 )
 w_proc_status = pn.pane.Markdown("*Select a scan and click Process.*")
 w_proc_spinner = pn.indicators.LoadingSpinner(value=False, size=40, visible=False)
-w_proc_iq_plot = pn.pane.Bokeh(object=None, sizing_mode="fixed", width=1000, height=400)
-w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="fixed", width=1000, height=1000)
+w_proc_iq_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=400)
+w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=500)
 w_proc_frame_slider = pn.widgets.IntSlider(
-    name="Frame", start=0, end=0, value=0, step=1, width=400,
+    name="Frame", start=0, end=1, value=0, step=1, width=400,
 )
 _proc_result_cache = {"result": None, "gi_result": None}
+
+# Guard: suppress _update_proc_2d while _on_process is building its own plot
+_processing_guard = {"active": False}
+
+# ---------------------------------------------------------------------------
+# Geometry cache monitoring / control
+# ---------------------------------------------------------------------------
+
+w_cache_enabled = pn.widgets.Checkbox(
+    name="Cache geometry between reductions", value=True, width=250,
+)
+w_cache_info = pn.pane.Markdown("*Click Refresh to view geometry cache status.*")
+w_btn_cache_refresh = pn.widgets.Button(
+    name="🔄 Refresh", button_type="default", width=100,
+)
+w_btn_cache_clear = pn.widgets.Button(
+    name="🗑 Clear cache", button_type="warning", width=120,
+)
+
+
+def _refresh_cache_info(_event=None):
+    """Update the cache info display."""
+    info = geometry_cache_info()
+    n = info.get("size", 0)
+    mb = info.get("estimated_mb", 0.0)
+    keys = info.get("keys", [])
+    lines = [
+        f"**Cached geometries:** {n}",
+        f"**Estimated memory:** {mb:.1f} MB",
+    ]
+    if keys:
+        lines.append("")
+        lines.append("**Entries:**")
+        for k in keys:
+            lines.append(f"- `{k}`")
+    w_cache_info.object = "\n".join(lines)
+
+
+def _clear_cache(_event=None):
+    """Clear the geometry cache and refresh the display."""
+    clear_geometry_cache()
+    _refresh_cache_info()
+    pn.state.notifications.info("Geometry cache cleared.")
+
+
+w_btn_cache_refresh.on_click(_refresh_cache_info)
+w_btn_cache_clear.on_click(_clear_cache)
+
+# ---------------------------------------------------------------------------
+# Cross-sections — interactive horizontal/vertical slices on the 2D map
+# ---------------------------------------------------------------------------
+#
+# Persisted across scans so the same set of cuts is automatically re-applied
+# each time a new scan is processed.  Each entry is:
+#   {"kind": "h"|"v", "center": float, "width": float}
+# For an h-cut, ``center`` is in y-units (chi or qz) and ``width`` is the
+# slice extent along y.  For a v-cut, both are in x-units (q or qxy).
+_persisted_cuts: list[dict] = []
+
+# Cache of the data currently rendered in the Process tab's 2D plot, used
+# to recompute cross sections when cuts move/resize or the frame changes.
+_proc_2d_cache: dict[str, Any] = {
+    "x": None, "y": None, "image": None,
+    "x_label": "", "y_label": "",
+    "title": "",
+    "cuts_source": None,
+    "cut_renderer": None,
+}
+
+# Recursion guard for the cuts ColumnDataSource.on_change callback —
+# avoids feedback loops when we snap rectangles back to canonical extents.
+_cuts_guard = {"in_progress": False}
+
+_CUT_FILL = {"h": "#1f77b4", "v": "#d62728"}
+_CUT_LINE = {"h": "#0a3a6e", "v": "#7a1414"}
+
+
+def _cuts_to_source_data(cuts: list[dict]) -> dict:
+    """Project the persisted cuts list into Bokeh Rect glyph columns."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    if x is None or y is None or len(x) == 0 or len(y) == 0:
+        return dict(x=[], y=[], width=[], height=[],
+                    kind=[], fill_color=[], line_color=[])
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    xc = (xmin + xmax) / 2.0
+    yc = (ymin + ymax) / 2.0
+    xw = xmax - xmin
+    yh = ymax - ymin
+    cx, cy, w, h, kinds, fc, lc = [], [], [], [], [], [], []
+    for cut in cuts:
+        k = cut["kind"]
+        if k == "h":
+            cx.append(xc)
+            cy.append(float(cut["center"]))
+            w.append(xw)
+            h.append(float(cut["width"]))
+        else:
+            cx.append(float(cut["center"]))
+            cy.append(yc)
+            w.append(float(cut["width"]))
+            h.append(yh)
+        kinds.append(k)
+        fc.append(_CUT_FILL[k])
+        lc.append(_CUT_LINE[k])
+    return dict(x=cx, y=cy, width=w, height=h,
+                kind=kinds, fill_color=fc, line_color=lc)
+
+
+def _source_data_to_cuts(data: dict) -> list[dict]:
+    """Inverse of ``_cuts_to_source_data`` — also classifies any newly drawn
+    boxes (which lack a ``kind``) by aspect ratio against the plot extents."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    if x is None or y is None or len(x) == 0 or len(y) == 0:
+        return []
+    xspan = float(np.max(x) - np.min(x)) or 1.0
+    yspan = float(np.max(y) - np.min(y)) or 1.0
+    cuts = []
+    kinds = list(data.get("kind", []))
+    xs = list(data.get("x", []))
+    ys = list(data.get("y", []))
+    ws = list(data.get("width", []))
+    hs = list(data.get("height", []))
+    for i, (cx, cy, w, h) in enumerate(zip(xs, ys, ws, hs)):
+        k = kinds[i] if i < len(kinds) and kinds[i] else None
+        if not k:
+            # New box drawn via shift-drag in the toolbar — classify by
+            # how it compares to the data span on each axis.
+            k = "h" if (w / xspan) >= (h / yspan) else "v"
+        if k == "h":
+            cuts.append({"kind": "h",
+                         "center": float(cy),
+                         "width": float(abs(h))})
+        else:
+            cuts.append({"kind": "v",
+                         "center": float(cx),
+                         "width": float(abs(w))})
+    return cuts
+
+
+def _compute_cross_section(cut: dict):
+    """Return ``(axis, intensity, axis_label)`` for one cut, or ``None``."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    img = cache["image"]
+    if x is None or y is None or img is None:
+        return None
+    c = float(cut["center"])
+    w = float(cut["width"]) or 0.0
+    half = max(w / 2.0, 0.0)
+    if cut["kind"] == "h":
+        mask = (y >= c - half) & (y <= c + half)
+        if not np.any(mask):
+            # Fall back to nearest single row
+            idx = int(np.argmin(np.abs(y - c)))
+            section = img[idx, :].astype(float)
+        else:
+            section = np.nanmean(img[mask, :], axis=0)
+        return x, section, cache["x_label"]
+    mask = (x >= c - half) & (x <= c + half)
+    if not np.any(mask):
+        idx = int(np.argmin(np.abs(x - c)))
+        section = img[:, idx].astype(float)
+    else:
+        section = np.nanmean(img[:, mask], axis=1)
+    return y, section, cache["y_label"]
+
+
+def _format_cut_label(i: int, cut: dict) -> str:
+    arrow = "─" if cut["kind"] == "h" else "│"
+    return f"{arrow} #{i + 1}: c={cut['center']:.3g}, Δ={cut['width']:.3g}"
+
+
+def _refresh_cuts_table():
+    rows = [{
+        "#": i + 1,
+        "kind": "horizontal" if c["kind"] == "h" else "vertical",
+        "center": round(c["center"], 6),
+        "width": round(c["width"], 6),
+    } for i, c in enumerate(_persisted_cuts)]
+    cols = ["#", "kind", "center", "width"]
+    w_cuts_table.value = (pd.DataFrame(rows, columns=cols)
+                          if rows else pd.DataFrame(columns=cols))
+
+
+def _render_cuts_plot():
+    """Redraw cross-section plots: separate axes for h and v cuts."""
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.layouts import column as bk_column
+
+    if not _persisted_cuts or _proc_2d_cache["image"] is None:
+        w_proc_cuts_plot.object = None
+        return
+
+    h_cuts = [(i, c) for i, c in enumerate(_persisted_cuts) if c["kind"] == "h"]
+    v_cuts = [(i, c) for i, c in enumerate(_persisted_cuts) if c["kind"] == "v"]
+
+    x_log = w_cuts_log_x.value
+    y_log = w_cuts_log_y.value
+    x_type = "log" if x_log else "linear"
+    y_type = "log" if y_log else "linear"
+
+    plots = []
+
+    if h_cuts:
+        p_h = bk_figure(
+            title="Horizontal cuts \u2014 I(q)", height=300,
+            sizing_mode="stretch_width",
+            x_axis_type=x_type, y_axis_type=y_type,
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+        )
+        plotted = False
+        for i, cut in h_cuts:
+            out = _compute_cross_section(cut)
+            if out is None:
+                continue
+            axis, section, axis_label = out
+            finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+            if not np.any(finite):
+                continue
+            alpha = max(0.4, 1.0 - 0.15 * i)
+            p_h.line(axis[finite], section[finite],
+                     line_color=_CUT_FILL["h"], line_width=1.4, alpha=alpha,
+                     legend_label=_format_cut_label(i, cut))
+            plotted = True
+        if plotted:
+            p_h.xaxis.axis_label = _proc_2d_cache["x_label"]
+            p_h.yaxis.axis_label = "I"
+            p_h.legend.click_policy = "hide"
+            p_h.legend.label_text_font_size = "9pt"
+            plots.append(p_h)
+
+    if v_cuts:
+        p_v = bk_figure(
+            title="Vertical cuts \u2014 I(\u03c7)", height=300,
+            sizing_mode="stretch_width",
+            x_axis_type=x_type, y_axis_type=y_type,
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+        )
+        plotted = False
+        for i, cut in v_cuts:
+            out = _compute_cross_section(cut)
+            if out is None:
+                continue
+            axis, section, axis_label = out
+            finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+            if not np.any(finite):
+                continue
+            alpha = max(0.4, 1.0 - 0.15 * i)
+            p_v.line(axis[finite], section[finite],
+                     line_color=_CUT_FILL["v"], line_width=1.4, alpha=alpha,
+                     legend_label=_format_cut_label(i, cut))
+            plotted = True
+        if plotted:
+            p_v.xaxis.axis_label = _proc_2d_cache["y_label"]
+            p_v.yaxis.axis_label = "I"
+            p_v.legend.click_policy = "hide"
+            p_v.legend.label_text_font_size = "9pt"
+            plots.append(p_v)
+
+    if not plots:
+        w_proc_cuts_plot.object = None
+        return
+    w_proc_cuts_plot.object = bk_column(*plots, sizing_mode="stretch_width")
+
+
+def _on_cuts_data_change(attr, old, new):
+    """Bokeh callback: source.data mutated by user (drag/resize/draw/delete)."""
+    if _cuts_guard["in_progress"]:
+        return
+    cuts = _source_data_to_cuts(new)
+    _persisted_cuts.clear()
+    _persisted_cuts.extend(cuts)
+    # Snap perpendicular extents back to full plot range.
+    snapped = _cuts_to_source_data(cuts)
+    if snapped != dict(new):
+        _cuts_guard["in_progress"] = True
+        try:
+            src = _proc_2d_cache.get("cuts_source")
+            if src is not None:
+                src.data = snapped
+        finally:
+            _cuts_guard["in_progress"] = False
+    _refresh_cuts_table()
+    _render_cuts_plot()
+
+
+def _attach_cuts_to_figure(p, x, y, image, x_label, y_label, title=""):
+    """Cache the figure's data and wire the cross-section overlay + tool."""
+    from bokeh.models import BoxEditTool, ColumnDataSource
+
+    x_arr = np.asarray(x)
+    y_arr = np.asarray(y)
+    img_arr = np.asarray(image)
+    # Normalize to (n_y, n_x) so _compute_cross_section can index correctly.
+    if img_arr.shape == (len(x_arr), len(y_arr)):
+        img_arr = img_arr.T
+    _proc_2d_cache.update(
+        x=x_arr, y=y_arr,
+        image=img_arr,
+        x_label=x_label, y_label=y_label, title=title,
+    )
+    src = ColumnDataSource(data=_cuts_to_source_data(_persisted_cuts))
+    rect = p.rect(
+        x="x", y="y", width="width", height="height",
+        fill_color="fill_color", fill_alpha=0.18,
+        line_color="line_color", line_width=2, line_dash="dashed",
+        source=src,
+    )
+    edit_tool = BoxEditTool(renderers=[rect], num_objects=20)
+    p.add_tools(edit_tool)
+    src.on_change("data", _on_cuts_data_change)
+    _proc_2d_cache["cuts_source"] = src
+    _proc_2d_cache["cut_renderer"] = rect
+    # Refresh the 1D pane so the lines reflect the new image (e.g. after
+    # frame slider movement) even when cut centres are unchanged.
+    try:
+        _render_cuts_plot()
+    except Exception as exc:
+        log.warning("_render_cuts_plot in _attach_cuts: %s", exc)
+
+
+def _add_cut(kind: str):
+    """Create a new cut centred on the plot with a default ~5% slice width."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    if x is None or y is None or len(x) == 0 or len(y) == 0:
+        w_proc_status.object = "*Process a scan first, then add cuts.*"
+        return
+    if kind == "h":
+        ymin, ymax = float(np.min(y)), float(np.max(y))
+        center = (ymin + ymax) / 2.0
+        width = (ymax - ymin) * 0.05 or 1.0
+    else:
+        xmin, xmax = float(np.min(x)), float(np.max(x))
+        center = (xmin + xmax) / 2.0
+        width = (xmax - xmin) * 0.05 or 1.0
+    _persisted_cuts.append({"kind": kind, "center": center, "width": width})
+    src = cache.get("cuts_source")
+    if src is not None:
+        _cuts_guard["in_progress"] = True
+        try:
+            src.data = _cuts_to_source_data(_persisted_cuts)
+        finally:
+            _cuts_guard["in_progress"] = False
+    _refresh_cuts_table()
+    _render_cuts_plot()
+
+
+def _on_add_hcut(_event):
+    _add_cut("h")
+
+
+def _on_add_vcut(_event):
+    _add_cut("v")
+
+
+def _on_clear_cuts(_event):
+    _persisted_cuts.clear()
+    src = _proc_2d_cache.get("cuts_source")
+    if src is not None:
+        _cuts_guard["in_progress"] = True
+        try:
+            src.data = _cuts_to_source_data(_persisted_cuts)
+        finally:
+            _cuts_guard["in_progress"] = False
+    _refresh_cuts_table()
+    _render_cuts_plot()
+
+
+# Cross-section widgets
+w_btn_add_hcut = pn.widgets.Button(
+    name="+ Horizontal cut", button_type="primary", width=140,
+    description="Add a horizontal slice at the centre of the 2D plot. "
+                "Drag/resize the dashed rectangle to change centre & width.",
+)
+w_btn_add_vcut = pn.widgets.Button(
+    name="+ Vertical cut", button_type="primary", width=130,
+    description="Add a vertical slice at the centre of the 2D plot.",
+)
+w_btn_clear_cuts = pn.widgets.Button(
+    name="Clear all cuts", button_type="warning", width=120,
+)
+w_cuts_log_x = pn.widgets.Checkbox(name="Log x", value=False, width=70)
+w_cuts_log_y = pn.widgets.Checkbox(name="Log y", value=False, width=70)
+
+
+def _on_cuts_log_change(*_events):
+    _render_cuts_plot()
+
+
+w_cuts_log_x.param.watch(_on_cuts_log_change, "value")
+w_cuts_log_y.param.watch(_on_cuts_log_change, "value")
+
+w_cuts_table = pn.widgets.Tabulator(
+    value=pd.DataFrame(columns=["#", "kind", "center", "width"]),
+    show_index=False, sizing_mode="stretch_width", height=160,
+    configuration={"layout": "fitColumns", "rowHeight": 22},
+)
+w_proc_cuts_plot = pn.pane.Bokeh(
+    object=None, sizing_mode="stretch_width", height=650,
+)
+
+w_btn_add_hcut.on_click(_on_add_hcut)
+w_btn_add_vcut.on_click(_on_add_vcut)
+w_btn_clear_cuts.on_click(_on_clear_cuts)
+
 
 # ---------------------------------------------------------------------------
 # Widgets — Collection
 # ---------------------------------------------------------------------------
 
-_COLL_COLS = ["uid_short", "sample", "plan", "geometry", "total_s", "uid"]
+_COLL_COLS = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
+
+
+def _coll_color_formatter(cell_value):
+    """Tabulator HTML formatter: render the color column as a swatch."""
+    return (
+        f'<div style="width:16px;height:16px;border-radius:3px;'
+        f'background:{cell_value};margin:auto;"></div>'
+    )
+
 
 w_coll_table = pn.widgets.Tabulator(
     value=pd.DataFrame(columns=_COLL_COLS),
-    show_index=False, sizing_mode="stretch_width", height=200,
+    show_index=False, sizing_mode="stretch_both", height=300,
     selectable="checkbox",
-    configuration={"rowHeight": 22, "layout": "fitColumns"},
+    configuration={"rowHeight": 24, "layout": "fitColumns"},
     hidden_columns=["uid"],
+    formatters={"color": {"type": "html"}},
+    editors={"color": {"type": "input"}},
+    widths={"color": 40},
+    titles={"color": "⬤"},
 )
 w_btn_coll_remove = pn.widgets.Button(
     name="Remove Selected", button_type="danger", width=130,
 )
-w_btn_coll_compare = pn.widgets.Button(
-    name="Compare I(q)", button_type="primary", width=120,
+w_coll_label = pn.widgets.Select(
+    name="Label column", options=["(none)"], value="(none)", width=180,
 )
-w_coll_varying = pn.pane.Markdown("")
-w_coll_compare_plot = pn.pane.Matplotlib(object=None, tight=True, height=400)
+w_coll_compare_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_both")
 
 
 # ---------------------------------------------------------------------------
@@ -1481,8 +2550,12 @@ def _plot_2d_transmission(result, frame_idx=None):
     else:
         img = qchi["intensity"].values
         title = "q vs χ (merged)"
-    q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[1])
+    q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
     chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
+
+    # Ensure img has shape (n_chi, n_q) so Bokeh renders chi on y, q on x.
+    if img.shape == (len(q), len(chi)):
+        img = img.T
 
     display = np.where(np.isfinite(img), img, 0).astype(np.float32)
     finite = img[np.isfinite(img) & (img > 0)]
@@ -1496,16 +2569,18 @@ def _plot_2d_transmission(result, frame_idx=None):
     q0, q1 = float(q.min()), float(q.max())
     c0, c1 = float(chi.min()), float(chi.max())
     p = bk_figure(
-        title=title, width=1000, height=1000,
+        title=title, height=500,
+        sizing_mode="stretch_width",
         x_range=(q0, q1), y_range=(c0, c1),
         tools="pan,wheel_zoom,box_zoom,reset,save",
         active_scroll="wheel_zoom",
-        match_aspect=True,
     )
     p.image(image=[display], x=q0, y=c0, dw=q1 - q0, dh=c1 - c0, color_mapper=mapper)
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
     p.xaxis.axis_label = "q (nm⁻¹)"
     p.yaxis.axis_label = "χ (°)"
+    _attach_cuts_to_figure(p, q, chi, display,
+                           x_label="q (nm⁻¹)", y_label="χ (°)", title=title)
     return p
 
 
@@ -1538,21 +2613,26 @@ def _plot_2d_gi(gi_result, frame_idx=None):
     x0, x1 = float(qxy.min()), float(qxy.max())
     y0, y1 = float(qz.min()), float(qz.max())
     p = bk_figure(
-        title=title, width=1000, height=1000,
+        title=title, height=500,
+        sizing_mode="stretch_width",
         x_range=(x0, x1), y_range=(y0, y1),
         tools="pan,wheel_zoom,box_zoom,reset,save",
         active_scroll="wheel_zoom",
-        match_aspect=True,
     )
     p.image(image=[display.T], x=x0, y=y0, dw=x1 - x0, dh=y1 - y0, color_mapper=mapper)
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
     p.xaxis.axis_label = "q_xy (nm⁻¹)"
     p.yaxis.axis_label = "q_z (nm⁻¹)"
+    _attach_cuts_to_figure(p, qxy, qz, display.T,
+                           x_label="q_xy (nm⁻¹)", y_label="q_z (nm⁻¹)",
+                           title=title)
     return p
 
 
 def _update_proc_2d(event):
     """Redraw the 2D map when the frame slider changes."""
+    if _processing_guard["active"]:
+        return  # _on_process will set the 2D plot itself
     gi = _proc_result_cache.get("gi_result")
     trans = _proc_result_cache.get("result")
     idx = event.new
@@ -1597,7 +2677,7 @@ def _do_search(page=0):
         return
 
     try:
-        df = _fetch_page()  # also sets _state["total"] from REST meta
+        df = _fetch_page()  # gets count + page data via REST
     except Exception as exc:
         w_search_spinner.value = False
         w_search_spinner.visible = False
@@ -1681,20 +2761,31 @@ def _reset_detail(preserve_figure=False):
         )
     w_image_status.object = ""
     w_image_slider.value = 0
-    w_image_slider.end = 0
+    w_image_slider.end = 1
     # Don't clear image_field options — preserve detector selection
     _image_cache.update(n_frames=0, dataset=None, fields=[],
                         raw_shape=None)
     w_explore_plot.object = None
+    # Grid (multi-view) tab — drop the figure so a new scan rebuilds fresh
+    w_mv_grid.object = None
+    w_mv_status.object = "*Click tab to load.*"
+    _multiview_cache.update(
+        uid=None, field=None, n_frames=0, frames=None,
+        renderers=None, mapper=None, log=None,
+        data_lo=None, data_hi=None,
+    )
     w_proc_status.object = "*Select a scan and click Process.*"
     w_proc_spinner.value = False
     w_proc_spinner.visible = False
+    # Clear the result cache BEFORE touching the frame slider so that
+    # _update_proc_2d (triggered by the slider value change) finds no result
+    # and exits early instead of rebuilding a stale 2D plot.
+    _proc_result_cache.update(result=None, gi_result=None)
     w_proc_iq_plot.object = None
     w_proc_2d_plot.object = None
     w_proc_frame_slider.value = 0
-    w_proc_frame_slider.end = 0
+    w_proc_frame_slider.end = 1
     w_proc_frame_slider.visible = False
-    _proc_result_cache.update(result=None, gi_result=None)
     w_btn_add_collection.disabled = True
     _detail_cache.update(
         uid=None, run=None, summary=None,
@@ -1729,11 +2820,15 @@ def _load_metadata(uid):
     # Convert non-serialisable values to strings
     import json as _json
 
-    def _sanitize(obj):
+    def _sanitize(obj, _key=None):
         if isinstance(obj, dict):
-            return {k: _sanitize(v) for k, v in obj.items()}
+            return {k: _sanitize(v, _key=k) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
             return [_sanitize(v) for v in obj]
+        # Convert epoch timestamps to human-readable
+        if _key == "time" and isinstance(obj, (int, float)) and 1e9 < obj < 2e10:
+            import datetime as _dt
+            return _dt.datetime.fromtimestamp(obj).strftime("%Y-%m-%d %H:%M:%S")
         try:
             _json.dumps(obj)
             return obj
@@ -1955,6 +3050,8 @@ def _load_active_tab(active):
         _load_primary()
         _load_images()
     elif active == 4:
+        _load_multiview()
+    elif active == 5:
         pass  # Process tab — no auto-load
 
 
@@ -2125,8 +3222,7 @@ def _on_process(event):
     w_proc_spinner.visible = True
     w_btn_process.disabled = True
     _proc_result_cache.update(result=None, gi_result=None)
-    w_proc_2d_plot.object = None
-    w_proc_iq_plot.object = None
+    _processing_guard["active"] = True
 
     try:
         t0 = time.perf_counter()
@@ -2198,6 +3294,7 @@ def _on_process(event):
                 geometry=geometry,
                 saxs_mask_path=w_proc_saxs_mask.value or None,
                 waxs_mask_path=w_proc_waxs_mask.value or None,
+                cache_geometry=w_cache_enabled.value,
             )
             if w_proc_nq.value != DEFAULT_N_Q:
                 params["n_q"] = w_proc_nq.value
@@ -2249,7 +3346,8 @@ def _on_process(event):
                     w_proc_frame_slider.visible = False
                 w_proc_2d_plot.object = _plot_2d_transmission(result)
             except Exception as exc:
-                log.warning("2D q-chi plot failed: %s", exc)
+                log.exception("2D q-chi plot failed")
+                w_proc_2d_plot.object = None
                 w_proc_frame_slider.visible = False
 
             # I(q) plot (Bokeh)
@@ -2298,6 +3396,7 @@ def _on_process(event):
         w_proc_iq_plot.object = None
         w_proc_2d_plot.object = None
     finally:
+        _processing_guard["active"] = False
         w_btn_process.disabled = False
         w_proc_spinner.value = False
         w_proc_spinner.visible = False
@@ -2309,7 +3408,25 @@ def _on_add_to_collection(event):
         return
     summary = _detail_cache.get("summary") or {}
     params = _last_result.get("params") or {}
-    _collection.add(result, summary, params)
+    # Bundle primary/baseline/raw metadata with the processed scan
+    primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
+    # Baseline: fetch as a proper scalar DataFrame (the UI table is transposed
+    # into field/before/after rows, which isn't suitable for numeric lookups).
+    baseline_df = None
+    if _detail_cache.get("baseline_loaded"):
+        run = _ensure_run()
+        if run and "baseline" in tb.stream_names(run):
+            try:
+                baseline_df = _scalar_stream_to_frame(run, "baseline")
+            except Exception:
+                pass
+    raw_metadata = w_meta_json.object if w_meta_json.object else None
+    _collection.add(
+        result, summary, params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        raw_metadata=raw_metadata,
+    )
     _refresh_collection()
     _open_collection_panel()  # pop open the floating panel
     pn.state.notifications.success(
@@ -2339,16 +3456,33 @@ w_coll_summary = pn.pane.Markdown(_coll_summary_text(), margin=(0, 5))
 
 
 def _refresh_collection():
-    w_coll_table.value = _collection.summary_table()
-    varying = _collection.varying_parameters()
-    if varying:
-        lines = ["**Varying parameters across collection:**"]
-        for k, vals in varying.items():
-            lines.append(f"- `{k}`: {', '.join(str(v) for v in vals)}")
-        w_coll_varying.object = "\n".join(lines)
+    old_len = len(w_coll_table.value) if w_coll_table.value is not None else 0
+    # Refresh available label columns from stored primary/baseline data
+    avail = _collection.available_label_columns()
+    label_opts = ["(none)"] + avail
+    prev_label = w_coll_label.value
+    w_coll_label.options = label_opts
+    if prev_label in label_opts:
+        w_coll_label.value = prev_label
     else:
-        w_coll_varying.object = ""
+        w_coll_label.value = "(none)"
+    # Build table with optional label column
+    label_col = w_coll_label.value if w_coll_label.value != "(none)" else None
+    df = _collection.summary_table(label_column=label_col)
+    # Render the color column as HTML swatches.
+    if "color" in df.columns:
+        df["color"] = df["color"].apply(
+            lambda c: (
+                f'<div style="width:16px;height:16px;border-radius:3px;'
+                f'background:{c};margin:auto;"></div>'
+            )
+        )
+    w_coll_table.value = df
     w_coll_summary.object = _coll_summary_text()
+    # Auto-select newly added scans so the I(q) comparison updates live.
+    new_len = len(w_coll_table.value)
+    if new_len > old_len:
+        w_coll_table.selection = list(range(new_len))
 
 
 def _on_coll_remove(event):
@@ -2361,19 +3495,401 @@ def _on_coll_remove(event):
             uid = df.iloc[idx]["uid"]
             _collection.remove(uid)
     _refresh_collection()
-    w_coll_compare_plot.object = None
 
 
-def _on_coll_compare(event):
-    if len(_collection) == 0:
+def _update_coll_compare(*_events):
+    """Rebuild I(q) comparison from current table selection."""
+    sel = w_coll_table.selection
+    df = w_coll_table.value
+    if df is None or len(df) == 0 or not sel:
+        w_coll_compare_plot.object = None
         return
-    fig = _collection.iq_comparison_figure()
+    uids = [df.iloc[i]["uid"] for i in sel if i < len(df)]
+    label_col = w_coll_label.value if w_coll_label.value != "(none)" else None
+    fig = _collection.iq_comparison_bokeh(uids, label_column=label_col)
     w_coll_compare_plot.object = fig
-    _open_collection_panel()  # ensure the floating panel is visible
 
+
+def _on_coll_label_change(*_events):
+    """Refresh collection table and I(q) comparison when label column changes."""
+    _refresh_collection()
+    _update_coll_compare()
+
+
+w_coll_table.param.watch(_update_coll_compare, "selection")
+w_coll_label.param.watch(_on_coll_label_change, "value")
 
 w_btn_coll_remove.on_click(_on_coll_remove)
-w_btn_coll_compare.on_click(_on_coll_compare)
+
+
+# ---------------------------------------------------------------------------
+# Batch processing — queue many scans from the current search results
+# ---------------------------------------------------------------------------
+#
+# A BatchProcessor (see batch_processor.py) runs PyHyperScattering reductions
+# on a background worker thread, leaving the UI interactive.  Status updates
+# are routed back onto the Bokeh document thread via add_next_tick_callback,
+# which is the only safe way to mutate widgets from a non-UI thread.
+#
+# The reduction parameters are read from the Process tab widgets at job time
+# (so the user configures them once in Parameters, then queues a batch).
+# Already-collected uids can be skipped.  Hard caps prevent runaway queues
+# when search results contain hundreds of scans.
+
+w_batch_status = pn.pane.Markdown(
+    "*Idle — queue scans from the current search results to process them in "
+    "the background.*",
+    margin=(0, 5),
+)
+w_batch_progress = pn.indicators.Progress(
+    name="Batch progress", value=0, max=1, width=400, visible=False,
+)
+w_batch_table = pn.widgets.Tabulator(
+    pd.DataFrame(columns=["uid_short", "label", "state", "duration_s", "error"]),
+    height=320, layout="fit_data_stretch", show_index=False, disabled=True,
+    sizing_mode="stretch_width",
+)
+
+_BATCH_ROW_COLORS = {
+    "running": "background-color: #d4edda",   # green
+    "error":   "background-color: #f8d7da",   # red
+    "done":    "background-color: #f0f0f0; color: #888",   # light grey
+    "skipped": "background-color: #f0f0f0; color: #888",
+    "cancelled": "background-color: #fff3cd; color: #888", # pale yellow
+    "queued":  "",
+}
+w_batch_max_workers = pn.widgets.IntInput(
+    name="Workers", value=1, start=1, end=8, width=90,
+)
+w_batch_skip_existing = pn.widgets.Checkbox(
+    name="Skip uids already in collection", value=True,
+)
+w_batch_max_jobs = pn.widgets.IntInput(
+    name="Max jobs", value=PAGE_SIZE, start=1, end=BatchProcessor.MAX_QUEUE,
+    width=110,
+)
+w_btn_batch_queue = pn.widgets.Button(
+    name="Queue current page", button_type="primary",
+)
+w_btn_batch_cancel = pn.widgets.Button(
+    name="Cancel", button_type="warning", disabled=True,
+)
+w_btn_batch_clear = pn.widgets.Button(
+    name="Clear log", button_type="light", disabled=True,
+)
+
+_batch_state: dict[str, Any] = {"doc": None, "processor": None}
+
+
+def _build_proc_params(uid: str) -> tuple:
+    """Snapshot current Process-tab widget values into reduction params.
+
+    Mirrors the param-construction in :func:`_on_process` so a batch job
+    runs with whatever the user has configured in the Parameters sub-tab.
+    Returns ``(callable, params_dict, geometry_label)``.
+    """
+    geometry = w_proc_geometry.value
+    if geometry == "grazing":
+        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+
+        gi_params: dict[str, Any] = dict(
+            uid=uid,
+            tiled_uri=DEFAULT_TILED_URI,
+            catalog=DEFAULT_CATALOG,
+            waxs_mask_path=w_proc_waxs_mask.value or None,
+        )
+        if w_proc_nqxy.value != DEFAULT_N_QXY:
+            gi_params["n_qxy"] = w_proc_nqxy.value
+        if w_proc_nqz.value != DEFAULT_N_QZ:
+            gi_params["n_qz"] = w_proc_nqz.value
+        if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
+            gi_params["theta_offset"] = w_proc_theta_offset.value
+        if w_proc_dezinger.value != DEFAULT_DEZINGER:
+            gi_params["dezinger_threshold"] = (
+                w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+            )
+        if not w_proc_incident_angle_auto.value:
+            gi_params["incident_angle_deg"] = w_proc_incident_angle.value
+        return reduce_smi_gi, gi_params, geometry
+
+    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+
+    params: dict[str, Any] = dict(
+        uid=uid,
+        tiled_uri=DEFAULT_TILED_URI,
+        catalog=DEFAULT_CATALOG,
+        solid_angle_correction=True,
+        geometry=geometry,
+        saxs_mask_path=w_proc_saxs_mask.value or None,
+        waxs_mask_path=w_proc_waxs_mask.value or None,
+        cache_geometry=w_cache_enabled.value,
+    )
+    if w_proc_nq.value != DEFAULT_N_Q:
+        params["n_q"] = w_proc_nq.value
+    else:
+        params["n_q"] = DEFAULT_N_Q
+    if w_proc_nchi.value != DEFAULT_N_CHI:
+        params["n_chi"] = w_proc_nchi.value
+
+    saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
+    saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
+    if saxs_row_changed or saxs_col_changed:
+        params["saxs_beam_delta_px"] = (
+            w_proc_saxs_row_delta.value, w_proc_saxs_col_delta.value,
+        )
+    waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
+    waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
+    if waxs_row_changed or waxs_col_changed:
+        params["waxs_beam_delta_px"] = (
+            w_proc_waxs_row_delta.value, w_proc_waxs_col_delta.value,
+        )
+    if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
+        params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
+    if w_proc_dezinger.value != DEFAULT_DEZINGER:
+        params["dezinger_threshold"] = (
+            w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+        )
+    return reduce_smi_combined, params, geometry
+
+
+def _batch_process_fn(uid: str):
+    """BatchProcessor.process_fn: run one reduction and return the result."""
+    run_fn, params, geometry = _build_proc_params(uid)
+    if geometry == "grazing":
+        # ScanCollection currently only handles transmission results.
+        raise NotImplementedError(
+            "Batch processing for GI (grazing) geometry is not supported yet."
+        )
+    # Use pre-snapshotted summary from enqueue time (thread-safe).
+    summary = _batch_state.get("summaries", {}).get(uid, {})
+    result = run_fn(**params)
+    # Fetch primary/baseline scalars and raw metadata so the collection
+    # can offer label columns and eventual export.
+    try:
+        run = _get_cat()[uid]
+        primary_df = _scalar_stream_to_frame(run, "primary")
+        baseline_df = _scalar_stream_to_frame(run, "baseline")
+        raw_md = dict(run.metadata)
+    except Exception:
+        primary_df = None
+        baseline_df = None
+        raw_md = None
+    # Pack extra data into params (BatchProcessor passes it through).
+    params["_primary_df"] = primary_df
+    params["_baseline_df"] = baseline_df
+    params["_raw_metadata"] = raw_md
+    return result, summary, params
+
+
+def _batch_skip(uid: str) -> bool:
+    if not w_batch_skip_existing.value:
+        return False
+    return uid in _collection
+
+
+def _batch_dispatch(snap: dict) -> None:
+    """status_cb: marshal UI updates onto the Bokeh document thread."""
+
+    def _apply():
+        try:
+            states = snap["states"]
+            total = snap["total"]
+            done = (
+                states["done"] + states["error"]
+                + states["skipped"] + states["cancelled"]
+            )
+            running = snap["running"]
+
+            w_batch_progress.max = max(total, 1)
+            w_batch_progress.value = done
+            w_batch_progress.visible = total > 0
+
+            label = "running" if running else (
+                "cancelling" if snap["cancel_requested"] else "idle"
+            )
+            w_batch_status.object = (
+                f"**Batch {label}** — {done}/{total} processed "
+                f"(done={states['done']}, error={states['error']}, "
+                f"skipped={states['skipped']}, cancelled={states['cancelled']}, "
+                f"queued={states['queued']}, running={states['running']})"
+            )
+
+            rows = []
+            for j in snap["jobs"]:
+                dur = j.get("duration_s")
+                rows.append({
+                    "uid_short": (j["uid"] or "")[:8],
+                    "label": j.get("label", ""),
+                    "state": j["state"],
+                    "duration_s": f"{dur:.1f}" if dur else "",
+                    "error": j.get("error", ""),
+                })
+            new_df = pd.DataFrame(
+                rows,
+                columns=["uid_short", "label", "state", "duration_s", "error"],
+            )
+            # Only do a full replace when the shape changes (new jobs added
+            # or cleared).  Otherwise patch individual cells so Tabulator
+            # keeps its scroll position instead of jumping to the top.
+            old_df = w_batch_table.value
+            if (
+                old_df is not None
+                and len(old_df) == len(new_df)
+                and list(old_df.columns) == list(new_df.columns)
+            ):
+                patches = {}
+                for col in new_df.columns:
+                    for idx in range(len(new_df)):
+                        ov = old_df.iat[idx, old_df.columns.get_loc(col)]
+                        nv = new_df.iat[idx, new_df.columns.get_loc(col)]
+                        if ov != nv:
+                            patches.setdefault(col, []).append((idx, nv))
+                if patches:
+                    w_batch_table.patch(patches)
+            else:
+                w_batch_table.value = new_df
+
+            # Apply row colours based on job state.
+            def _color_batch_rows(row):
+                css = _BATCH_ROW_COLORS.get(row["state"], "")
+                return [css] * len(row)
+            w_batch_table.style.apply(_color_batch_rows, axis=1)
+
+            w_btn_batch_queue.disabled = running
+            w_btn_batch_cancel.disabled = not running
+            w_btn_batch_clear.disabled = running or total == 0
+
+            # Keep the collection panel in sync as jobs land.
+            _refresh_collection()
+        except Exception:
+            log.exception("batch: UI render failed")
+
+    doc = _batch_state.get("doc")
+    if doc is None:
+        _apply()
+        return
+    try:
+        doc.add_next_tick_callback(_apply)
+    except Exception:
+        log.exception("batch: add_next_tick_callback failed")
+
+
+def _batch_add_fn(result, summary, params):
+    # ScanCollection internals are plain dicts; updates are GIL-protected.
+    # We add on the worker thread so the snapshot fired immediately after
+    # already reflects the new collection size.
+    primary_df = params.pop("_primary_df", None)
+    baseline_df = params.pop("_baseline_df", None)
+    raw_metadata = params.pop("_raw_metadata", None)
+    _collection.add(
+        result, summary, params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        raw_metadata=raw_metadata,
+    )
+
+
+def _ensure_batch_processor() -> BatchProcessor:
+    bp = _batch_state.get("processor")
+    workers = max(1, int(w_batch_max_workers.value or 1))
+    # Re-create when worker count changes or the previous run finished
+    # (BatchProcessor is single-shot in the sense that its worker threads
+    # exit when the queue drains; restarting cleanly = new instance).
+    if bp is None or bp._max_workers != workers or not bp.is_running:
+        if bp is not None and bp.is_running:
+            return bp
+        bp = BatchProcessor(
+            process_fn=_batch_process_fn,
+            add_fn=_batch_add_fn,
+            status_cb=_batch_dispatch,
+            skip_fn=_batch_skip,
+            max_workers=workers,
+        )
+        _batch_state["processor"] = bp
+    return bp
+
+
+def _on_batch_queue(event):
+    df = w_table.value
+    if df is None or len(df) == 0:
+        pn.state.notifications.warning("No search results to queue.")
+        return
+    # Capture the current Bokeh document on the UI thread for cross-thread
+    # dispatch from worker threads.
+    try:
+        _batch_state["doc"] = pn.state.curdoc
+    except Exception:
+        _batch_state["doc"] = None
+
+    max_jobs = max(1, int(w_batch_max_jobs.value or 25))
+    uids = df["uid"].tolist()[:max_jobs]
+    samples = (
+        df["sample_name"].tolist()[:max_jobs]
+        if "sample_name" in df.columns else [""] * len(uids)
+    )
+    items = [(u, s) for u, s in zip(uids, samples) if u]
+    if not items:
+        pn.state.notifications.warning("No valid uids in current page.")
+        return
+
+    # Snapshot search-table rows so the worker thread never reads w_table.
+    summaries: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        uid_val = row.get("uid")
+        if uid_val:
+            summaries[uid_val] = row.to_dict()
+    _batch_state["summaries"] = summaries
+
+    bp = _ensure_batch_processor()
+    n = bp.enqueue(items)
+    if n == 0:
+        pn.state.notifications.info("Nothing to queue (all already tracked).")
+        return
+    bp.start()
+    pn.state.notifications.success(
+        f"Queued {n} scan{'s' if n != 1 else ''} for batch processing."
+    )
+
+
+def _on_batch_cancel(event):
+    bp = _batch_state.get("processor")
+    if bp is None:
+        return
+    bp.cancel()
+    pn.state.notifications.info(
+        "Cancellation requested; the running job will finish."
+    )
+
+
+def _on_batch_clear(event):
+    bp = _batch_state.get("processor")
+    if bp is None:
+        return
+    bp.clear_terminal()
+
+
+w_btn_batch_queue.on_click(_on_batch_queue)
+w_btn_batch_cancel.on_click(_on_batch_cancel)
+w_btn_batch_clear.on_click(_on_batch_clear)
+
+
+batch_panel = pn.Column(
+    pn.pane.Markdown(
+        "**Batch process scans from the current search results.** "
+        "Each job uses the parameters configured in the *Parameters* "
+        "sub-tab above.  Reductions run on a background thread so the "
+        "interface stays interactive; results land in the Scan Collection "
+        "as they complete.  Already-processed uids are skipped if the "
+        "checkbox is on.  GI (grazing) geometry is not yet supported in "
+        "batch mode.",
+    ),
+    pn.Row(w_btn_batch_queue, w_btn_batch_cancel, w_btn_batch_clear),
+    pn.Row(w_batch_max_jobs, w_batch_max_workers, w_batch_skip_existing),
+    w_batch_status,
+    w_batch_progress,
+    w_batch_table,
+    sizing_mode="stretch_width",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2394,7 +3910,182 @@ _live: dict[str, Any] = {
     "manager": None,
     "active": False,
     "saved": {},  # widget -> {param_name: prev_value}
+    "doc": None,  # captured Bokeh document for cross-thread dispatch
 }
+
+# ---------------------------------------------------------------------------
+# Tiled authentication (login / logout / status)
+# ---------------------------------------------------------------------------
+#
+# The NSLS-II tiled server uses session tokens that expire after a few days.
+# When tokens lapse, every fetch starts returning HTTP 401.  These widgets
+# let the user re-authenticate from inside the running Panel app (no need
+# to drop to a terminal and run ``python -c "from tiled.client import
+# from_uri; from_uri(...).login()"``).
+#
+# After a successful login, the tokens get cached on disk via the standard
+# tiled token cache, so the cached tokens are also picked up by any
+# subprocess / fresh ``from_uri`` (including the one that PyHyperScattering
+# creates internally inside ``reduce_smi_combined``).  We also clear our
+# module-level ``_cat`` so the next access re-builds the catalog with the
+# refreshed credentials.
+
+def _tiled_whoami() -> str | None:
+    """Return the username for the currently cached tiled session, or None."""
+    try:
+        from tiled.client import from_uri
+        client = from_uri(DEFAULT_TILED_URI)
+        info = client.context.whoami()
+    except Exception:
+        return None
+    if not info:
+        return None
+    identities = info.get("identities") or []
+    for ident in identities:
+        if ident.get("id"):
+            return str(ident["id"])
+    return None
+
+
+def _tiled_login(username: str, password: str) -> str:
+    """Authenticate against tiled with username/password.
+
+    Returns the logged-in username on success; raises on failure.
+    """
+    from tiled.client import from_uri
+    from tiled.client.context import password_grant
+
+    if not username or not password:
+        raise ValueError("Username and password are required.")
+
+    client = from_uri(DEFAULT_TILED_URI)
+    ctx = client.context
+    providers = ctx.server_info.authentication.providers
+    if not providers:
+        raise RuntimeError("Tiled server reports no authentication providers.")
+    spec = providers[0]
+    auth_endpoint = spec.links["auth_endpoint"]
+    tokens = password_grant(
+        ctx.http_client, auth_endpoint, spec.provider, username, password,
+    )
+    ctx.configure_auth(tokens, remember_me=True)
+
+    # Drop the cached catalog so the next access uses the refreshed tokens.
+    global _cat
+    _cat = None
+
+    info = ctx.whoami()
+    identities = (info or {}).get("identities") or []
+    return identities[0]["id"] if identities else username
+
+
+def _tiled_logout() -> None:
+    """Clear the cached tiled session for this server."""
+    try:
+        from tiled.client import from_uri
+        client = from_uri(DEFAULT_TILED_URI)
+        try:
+            client.logout()
+        except Exception:
+            # logout() can fail if there's no live session; clear cache anyway.
+            pass
+        try:
+            client.context.tokens.clear()
+        except Exception:
+            pass
+    finally:
+        global _cat
+        _cat = None
+
+
+w_login_status = pn.pane.Markdown("*checking…*", width=220)
+w_btn_login = pn.widgets.Button(
+    name="🔑 Login", button_type="primary", width=90,
+)
+w_btn_logout = pn.widgets.Button(
+    name="Logout", button_type="light", width=80, visible=False,
+)
+
+w_login_user = pn.widgets.TextInput(
+    name="Username", placeholder="bnl username", width=220,
+)
+w_login_pass = pn.widgets.PasswordInput(
+    name="Password", placeholder="password", width=220,
+)
+w_login_submit = pn.widgets.Button(
+    name="Sign in", button_type="success", width=90,
+)
+w_login_msg = pn.pane.Markdown("", width=220)
+w_login_form = pn.Column(
+    pn.pane.Markdown("**Tiled login**"),
+    w_login_user,
+    w_login_pass,
+    pn.Row(w_login_submit),
+    w_login_msg,
+    visible=False,
+    width=260,
+    styles={
+        "background": "#f8f9fa",
+        "border": "1px solid #ced4da",
+        "border-radius": "6px",
+        "padding": "10px",
+    },
+)
+
+
+def _refresh_login_status():
+    user = _tiled_whoami()
+    if user:
+        w_login_status.object = f"🟢 **Logged in:** `{user}`"
+        w_btn_login.name = "🔄 Re-login"
+        w_btn_logout.visible = True
+    else:
+        w_login_status.object = "🔴 **Not logged in**"
+        w_btn_login.name = "🔑 Login"
+        w_btn_logout.visible = False
+
+
+def _toggle_login_form(event=None):
+    w_login_form.visible = not w_login_form.visible
+    if w_login_form.visible:
+        w_login_msg.object = ""
+        w_login_pass.value = ""
+
+
+def _on_login_submit(event=None):
+    user_in = (w_login_user.value or "").strip()
+    pwd = w_login_pass.value or ""
+    w_login_msg.object = "*signing in…*"
+    w_login_submit.disabled = True
+    try:
+        user = _tiled_login(user_in, pwd)
+        w_login_msg.object = f"✅ Signed in as `{user}`"
+        w_login_pass.value = ""
+        w_login_form.visible = False
+        _refresh_login_status()
+        try:
+            pn.state.notifications.success(f"Tiled login OK ({user})")
+        except Exception:
+            pass
+    except Exception as exc:
+        w_login_msg.object = f"❌ {type(exc).__name__}: {exc}"
+    finally:
+        w_login_submit.disabled = False
+
+
+def _on_logout(event=None):
+    _tiled_logout()
+    _refresh_login_status()
+    try:
+        pn.state.notifications.info("Logged out of tiled.")
+    except Exception:
+        pass
+
+
+w_btn_login.on_click(_toggle_login_form)
+w_login_submit.on_click(_on_login_submit)
+w_btn_logout.on_click(_on_logout)
+
 
 w_btn_live = pn.widgets.Toggle(
     name="🔴 Go Live", value=False,
@@ -2417,12 +4108,18 @@ w_live_banner = pn.pane.Markdown(
 def _dispatch_to_doc(fn):
     """Schedule ``fn`` (zero-arg) on the Bokeh document thread.
 
-    Streaming callbacks fire on tiled's ThreadPoolExecutor; UI mutations
-    must hop onto the Panel/Bokeh document.  Falls back to inline call
-    if no document is available (e.g. unit tests).
+    Streaming callbacks fire on tiled's ThreadPoolExecutor.  Bokeh requires
+    that any document mutation happen under the document lock; the only
+    safe cross-thread entry point is ``Document.add_next_tick_callback``.
+
+    ``pn.state.curdoc`` is *thread-local*, so reading it from a worker
+    thread returns ``None``.  We therefore capture the document once on
+    the UI thread when live mode starts (see ``_enter_live_mode``) and
+    use that captured reference here.
     """
-    doc = pn.state.curdoc
+    doc = _live.get("doc")
     if doc is None:
+        # No document captured — best effort inline (unit tests, REPL).
         try:
             fn()
         except Exception:
@@ -2463,7 +4160,7 @@ def _live_set_lockout(on: bool) -> None:
         for w in (w_btn_search, w_btn_reset, w_btn_add_filter,
                   w_btn_first, w_btn_prev, w_btn_next, w_btn_last,
                   w_btn_process, w_btn_add_collection,
-                  w_btn_coll_remove, w_btn_coll_compare):
+                  w_btn_coll_remove):
             _live_save(w, "disabled")
             w.disabled = True
         for rd in _filter_rows:
@@ -2620,6 +4317,10 @@ def _on_live_toggle(event) -> None:
 def _enter_live_mode() -> None:
     log.info("live: entering live mode")
     _live["active"] = True
+    # Capture the Bokeh document on the UI thread so worker threads can
+    # marshal updates back via add_next_tick_callback.  pn.state.curdoc
+    # is thread-local; we cannot read it from inside streaming callbacks.
+    _live["doc"] = pn.state.curdoc
     w_btn_live.name = "■ Stop Live"
     _live_set_lockout(True)
     _live_set_banner("🔴 **LIVE** — connecting to tiled stream…")
@@ -2659,6 +4360,7 @@ def _exit_live_mode() -> None:
             mgr.stop()
         except Exception:
             log.exception("live: manager.stop failed")
+    _live["doc"] = None
     _live_set_lockout(False)
     _live_set_banner("")
 
@@ -2694,7 +4396,7 @@ search_card = pn.Card(
            pn.Column(pn.Spacer(height=0), w_btn_search),
            pn.Column(pn.Spacer(height=0), w_btn_reset)),
     title="🔍 Search Filters",
-    collapsed=True,
+    collapsed=False,
     sizing_mode="stretch_width",
     margin=(0, 0, 5, 0),
 )
@@ -2758,78 +4460,157 @@ w_detail_tabs = pn.Tabs(
         ),
     ),
     (
+        "Grid",
+        pn.Column(
+            pn.Row(w_mv_status, w_mv_spinner),
+            pn.Row(w_mv_field, w_mv_cmap, w_mv_log, w_mv_label, sizing_mode="stretch_width"),
+            w_mv_range,
+            pn.Column(w_mv_grid, sizing_mode="stretch_both", min_height=500),
+            sizing_mode="stretch_both",
+        ),
+    ),
+    (
         "Process",
         pn.Column(
             # Quick controls — geometry selector + run button
             pn.Row(w_proc_geometry, w_btn_process, w_btn_add_collection,
                    w_proc_spinner),
             w_proc_status,
-            # Advanced parameter expanders — collapsed by default; widgets
-            # remain at their PyHyper defaults unless the user opens an
-            # expander and changes a value.  Unchanged values are sent as
-            # None so the upstream loader fills in its calibrated default.
-            pn.Card(
-                w_trans_row,
-                w_gi_row,
-                title="Output grid",
-                collapsed=True, sizing_mode="stretch_width",
-            ),
-            pn.Card(
-                pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
-                pn.pane.Markdown(
-                    "*Leave blank to use the bundled PyHyperScattering "
-                    "defaults shown in the placeholder text.  Use the "
-                    "Explore tab to view or edit a mask interactively.*",
+            # Advanced parameters grouped in a sub-tabs to save vertical space
+            pn.Tabs(
+                (
+                    "Results",
+                    pn.Column(
+                        w_proc_frame_slider,
+                        w_proc_2d_plot,
+                        # Cross sections — interactive overlay on the 2D plot above.
+                        pn.Card(
+                            pn.pane.Markdown(
+                                "*Click **+ Horizontal cut** or **+ Vertical cut** to "
+                                "drop a dashed slice rectangle on the 2D plot above. "
+                                "Drag it to move; drag a corner/edge to resize the "
+                                "slice width. Hold shift+drag on empty space to draw "
+                                "a new box; click a box and press Backspace to delete. "
+                                "Cuts persist across scans \u2014 they are re-applied to "
+                                "every newly processed result.*",
+                            ),
+                            pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts,
+                                   w_cuts_log_x, w_cuts_log_y),
+                            w_cuts_table,
+                            w_proc_cuts_plot,
+                            title="\u2702 Cross sections",
+                            collapsed=False, sizing_mode="stretch_width",
+                        ),
+                        w_proc_iq_plot,
+                        sizing_mode="stretch_width",
+                    ),
                 ),
-                title="Masks",
-                collapsed=True, sizing_mode="stretch_width",
-            ),
-            pn.Card(
-                pn.pane.Markdown("**Beam-centre Δ (px)**"),
-                pn.Row(
-                    w_proc_saxs_row_delta, w_proc_saxs_col_delta,
-                    w_proc_waxs_row_delta, w_proc_waxs_col_delta,
+                (
+                    "Parameters",
+                    pn.Column(
+                        pn.Card(
+                            w_trans_row,
+                            w_gi_row,
+                            title="Output grid",
+                            collapsed=False, sizing_mode="stretch_width",
+                        ),
+                        pn.Card(
+                            pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
+                            pn.pane.Markdown(
+                                "*Leave blank to use the bundled PyHyperScattering "
+                                "defaults shown in the placeholder text.  Use the "
+                                "Explore tab to view or edit a mask interactively.*",
+                            ),
+                            title="Masks",
+                            collapsed=False, sizing_mode="stretch_width",
+                        ),
+                        pn.Card(
+                            pn.pane.Markdown("**Beam-centre Δ (px)**"),
+                            pn.Row(
+                                w_proc_saxs_row_delta, w_proc_saxs_col_delta,
+                                w_proc_waxs_row_delta, w_proc_waxs_col_delta,
+                            ),
+                            pn.Row(w_proc_dist_delta),
+                            pn.pane.Markdown(
+                                "*Defaults match the SMI loader's calibrated values "
+                                "(SAXS Δrow=2, Δcol=3, Δdist=−20 mm; WAXS Δrow=0, "
+                                "Δcol=−2).  Change only if you know the calibration "
+                                "has shifted.*",
+                            ),
+                            title="Geometry overrides",
+                            collapsed=False, sizing_mode="stretch_width",
+                        ),
+                        pn.Card(
+                            pn.Row(w_proc_dezinger),
+                            pn.pane.Markdown("*Set to 0 to disable hot-pixel rejection.*"),
+                            title="Hot-pixel rejection",
+                            collapsed=False, sizing_mode="stretch_width",
+                        ),
+                        sizing_mode="stretch_width",
+                    ),
                 ),
-                pn.Row(w_proc_dist_delta),
-                pn.pane.Markdown(
-                    "*Defaults match the SMI loader's calibrated values "
-                    "(SAXS Δrow=2, Δcol=3, Δdist=−20 mm; WAXS Δrow=0, "
-                    "Δcol=−2).  Change only if you know the calibration "
-                    "has shifted.*",
+                (
+                    "Cache",
+                    pn.Column(
+                        w_cache_enabled,
+                        pn.Row(w_btn_cache_refresh, w_btn_cache_clear),
+                        w_cache_info,
+                        pn.pane.Markdown(
+                            "*Geometry cache stores pre-computed integrator "
+                            "objects (poni files, solid-angle corrections, etc.) "
+                            "to speed up repeated reductions. Clear it if you "
+                            "change calibration parameters or to free memory.*",
+                        ),
+                        sizing_mode="stretch_width",
+                    ),
                 ),
-                title="Geometry overrides",
-                collapsed=True, sizing_mode="stretch_width",
+                ("Batch", batch_panel),
+                sizing_mode="stretch_width",
             ),
-            pn.Card(
-                pn.Row(w_proc_dezinger),
-                pn.pane.Markdown("*Set to 0 to disable hot-pixel rejection.*"),
-                title="Hot-pixel rejection",
-                collapsed=True, sizing_mode="stretch_width",
-            ),
-            # Results
-            w_proc_frame_slider,
-            w_proc_2d_plot,
-            w_proc_iq_plot,
         ),
     ),
-    dynamic=True,
 )
 
 w_detail_tabs.param.watch(_on_detail_tab, "active")
 
+# Toggle button to collapse / expand the left search panel
+w_btn_toggle_sidebar = pn.widgets.Toggle(
+    name="◀", value=False, button_type="light", width=32,
+    stylesheets=[":host { font-size: 14px; padding: 0; }"],
+)
+
+def _on_toggle_sidebar(event):
+    hidden = event.new
+    left_panel.visible = not hidden
+    w_btn_toggle_sidebar.name = "▶" if hidden else "◀"
+
+w_btn_toggle_sidebar.param.watch(_on_toggle_sidebar, "value")
+
 detail_panel = pn.Column(
-    w_detail_title,
+    pn.Row(w_btn_toggle_sidebar, w_detail_title, sizing_mode="stretch_width"),
     w_detail_tabs,
     sizing_mode="stretch_both",
     min_width=600,
 )
 
 collection_card = pn.Card(
-    pn.Row(w_btn_coll_compare, w_btn_coll_remove),
-    w_coll_table,
-    w_coll_varying,
-    w_coll_compare_plot,
-    title="📊 Scan Collection",
+    pn.Row(
+        pn.Column(
+            pn.Row(w_btn_coll_remove, w_coll_label),
+            w_coll_table,
+            sizing_mode="stretch_width",
+            min_width=300,
+            max_width=500,
+        ),
+        pn.Column(
+            w_coll_compare_plot,
+            sizing_mode="stretch_width",
+            min_width=400,
+            height=500,
+        ),
+        sizing_mode="stretch_width",
+    ),
+    title="📊 Processed Collection",
     collapsed=True,
     sizing_mode="stretch_width",
     margin=(0, 0, 10, 0),
@@ -2851,9 +4632,13 @@ dashboard = pn.Column(
     pn.Row(
         pn.pane.Markdown("# SMI Tiled Browser — NSLS-II"),
         pn.layout.HSpacer(),
+        w_login_status,
+        w_btn_login,
+        w_btn_logout,
         w_btn_live,
         sizing_mode="stretch_width",
     ),
+    w_login_form,
     w_live_banner,
     # Collection card sits ABOVE the browse area so it can never overlap
     # tall scrolling content (e.g. a full-resolution detector image).
@@ -2870,12 +4655,76 @@ dashboard = pn.Column(
 
 dashboard.servable(title="SMI Browser")
 
+_refresh_login_status()
 _refresh_pagination()
 _reset_detail()
 _refresh_collection()
 
-# Load the latest page of results on startup
-_do_search(0)
+# Load the 25 most recent scans in the background so the UI renders
+# immediately.  Uses a cached count to skip the expensive count probe.
+def _startup_search():
+    try:
+        # Fast path: use cached count as count hint
+        count_hint = tb.load_cached_count()
+
+        cat = _get_cat()
+
+        if count_hint is None:
+            # First run or cache missing — use len(cat) which is faster
+            # than the REST probe (10-34s vs 30-40s for REST count).
+            try:
+                t0 = time.time()
+                count_hint = len(cat)
+                log.info("startup: len(cat) = %d in %.1fs", count_hint, time.time() - t0)
+            except Exception:
+                count_hint = None  # fall through to slow path
+
+        if count_hint:
+            log.info("startup: using count_hint=%d", count_hint)
+        offset = _state["page"] * _state["page_size"]
+        limit = _state["page_size"]
+
+        summaries, total = tb.fetch_page_fast(
+            cat, unified_filters=[], offset=offset, limit=limit,
+            count_hint=count_hint,
+        )
+        _state["total"] = total
+        _state["unified_filters"] = []
+
+        # Cache the real count for next startup
+        if total > 0:
+            tb.save_cached_count(total)
+
+        if not summaries:
+            w_status.object = "**0 scans** — add filters and press Search"
+            w_search_spinner.value = False
+            w_search_spinner.visible = False
+            return
+
+        df = pd.DataFrame(summaries)
+        for col in RESULT_COLS:
+            if col not in df.columns:
+                df[col] = "?"
+        df = df[RESULT_COLS].fillna("?")
+
+        w_table.value = df
+        n_pg = _n_pages()
+        w_status.object = (
+            f"**{total} scan{'s' if total != 1 else ''}** — "
+            f"page {_state['page'] + 1}/{n_pg}"
+        )
+        _refresh_pagination()
+        w_filter_summary.object = _filter_summary_text()
+        search_card.collapsed = True
+    except Exception as exc:
+        log.warning("startup search failed: %s", exc)
+        w_status.object = "*Ready — add filters and press Search*"
+    finally:
+        w_search_spinner.value = False
+        w_search_spinner.visible = False
+
+_startup_thread = threading.Thread(target=_startup_search, daemon=True)
+_startup_thread.start()
 
 if __name__ == "__main__":
     dashboard.show(title="SMI Browser")
