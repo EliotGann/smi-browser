@@ -219,262 +219,7 @@ def enhanced_summary(run) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# ScanCollection — holds processed results for comparison
-# ---------------------------------------------------------------------------
-
-class ScanCollection:
-    """
-    Manages a set of processed CombinedReductionResults for comparison
-    and parameter-sweep analysis.
-
-    Within-scan variation (e.g. waxs_arc angle per frame) is already
-    handled by reduce_smi_combined.  Between-scan variation (sample,
-    temperature, etc.) is tracked here.
-
-    Usage
-    -----
-        coll = ScanCollection()
-        coll.add(result, metadata, params)
-        coll.varying_parameters()      # which metadata fields differ
-        coll.iq_comparison_figure()    # matplotlib overlay
-        ds = coll.stack_iq("sample")   # xr.Dataset along a new dim
-    """
-
-    _PALETTE = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    ]
-
-    def __init__(self):
-        self._results: dict[str, Any] = {}           # uid -> CombinedReductionResult
-        self._metadata: dict[str, dict] = {}         # uid -> enhanced_summary dict
-        self._processing: dict[str, dict] = {}       # uid -> processing kwargs
-        self._colors: dict[str, str] = {}            # uid -> hex color
-        self._color_idx = 0
-
-    @property
-    def uids(self) -> list[str]:
-        return list(self._results.keys())
-
-    def __len__(self):
-        return len(self._results)
-
-    def __contains__(self, uid: str):
-        return uid in self._results
-
-    def add(self, result, metadata: dict, params: dict | None = None):
-        """Add a processed scan to the collection."""
-        self._results[result.uid] = result
-        self._metadata[result.uid] = metadata
-        if params:
-            self._processing[result.uid] = params
-        if result.uid not in self._colors:
-            self._colors[result.uid] = self._PALETTE[
-                self._color_idx % len(self._PALETTE)
-            ]
-            self._color_idx += 1
-
-    def remove(self, uid: str):
-        self._results.pop(uid, None)
-        self._metadata.pop(uid, None)
-        self._processing.pop(uid, None)
-        self._colors.pop(uid, None)
-
-    def get_color(self, uid: str) -> str:
-        return self._colors.get(uid, "#888888")
-
-    def set_color(self, uid: str, color: str) -> None:
-        if uid in self._results:
-            self._colors[uid] = color
-
-    def get_result(self, uid: str):
-        return self._results.get(uid)
-
-    def summary_table(self) -> pd.DataFrame:
-        """DataFrame summary of all scans in the collection."""
-        rows = []
-        for uid in self._results:
-            res = self._results[uid]
-            meta = self._metadata.get(uid, {})
-            timing = res.timing or {}
-            det_list = meta.get("detector_list")
-            if det_list and isinstance(det_list, list):
-                detectors = ", ".join(det_list)
-            else:
-                detectors = meta.get("detectors", "?")
-            rows.append({
-                "color":     self._colors.get(uid, "#888888"),
-                "uid_short": uid[:8],
-                "sample":    meta.get("sample_name", "?"),
-                "plan":      meta.get("plan_name", "?"),
-                "detectors": detectors,
-                "geometry":  res.geometry,
-                "total_s":   f"{sum(timing.values()):.1f}" if timing else "?",
-                "uid":       uid,
-            })
-        cols = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-    def varying_parameters(self) -> dict[str, list]:
-        """
-        Identify metadata fields that differ across scans in the collection.
-        Skips fields that are inherently unique per-scan (uid, scan_id, time).
-        """
-        if len(self._metadata) < 2:
-            return {}
-        all_metas = list(self._metadata.values())
-        all_keys: set[str] = set()
-        for m in all_metas:
-            all_keys.update(m.keys())
-
-        skip = {
-            "uid", "scan_id", "time", "exit_status", "streams",
-            "detector_list", "has_saxs", "has_waxs", "n_steps",
-        }
-        varying = {}
-        for key in sorted(all_keys - skip):
-            vals = [str(m.get(key, "")) for m in all_metas]
-            if len(set(vals)) > 1:
-                varying[key] = vals
-        return varying
-
-    def iq_comparison_figure(self, figsize=(9, 5)):
-        """Matplotlib figure overlaying I(q) from every scan."""
-        if not self._results:
-            return None
-        fig, ax = plt.subplots(figsize=figsize)
-        for uid, res in self._results.items():
-            meta = self._metadata.get(uid, {})
-            label = f"{uid[:8]} — {meta.get('sample_name', '?')}"
-            iq = res.merged_iq
-            q = iq["q"].values
-            I = iq["I"].values
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                ax.plot(q[mask], I[mask], linewidth=0.8, label=label)
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("q (nm⁻¹)")
-        ax.set_ylabel("I(q)")
-        ax.set_title("Processed Collection — I(q) Comparison")
-        ax.legend(fontsize=8, loc="best")
-        fig.tight_layout()
-        return fig
-
-    def iq_comparison_bokeh(self, uids: list[str] | None = None):
-        """Bokeh figure overlaying I(q) for selected uids (or all).
-
-        Uses stored per-scan colours (matching the table swatch) and
-        omits the legend — the table serves as the interactive legend.
-        Hovering highlights the nearest curve and dims the others.
-        """
-        from bokeh.events import MouseLeave
-        from bokeh.models import CustomJS, HoverTool
-        from bokeh.models.glyphs import Line as BkLine
-        from bokeh.plotting import figure as bk_figure
-
-        subset = uids if uids else list(self._results.keys())
-        subset = [u for u in subset if u in self._results]
-        if not subset:
-            return None
-
-        p = bk_figure(
-            title="Processed Collection — I(q) Comparison",
-            width=1000, height=500,
-            x_axis_type="log", y_axis_type="log",
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            active_scroll="wheel_zoom",
-            sizing_mode="stretch_both",
-        )
-
-        renderers = []
-        for uid in subset:
-            res = self._results[uid]
-            meta = self._metadata.get(uid, {})
-            label = f"{uid[:8]} — {meta.get('sample_name', '?')}"
-            color = self._colors.get(uid, "#888888")
-            iq = res.merged_iq
-            q = iq["q"].values
-            I = iq["I"].values
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                r = p.line(
-                    q[mask], I[mask],
-                    line_width=1.2, line_alpha=0.4,
-                    color=color, name=label,
-                )
-                r.hover_glyph = BkLine(
-                    line_color=color, line_alpha=1.0, line_width=3.5,
-                )
-                renderers.append(r)
-
-        p.xaxis.axis_label = "q (nm⁻¹)"
-        p.yaxis.axis_label = "I(q)"
-        if p.legend:
-            p.legend.visible = False
-
-        if renderers:
-            # Hover on nearest line: brightens it, tooltip shows scan info.
-            # A JS callback dims all OTHER lines while one is inspected.
-            hover_cb = CustomJS(args=dict(renderers=renderers), code="""
-                const r = cb_obj.renderers;
-                const inspected = r.filter(
-                    rend => rend.inspected && rend.inspected.indices.length > 0
-                );
-                if (inspected.length > 0) {
-                    for (const rend of renderers) {
-                        if (inspected.includes(rend)) {
-                            rend.glyph.line_alpha = 1.0;
-                            rend.glyph.line_width = 3.5;
-                        } else {
-                            rend.glyph.line_alpha = 0.08;
-                            rend.glyph.line_width = 0.7;
-                        }
-                    }
-                }
-            """)
-            reset_cb = CustomJS(args=dict(renderers=renderers), code="""
-                for (const r of renderers) {
-                    r.glyph.line_alpha = 0.4;
-                    r.glyph.line_width = 1.2;
-                }
-            """)
-            hover = HoverTool(
-                renderers=renderers,
-                tooltips=[
-                    ("scan", "$name"),
-                    ("q", "$x{0.000}"),
-                    ("I", "$y{0.00e+0}"),
-                ],
-                line_policy="nearest",
-                mode="mouse",
-                callback=hover_cb,
-            )
-            p.add_tools(hover)
-            p.js_on_event(MouseLeave, reset_cb)
-
-        return p
-
-    def stack_iq(self, dim_name: str = "scan", dim_values=None):
-        """
-        Stack merged I(q) datasets into a single xr.Dataset along a new dim.
-        If dim_values is given, use those as the coordinate; otherwise use
-        short UID + sample_name labels.
-        """
-        import xarray as xr
-        if not self._results:
-            return xr.Dataset()
-        datasets = []
-        labels = []
-        for i, (uid, res) in enumerate(self._results.items()):
-            if dim_values is not None and i < len(dim_values):
-                labels.append(dim_values[i])
-            else:
-                meta = self._metadata.get(uid, {})
-                labels.append(f"{uid[:8]}_{meta.get('sample_name', '?')}")
-            datasets.append(res.merged_iq)
-        return xr.concat(datasets, dim=pd.Index(labels, name=dim_name))
+from smi_browser.models.collection import ScanCollection
 
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1060,9 @@ w_mv_range = pn.widgets.RangeSlider(
 )
 w_mv_status = pn.pane.Markdown("*Click tab to load.*")
 w_mv_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
+w_mv_label = pn.widgets.Select(
+    name="Frame label", options=["(frame #)"], value="(frame #)", width=180,
+)
 w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
 
 _multiview_cache: dict = {
@@ -1370,6 +1118,25 @@ def _build_multiview_grid(frames, field):
     if not frames:
         w_mv_grid.object = None
         return
+
+    # Build per-frame labels from primary scalar column if selected
+    label_col = w_mv_label.value
+    frame_labels: list[str] = []
+    if label_col and label_col != "(frame #)":
+        df = w_primary_table.value
+        if df is not None and label_col in df.columns:
+            vals = df[label_col].values
+            for i in range(len(frames)):
+                if i < len(vals):
+                    v = vals[i]
+                    try:
+                        frame_labels.append(f"{label_col}={float(v):.4g}")
+                    except (ValueError, TypeError):
+                        frame_labels.append(f"{label_col}={v}")
+                else:
+                    frame_labels.append(f"frame {i}")
+    if not frame_labels:
+        frame_labels = [f"frame {i}" for i in range(len(frames))]
 
     # Per-frame display arrays + global data range
     displays = [np.where(np.isfinite(a), a, 0).astype(np.float32) for a in frames]
@@ -1428,7 +1195,7 @@ def _build_multiview_grid(frames, field):
         else:
             kwargs["x_range"] = (0, w)
             kwargs["y_range"] = (0, h)
-        p = bk_figure(title=f"frame {i}", **kwargs)
+        p = bk_figure(title=frame_labels[i], **kwargs)
         if shared_x is None:
             shared_x = p.x_range
             shared_y = p.y_range
@@ -1440,6 +1207,7 @@ def _build_multiview_grid(frames, field):
         hover = HoverTool(
             renderers=[r],
             tooltips=[
+                ("label", frame_labels[i]),
                 ("frame", str(i)),
                 ("(col, row)", "($x{0}, $y{0})"),
                 ("intensity", "@image{0.000}"),
@@ -1490,6 +1258,20 @@ def _load_multiview():
         w_mv_status.object = "*No image fields found.*"
         w_mv_grid.object = None
         return
+
+    # Ensure primary scalars are loaded so the label dropdown has options
+    if not _detail_cache.get("primary_loaded"):
+        _load_primary()
+    df = w_primary_table.value
+    label_options = ["(frame #)"]
+    if df is not None and not df.empty:
+        label_options += [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    prev_label = w_mv_label.value
+    w_mv_label.options = label_options
+    if prev_label in label_options:
+        w_mv_label.value = prev_label
+    else:
+        w_mv_label.value = "(frame #)"
 
     image_fields = list(info["images"])
     # Populate detector dropdown (preserve previous choice if present)
@@ -1594,6 +1376,17 @@ w_mv_field.param.watch(_on_mv_field, "value")
 w_mv_cmap.param.watch(_on_mv_cmap, "value")
 w_mv_log.param.watch(_on_mv_log, "value")
 w_mv_range.param.watch(_on_mv_range, "value")
+
+
+def _on_mv_label(event):
+    """Rebuild grid with updated frame labels when the label column changes."""
+    field = _multiview_cache.get("field")
+    frames = _multiview_cache.get("frames")
+    if field and frames:
+        _build_multiview_grid(frames, field)
+
+
+w_mv_label.param.watch(_on_mv_label, "value")
 
 
 # ---------------------------------------------------------------------------
@@ -2680,6 +2473,7 @@ _coll_ns = _coll_mod.wire(_collection)
 
 w_coll_table = _coll_ns.coll_table
 w_btn_coll_remove = _coll_ns.btn_remove
+w_coll_label = _coll_ns.label_select
 w_coll_compare_plot = _coll_ns.compare_plot
 
 
@@ -3557,7 +3351,25 @@ def _on_add_to_collection(event):
         return
     summary = _detail_cache.get("summary") or {}
     params = _last_result.get("params") or {}
-    _collection.add(result, summary, params)
+    # Bundle primary/baseline/raw metadata with the processed scan
+    primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
+    # Fetch baseline as raw scalar DataFrame (the UI table is transposed
+    # into field/before/after rows, which isn't suitable for numeric lookups).
+    baseline_df = None
+    if _detail_cache.get("baseline_loaded"):
+        run = _ensure_run()
+        if run and "baseline" in tb.stream_names(run):
+            try:
+                baseline_df = _scalar_stream_to_frame(run, "baseline")
+            except Exception:
+                pass
+    raw_metadata = w_meta_json.object if w_meta_json.object else None
+    _collection.add(
+        result, summary, params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        raw_metadata=raw_metadata,
+    )
     _refresh_collection()
     _open_collection_panel()  # pop open the floating panel
     pn.state.notifications.success(
@@ -3864,6 +3676,21 @@ def _batch_process_fn(uid: str):
     # Use pre-snapshotted summary from enqueue time (thread-safe).
     summary = _batch_state.get("summaries", {}).get(uid, {})
     result = run_fn(**params)
+    # Fetch primary/baseline scalars and raw metadata so the collection
+    # can offer label columns and eventual export.
+    try:
+        run = _get_cat()[uid]
+        primary_df = _scalar_stream_to_frame(run, "primary")
+        baseline_df = _scalar_stream_to_frame(run, "baseline")
+        raw_md = dict(run.metadata)
+    except Exception:
+        primary_df = None
+        baseline_df = None
+        raw_md = None
+    # Pack extra data into params (BatchProcessor passes it through).
+    params["_primary_df"] = primary_df
+    params["_baseline_df"] = baseline_df
+    params["_raw_metadata"] = raw_md
     return result, summary, params
 
 
@@ -3964,7 +3791,15 @@ def _batch_add_fn(result, summary, params):
     # ScanCollection internals are plain dicts; updates are GIL-protected.
     # We add on the worker thread so the snapshot fired immediately after
     # already reflects the new collection size.
-    _collection.add(result, summary, params)
+    primary_df = params.pop("_primary_df", None)
+    baseline_df = params.pop("_baseline_df", None)
+    raw_metadata = params.pop("_raw_metadata", None)
+    _collection.add(
+        result, summary, params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        raw_metadata=raw_metadata,
+    )
 
 
 def _ensure_batch_processor() -> BatchProcessor:
@@ -4658,7 +4493,7 @@ w_detail_tabs = pn.Tabs(
         "Grid",
         pn.Column(
             pn.Row(w_mv_status, w_mv_spinner),
-            pn.Row(w_mv_field, w_mv_cmap, w_mv_log, sizing_mode="stretch_width"),
+            pn.Row(w_mv_field, w_mv_cmap, w_mv_log, w_mv_label, sizing_mode="stretch_width"),
             w_mv_range,
             pn.Column(w_mv_grid, sizing_mode="stretch_both", min_height=500),
             sizing_mode="stretch_both",
@@ -4764,7 +4599,7 @@ detail_panel = pn.Column(
 collection_card = pn.Card(
     pn.Row(
         pn.Column(
-            pn.Row(w_btn_coll_remove),
+            pn.Row(w_btn_coll_remove, w_coll_label),
             w_coll_table,
             sizing_mode="stretch_width",
             min_width=300,

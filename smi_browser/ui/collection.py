@@ -46,7 +46,7 @@ def wire(collection: ScanCollection) -> SimpleNamespace:
     # --- widgets (created fresh each session) ---
     coll_table = pn.widgets.Tabulator(
         value=pd.DataFrame(columns=_COLL_COLS),
-        show_index=False, sizing_mode="stretch_both", height=300,
+        show_index=False, sizing_mode="stretch_both", min_height=300,
         selectable="checkbox",
         configuration={"rowHeight": 24, "layout": "fitColumns"},
         hidden_columns=["uid"],
