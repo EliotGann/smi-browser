@@ -47,53 +47,6 @@ import tiled_browser as tb
 from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 
-# Re-export relocated modules so internal references still work
-from smi_browser.models.summary import enhanced_summary  # noqa: F401
-from smi_browser.models.collection import ScanCollection  # noqa: F401
-from smi_browser.data.scalars import (  # noqa: F401
-    scalars_to_dataframe as _scalars_to_dataframe_impl,
-    scalar_stream_to_frame as _scalar_stream_to_frame_impl,
-)
-from smi_browser.data.frames import (  # noqa: F401
-    detector_for_field as _detector_for_field_impl,
-    orient_frame as _orient_frame_impl,
-)
-from smi_browser.data.masks import (  # noqa: F401
-    normalized_mask_to_xs_ys as _normalized_mask_to_xs_ys_impl,
-    xs_ys_to_normalized_mask as _xs_ys_to_normalized_mask_impl,
-    default_mask_path_for as _default_mask_path_for_impl,
-    classify_detector_field,
-)
-from smi_browser.figures.image import (  # noqa: F401
-    thumbnail_figure as _thumbnail_figure_impl,
-    update_image_data as _update_image_data_impl,
-)
-from smi_browser.figures.multiview import (  # noqa: F401
-    grid_dims as _mv_grid_dims_impl,
-    compute_data_range as _mv_compute_data_range_impl,
-)
-from smi_browser.figures.cuts import (  # noqa: F401
-    cuts_to_source_data as _cuts_to_source_data_impl,
-    source_data_to_cuts as _source_data_to_cuts_impl,
-    compute_cross_section as _compute_cross_section_impl,
-    format_cut_label as _format_cut_label_impl,
-    _CUT_FILL, _CUT_LINE,
-)
-from smi_browser.figures.process_2d import (  # noqa: F401
-    plot_2d_transmission as _plot_2d_transmission_impl,
-    plot_2d_gi as _plot_2d_gi_impl,
-)
-from smi_browser.processing import build_proc_params as _build_proc_params_impl
-from smi_browser.config import (  # noqa: F401
-    PAGE_SIZE,
-    COMMON_SEARCH_KEYS,
-    RESULT_COLS,
-    EMPTY_DF as _EMPTY_DF_pkg,
-    SEARCH_TYPES as SEARCH_TYPES_pkg,
-    SEARCH_TYPE_MAP as SEARCH_TYPE_MAP_pkg,
-)
-from smi_browser.state import AppState
-
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -102,13 +55,20 @@ log = logging.getLogger(__name__)
 
 pn.extension("tabulator", sizing_mode="stretch_width", notifications=True)
 
+# UI modules must be imported AFTER pn.extension() so that Tabulator widgets
+# created inside wire() register the JS extension correctly.
+from smi_browser.ui import collection as _coll_mod
+
 # ---------------------------------------------------------------------------
-# Configuration  (canonical source: smi_browser.config)
+# Configuration
 # ---------------------------------------------------------------------------
 
-# PAGE_SIZE, COMMON_SEARCH_KEYS, RESULT_COLS imported from smi_browser.config above.
+PAGE_SIZE = 25
 
-# PyHyperScattering imports still needed directly in this file.
+# Canonical defaults & helpers are owned by PyHyperScattering.smi_defaults.
+# Importing it triggers PyHyperScattering/__init__.py once (which pulls in
+# the heavy integrators), but we need LOADER_DEFAULTS at widget-construct
+# time anyway, so eat the cost here rather than mirroring constants.
 from PyHyperScattering import smi_defaults as smid
 from PyHyperScattering.SMISWAXSIntegrator import (
     clear_geometry_cache,
@@ -120,9 +80,11 @@ DEFAULT_CATALOG = smid.DEFAULT_CATALOG
 DEFAULT_SAXS_MASK_NAME = smid.DEFAULT_SAXS_MASK_NAME
 DEFAULT_WAXS_MASK_NAME = smid.DEFAULT_WAXS_MASK_NAME
 
+# Detector-name classification (kept as module aliases for legacy usage).
 SAXS_DETECTOR_NAMES = smid.SAXS_DETECTOR_NAMES
 WAXS_DETECTOR_NAMES = smid.WAXS_DETECTOR_NAMES
 
+# Loader-side calibrated defaults (frozen dataclass exposed by PyHyper).
 _LD = smid.LOADER_DEFAULTS
 DEFAULT_SAXS_ROW_DELTA = _LD.saxs_row_delta_px
 DEFAULT_SAXS_COL_DELTA = _LD.saxs_col_delta_px
@@ -130,44 +92,428 @@ DEFAULT_WAXS_ROW_DELTA = _LD.waxs_row_delta_px
 DEFAULT_WAXS_COL_DELTA = _LD.waxs_col_delta_px
 DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 
-DEFAULT_N_Q = 2000
+# Processing defaults  (UI-side; these mirror the upstream PyHyper defaults
+# so the widgets show meaningful numbers even before any override.  When a
+# widget value still equals its default, _on_process passes None so the
+# upstream loader supplies its own calibrated default.)
+DEFAULT_N_Q = 2000          # PyHyper default is 1000; smi-browser used 2000
 DEFAULT_N_CHI = 360
-DEFAULT_SAXS_MASK = ""
+DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
 DEFAULT_WAXS_MASK = ""
 DEFAULT_DEZINGER = 3000.0
+DEFAULT_DEZINGER_KERNEL = 5
 DEFAULT_INCIDENT_ANGLE = 0.0
 DEFAULT_THETA_OFFSET = -0.5
 DEFAULT_N_QXY = 500
 DEFAULT_N_QZ = 500
+DEFAULT_SOLID_ANGLE = True
+DEFAULT_SAXS_AGBH_RING_ORDER = 5
+DEFAULT_SAXS_Q_MARGIN_FRACTION = 0.01
+DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG = 0.0
+DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG = 15.0
+DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG = 14.5
+DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG = 18.0
+DEFAULT_DYN_APER_AGBH_RING_ORDER = 5
+DEFAULT_DYN_APER_Q_MARGIN_FRACTION = 0.01
+DEFAULT_WAXS_ENERGY_KEV = 16.1
+DEFAULT_WAXS_SAMPLE_DIST_MM = 274.0
+DEFAULT_WAXS_PIXEL_SIZE_MM = 0.172
+DEFAULT_WAXS_BEAM_CENTER_ROW = 217.0
+DEFAULT_WAXS_BEAM_CENTER_COL = 319.0
+DEFAULT_WAXS_THETA_ZERO_DEG = 0.0
+DEFAULT_WAXS_SAMPLE_OFFSET_X_MM = 0.0
+DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM = 2.0
+DEFAULT_WAXS_Q_HORIZONTAL_SIGN = -1.0
+DEFAULT_WAXS_Q_VERTICAL_SIGN = -1.0
+DEFAULT_WAXS_ROTATION_K = 3
 
-_EMPTY_DF = _EMPTY_DF_pkg
+# Common metadata keys for Like search (user can also type custom keys)
+COMMON_SEARCH_KEYS = [
+    "sample_name",
+    "plan_name",
+    "data_session",
+    "proposal.first_name",
+    "proposal.last_name",
+    "project_name",
+    "institution",
+    "scan_id",
+    "uid",
+    "detectors",
+]
 
+RESULT_COLS = [
+    "scan_id", "n_steps", "sample_name", "plan_name",
+    "data_session", "detectors", "exit_status", "time", "uid",
+]
 
-# enhanced_summary is imported from smi_browser.models.summary above.
-# ScanCollection is imported from smi_browser.models.collection above.
+_EMPTY_DF = pd.DataFrame(columns=RESULT_COLS)
 
 
 # ---------------------------------------------------------------------------
-# Global state  (canonical source: smi_browser.state.AppState)
+# Enhanced run summary  (metadata-only, adds detector + institution fields)
 # ---------------------------------------------------------------------------
 
-_app = AppState()
+def enhanced_summary(run) -> dict:
+    """
+    Build a lightweight summary from a tiled run node.
+    Only reads .metadata — zero array I/O.  Extends tb.run_summary with
+    detector classification and institution info.
+    """
+    md = run.metadata
+    start = md.get("start", {})
+    stop = md.get("stop", {})
 
-# Convenience aliases for the transition period — these point into _app
-# so existing code can be migrated incrementally.
-_collection = _app.collection
-_state = _app.search
-_detail_cache = _app.detail_cache
-_last_result = _app.last_result
+    t0 = start.get("time")
+    time_str = (
+        datetime.datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M")
+        if t0 else "?"
+    )
+
+    # Detectors
+    det_list = start.get("detectors", [])
+    if isinstance(det_list, str):
+        det_list = [det_list]
+    det_lower = {d.lower() for d in det_list}
+    has_saxs = bool(det_lower & SAXS_DETECTOR_NAMES)
+    has_waxs = bool(det_lower & WAXS_DETECTOR_NAMES)
+    if has_saxs and has_waxs:
+        det_str = "SAXS+WAXS"
+    elif has_saxs:
+        det_str = "SAXS"
+    elif has_waxs:
+        det_str = "WAXS"
+    else:
+        det_str = ", ".join(det_list) if det_list else "?"
+
+    # Steps
+    num_events = stop.get("num_events", {})
+    if isinstance(num_events, dict):
+        n_steps = num_events.get("primary", "?")
+    else:
+        n_steps = num_events
+
+    # Institution / data session
+    institution = start.get(
+        "institution",
+        start.get("data_session", start.get("proposal_id", "?")),
+    )
+
+    exit_status = stop.get("exit_status", "?")
+
+    return {
+        "uid":          start.get("uid", "?"),
+        "scan_id":      start.get("scan_id", "?"),
+        "time":         time_str,
+        "plan_name":    start.get("plan_name", "?"),
+        "sample_name":  start.get(
+            "sample_name",
+            start.get("sample", start.get("Sample", "?")),
+        ),
+        "exit_status":  exit_status,
+        "n_steps":      n_steps,
+        "institution":  str(institution),
+        "detectors":    det_str,
+        "has_saxs":     has_saxs,
+        "has_waxs":     has_waxs,
+        "detector_list": det_list,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ScanCollection — holds processed results for comparison
+# ---------------------------------------------------------------------------
+
+class ScanCollection:
+    """
+    Manages a set of processed CombinedReductionResults for comparison
+    and parameter-sweep analysis.
+
+    Within-scan variation (e.g. waxs_arc angle per frame) is already
+    handled by reduce_smi_combined.  Between-scan variation (sample,
+    temperature, etc.) is tracked here.
+
+    Usage
+    -----
+        coll = ScanCollection()
+        coll.add(result, metadata, params)
+        coll.varying_parameters()      # which metadata fields differ
+        coll.iq_comparison_figure()    # matplotlib overlay
+        ds = coll.stack_iq("sample")   # xr.Dataset along a new dim
+    """
+
+    _PALETTE = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
+
+    def __init__(self):
+        self._results: dict[str, Any] = {}           # uid -> CombinedReductionResult
+        self._metadata: dict[str, dict] = {}         # uid -> enhanced_summary dict
+        self._processing: dict[str, dict] = {}       # uid -> processing kwargs
+        self._colors: dict[str, str] = {}            # uid -> hex color
+        self._color_idx = 0
+
+    @property
+    def uids(self) -> list[str]:
+        return list(self._results.keys())
+
+    def __len__(self):
+        return len(self._results)
+
+    def __contains__(self, uid: str):
+        return uid in self._results
+
+    def add(self, result, metadata: dict, params: dict | None = None):
+        """Add a processed scan to the collection."""
+        self._results[result.uid] = result
+        self._metadata[result.uid] = metadata
+        if params:
+            self._processing[result.uid] = params
+        if result.uid not in self._colors:
+            self._colors[result.uid] = self._PALETTE[
+                self._color_idx % len(self._PALETTE)
+            ]
+            self._color_idx += 1
+
+    def remove(self, uid: str):
+        self._results.pop(uid, None)
+        self._metadata.pop(uid, None)
+        self._processing.pop(uid, None)
+        self._colors.pop(uid, None)
+
+    def get_color(self, uid: str) -> str:
+        return self._colors.get(uid, "#888888")
+
+    def set_color(self, uid: str, color: str) -> None:
+        if uid in self._results:
+            self._colors[uid] = color
+
+    def get_result(self, uid: str):
+        return self._results.get(uid)
+
+    def summary_table(self) -> pd.DataFrame:
+        """DataFrame summary of all scans in the collection."""
+        rows = []
+        for uid in self._results:
+            res = self._results[uid]
+            meta = self._metadata.get(uid, {})
+            timing = res.timing or {}
+            det_list = meta.get("detector_list")
+            if det_list and isinstance(det_list, list):
+                detectors = ", ".join(det_list)
+            else:
+                detectors = meta.get("detectors", "?")
+            rows.append({
+                "color":     self._colors.get(uid, "#888888"),
+                "uid_short": uid[:8],
+                "sample":    meta.get("sample_name", "?"),
+                "plan":      meta.get("plan_name", "?"),
+                "detectors": detectors,
+                "geometry":  res.geometry,
+                "total_s":   f"{sum(timing.values()):.1f}" if timing else "?",
+                "uid":       uid,
+            })
+        cols = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+    def varying_parameters(self) -> dict[str, list]:
+        """
+        Identify metadata fields that differ across scans in the collection.
+        Skips fields that are inherently unique per-scan (uid, scan_id, time).
+        """
+        if len(self._metadata) < 2:
+            return {}
+        all_metas = list(self._metadata.values())
+        all_keys: set[str] = set()
+        for m in all_metas:
+            all_keys.update(m.keys())
+
+        skip = {
+            "uid", "scan_id", "time", "exit_status", "streams",
+            "detector_list", "has_saxs", "has_waxs", "n_steps",
+        }
+        varying = {}
+        for key in sorted(all_keys - skip):
+            vals = [str(m.get(key, "")) for m in all_metas]
+            if len(set(vals)) > 1:
+                varying[key] = vals
+        return varying
+
+    def iq_comparison_figure(self, figsize=(9, 5)):
+        """Matplotlib figure overlaying I(q) from every scan."""
+        if not self._results:
+            return None
+        fig, ax = plt.subplots(figsize=figsize)
+        for uid, res in self._results.items():
+            meta = self._metadata.get(uid, {})
+            label = f"{uid[:8]} — {meta.get('sample_name', '?')}"
+            iq = res.merged_iq
+            q = iq["q"].values
+            I = iq["I"].values
+            mask = np.isfinite(I) & (I > 0)
+            if mask.any():
+                ax.plot(q[mask], I[mask], linewidth=0.8, label=label)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("q (nm⁻¹)")
+        ax.set_ylabel("I(q)")
+        ax.set_title("Processed Collection — I(q) Comparison")
+        ax.legend(fontsize=8, loc="best")
+        fig.tight_layout()
+        return fig
+
+    def iq_comparison_bokeh(self, uids: list[str] | None = None):
+        """Bokeh figure overlaying I(q) for selected uids (or all).
+
+        Uses stored per-scan colours (matching the table swatch) and
+        omits the legend — the table serves as the interactive legend.
+        Hovering highlights the nearest curve and dims the others.
+        """
+        from bokeh.events import MouseLeave
+        from bokeh.models import CustomJS, HoverTool
+        from bokeh.models.glyphs import Line as BkLine
+        from bokeh.plotting import figure as bk_figure
+
+        subset = uids if uids else list(self._results.keys())
+        subset = [u for u in subset if u in self._results]
+        if not subset:
+            return None
+
+        p = bk_figure(
+            title="Processed Collection — I(q) Comparison",
+            width=1000, height=500,
+            x_axis_type="log", y_axis_type="log",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+            sizing_mode="stretch_both",
+        )
+
+        renderers = []
+        for uid in subset:
+            res = self._results[uid]
+            meta = self._metadata.get(uid, {})
+            label = f"{uid[:8]} — {meta.get('sample_name', '?')}"
+            color = self._colors.get(uid, "#888888")
+            iq = res.merged_iq
+            q = iq["q"].values
+            I = iq["I"].values
+            mask = np.isfinite(I) & (I > 0)
+            if mask.any():
+                r = p.line(
+                    q[mask], I[mask],
+                    line_width=1.2, line_alpha=0.4,
+                    color=color, name=label,
+                )
+                r.hover_glyph = BkLine(
+                    line_color=color, line_alpha=1.0, line_width=3.5,
+                )
+                renderers.append(r)
+
+        p.xaxis.axis_label = "q (nm⁻¹)"
+        p.yaxis.axis_label = "I(q)"
+        if p.legend:
+            p.legend.visible = False
+
+        if renderers:
+            # Hover on nearest line: brightens it, tooltip shows scan info.
+            # A JS callback dims all OTHER lines while one is inspected.
+            hover_cb = CustomJS(args=dict(renderers=renderers), code="""
+                const r = cb_obj.renderers;
+                const inspected = r.filter(
+                    rend => rend.inspected && rend.inspected.indices.length > 0
+                );
+                if (inspected.length > 0) {
+                    for (const rend of renderers) {
+                        if (inspected.includes(rend)) {
+                            rend.glyph.line_alpha = 1.0;
+                            rend.glyph.line_width = 3.5;
+                        } else {
+                            rend.glyph.line_alpha = 0.08;
+                            rend.glyph.line_width = 0.7;
+                        }
+                    }
+                }
+            """)
+            reset_cb = CustomJS(args=dict(renderers=renderers), code="""
+                for (const r of renderers) {
+                    r.glyph.line_alpha = 0.4;
+                    r.glyph.line_width = 1.2;
+                }
+            """)
+            hover = HoverTool(
+                renderers=renderers,
+                tooltips=[
+                    ("scan", "$name"),
+                    ("q", "$x{0.000}"),
+                    ("I", "$y{0.00e+0}"),
+                ],
+                line_policy="nearest",
+                mode="mouse",
+                callback=hover_cb,
+            )
+            p.add_tools(hover)
+            p.js_on_event(MouseLeave, reset_cb)
+
+        return p
+
+    def stack_iq(self, dim_name: str = "scan", dim_values=None):
+        """
+        Stack merged I(q) datasets into a single xr.Dataset along a new dim.
+        If dim_values is given, use those as the coordinate; otherwise use
+        short UID + sample_name labels.
+        """
+        import xarray as xr
+        if not self._results:
+            return xr.Dataset()
+        datasets = []
+        labels = []
+        for i, (uid, res) in enumerate(self._results.items()):
+            if dim_values is not None and i < len(dim_values):
+                labels.append(dim_values[i])
+            else:
+                meta = self._metadata.get(uid, {})
+                labels.append(f"{uid[:8]}_{meta.get('sample_name', '?')}")
+            datasets.append(res.merged_iq)
+        return xr.concat(datasets, dim=pd.Index(labels, name=dim_name))
+
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+_cat = None          # migration catalog (for data access / processing)
+_collection = ScanCollection()
+
+_state = {
+    "unified_filters": [],  # list of (type, key, value) tuples
+    "page":         0,
+    "page_size":    PAGE_SIZE,
+    "total":        0,
+    "selected_uid": None,
+}
+
+_detail_cache = {
+    "uid":              None,
+    "run":              None,
+    "summary":          None,
+    "primary_loaded":   False,
+    "baseline_loaded":  False,
+    "images_loaded":    False,
+    "primary_info":     None,
+    "primary_dataset":  None,
+}
+
+_last_result = {"result": None, "params": None}
 
 
 def _get_cat():
     """Return the migration catalog (used for data access / processing)."""
-    if _app.cat is None:
+    global _cat
+    if _cat is None:
         t0 = time.time()
-        _app.cat = tb.connect(DEFAULT_TILED_URI, DEFAULT_CATALOG)
+        _cat = tb.connect(DEFAULT_TILED_URI, DEFAULT_CATALOG)
         log.info("tiled connect (migration) took %.2fs", time.time() - t0)
-    return _app.cat
+    return _cat
 
 
 def _n_pages() -> int:
@@ -178,8 +524,8 @@ def _n_pages() -> int:
 # Search / data helpers
 # ---------------------------------------------------------------------------
 
-SEARCH_TYPES = SEARCH_TYPES_pkg
-SEARCH_TYPE_MAP = SEARCH_TYPE_MAP_pkg
+SEARCH_TYPES = ["Anywhere", "Text in field", "Contains", "Exact"]
+SEARCH_TYPE_MAP = {"Anywhere": "anywhere", "Text in field": "like", "Contains": "contains", "Exact": "exact"}
 
 
 def _collect_unified_filters() -> list[tuple[str, str, str]]:
@@ -228,50 +574,269 @@ def _count_total() -> int:
 
 
 def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
-    return _scalars_to_dataframe_impl(scalar_data)
+    """Convert a {field: ndarray} dict of scalars into a DataFrame."""
+    if not scalar_data:
+        return pd.DataFrame()
+
+    columns = {}
+    max_len = 0
+    for key, arr in scalar_data.items():
+        arr = np.asarray(arr)
+        if arr.ndim == 0:
+            arr = np.array([arr.item()])
+        if arr.ndim != 1:
+            continue
+        columns[key] = arr
+        max_len = max(max_len, len(arr))
+
+    if not columns:
+        return pd.DataFrame()
+
+    data = {}
+    for key, arr in columns.items():
+        if len(arr) < max_len:
+            padded = np.full(
+                max_len, np.nan,
+                dtype=float if np.issubdtype(arr.dtype, np.number) else object,
+            )
+            padded[:len(arr)] = arr
+            data[key] = padded
+        else:
+            data[key] = arr
+    return pd.DataFrame(data)
 
 
 def _scalar_stream_to_frame(run, stream: str) -> pd.DataFrame:
-    return _scalar_stream_to_frame_impl(run, stream)
+    """Read scalar fields from a stream into a DataFrame."""
+    scalar_data = tb.fetch_scalars(run, stream)
+    return _scalars_to_dataframe(scalar_data)
 
 
 def _detector_for_field(field: str) -> str | None:
-    return classify_detector_field(field)
+    """Classify a detector field name as ``'saxs'`` / ``'waxs'`` / ``None``."""
+    return smid.classify_detector_field(field)
 
 
 def _orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
-    return _orient_frame_impl(arr, field)
+    """Re-orient detector frames for display via the canonical PyHyper transform."""
+    detector = _detector_for_field(field)
+    if detector is None:
+        return arr
+    return smid.orient_frame_for_display(arr, detector)
 
 
 # ---------------------------------------------------------------------------
-# Polygon mask helpers  (canonical source: smi_browser.data.masks)
+# Polygon mask helpers (overlay + edit on the Explore image preview)
+#
+# All schema parsing and orientation math lives in PyHyperScattering's
+# smi_defaults module.  The browser keeps only the thin projection between
+# the *normalized* mask dict (PyHyper's canonical shape) and Bokeh's
+# (xs, ys, names, kinds) ColumnDataSource columns.
 # ---------------------------------------------------------------------------
 
 
-def _normalized_mask_to_xs_ys(mask, field=None, raw_shape=None):
-    return _normalized_mask_to_xs_ys_impl(mask, field, raw_shape)
+def _normalized_mask_to_xs_ys(
+    mask: dict,
+    field: str | None = None,
+    raw_shape: tuple[int, int] | None = None,
+) -> tuple[list, list, list, list]:
+    """Project a normalized mask dict into Bokeh patches columns.
+
+    Input is the dict returned by ``smid.load_mask_polygons`` (always shaped
+    ``{image_shape, static_regions, beamstops}`` in raw detector indexing).
+    When ``field`` and ``raw_shape`` are given, vertices are transformed
+    via ``smid.orient_polygon_xy`` so the polygons overlay the *displayed*
+    image.
+    """
+    xs, ys, names, kinds = [], [], [], []
+    detector = _detector_for_field(field) if field else None
+
+    def _xy(col_raw: float, row_raw: float) -> tuple[float, float]:
+        if detector is not None and raw_shape is not None:
+            return smid.orient_polygon_xy(col_raw, row_raw, detector, raw_shape)
+        return float(col_raw), float(row_raw)
+
+    for kind, bucket in (("static", "static_regions"), ("beamstop", "beamstops")):
+        for name, verts in (mask.get(bucket) or {}).items():
+            if not verts:
+                continue
+            xl, yl = [], []
+            for v in verts:
+                x, y = _xy(v[0], v[1])
+                xl.append(x)
+                yl.append(y)
+            xs.append(xl)
+            ys.append(yl)
+            names.append(str(name))
+            kinds.append(kind)
+    return xs, ys, names, kinds
 
 
-def _xs_ys_to_normalized_mask(xs, ys, names, kinds, field=None, raw_shape=None):
-    return _xs_ys_to_normalized_mask_impl(xs, ys, names, kinds, field, raw_shape)
+def _xs_ys_to_normalized_mask(
+    xs, ys, names, kinds,
+    field: str | None = None,
+    raw_shape: tuple[int, int] | None = None,
+) -> dict:
+    """Inverse projection — build a normalized mask dict from Bokeh columns."""
+    out: dict = {
+        "image_shape": list(raw_shape) if raw_shape else None,
+        "static_regions": {},
+        "beamstops": {},
+    }
+    detector = _detector_for_field(field) if field else None
+    counters = {"static": 0, "beamstop": 0}
+    for px, py, name, kind in zip(xs, ys, names, kinds):
+        if not px or not py:
+            continue
+        verts = []
+        for x, y in zip(px, py):
+            if detector is not None and raw_shape is not None:
+                col, row = smid.orient_polygon_xy_inverse(
+                    x, y, detector, raw_shape)
+            else:
+                col, row = float(x), float(y)
+            verts.append([col, row])
+        if not name:
+            counters[kind] += 1
+            name = f"{kind}_{counters[kind]}"
+        bucket = "static_regions" if kind == "static" else "beamstops"
+        out[bucket][name] = verts
+    return out
 
 
 def _default_mask_path_for(detector: str):
-    return _default_mask_path_for_impl(detector)
+    """Resolve the bundled default mask path for a detector."""
+    return (smid.default_waxs_mask_path() if detector == "waxs"
+            else smid.default_saxs_mask_path())
 
 
 def _thumbnail_figure(arr, title):
-    """Build an interactive Bokeh image figure (delegates to smi_browser.figures.image)."""
-    p, source, mapper, extras = _thumbnail_figure_impl(
-        arr, title, mask_visible=bool(w_mask_show.value),
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
+        PolyDrawTool, PolyEditTool,
     )
-    # Stash extras on image cache so the Explore controls can read/write them
-    _image_cache.update(extras)
+
+    h, w = arr.shape
+    finite = arr[np.isfinite(arr) & (arr > 0)]
+    if finite.size:
+        vlo = max(float(np.percentile(finite, 1)), 1e-3)
+        vhi = float(np.percentile(finite, 99.5))
+        vhi = max(vhi, vlo + 1.0)
+        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=vhi)
+    else:
+        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
+        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
+        mapper = LinearColorMapper(palette="Greys256", low=lo, high=hi)
+
+    pw = 600
+    ph = 600
+
+    display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
+    source = ColumnDataSource(data=dict(image=[display], x=[0], y=[0], dw=[w], dh=[h]))
+
+    p = bk_figure(
+        title=title, width=pw, height=ph,
+        x_range=(0, w), y_range=(0, h),
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        match_aspect=True,
+        sizing_mode="stretch_both",
+    )
+    p.image(image="image", x="x", y="y", dw="dw", dh="dh",
+            color_mapper=mapper, source=source)
+    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
+    p.xaxis.axis_label = "col (px)"
+    p.yaxis.axis_label = "row (px)"
+
+    # ----- Polygon mask overlay (always present; populated/hidden by callers)
+    mask_source = ColumnDataSource(
+        data=dict(xs=[], ys=[], name=[], kind=[],
+                  fill_color=[], line_color=[]),
+    )
+    mask_renderer = p.patches(
+        xs="xs", ys="ys",
+        fill_color="fill_color", fill_alpha=0.25,
+        line_color="line_color", line_width=2,
+        source=mask_source,
+    )
+    # ----- Separate "new polygons" overlay --------------------------------
+    # PolyDrawTool draws into its own dedicated source so:
+    #   (a) new polygons get a visually distinct colour (cyan), and
+    #   (b) the tool isn't confused by the many pre-loaded static-mask
+    #       polygons (which carry extra columns and can prevent draw
+    #       activation in some Bokeh versions).
+    new_mask_source = ColumnDataSource(data=dict(xs=[], ys=[]))
+    new_mask_renderer = p.patches(
+        xs="xs", ys="ys",
+        fill_color="#00e5ff", fill_alpha=0.30,
+        line_color="#0066ff", line_width=2,
+        source=new_mask_source,
+    )
+    # Vertex source for PolyEditTool (shows draggable handles in edit mode)
+    vertex_source = ColumnDataSource(data=dict(x=[], y=[]))
+    vertex_renderer = p.scatter(
+        x="x", y="y", source=vertex_source,
+        size=8, color="white", line_color="black", line_width=1,
+    )
+    # PolyDrawTool only sees the *new* renderer; PolyEditTool can edit both.
+    draw_tool = PolyDrawTool(renderers=[new_mask_renderer], num_objects=200)
+    edit_tool = PolyEditTool(renderers=[mask_renderer, new_mask_renderer],
+                             vertex_renderer=vertex_renderer)
+    p.add_tools(draw_tool, edit_tool)
+
+    # ----- Tap-position debug readout -------------------------------------
+    # Reports the (x, y) of every tap on the figure, so we can verify the
+    # PolyDrawTool is actually being reached by tap events.
+    from bokeh.models import CustomJS
+
+    tap_cb = CustomJS(
+        args=dict(),
+        code="""
+        const x = cb_obj.x;
+        const y = cb_obj.y;
+        const ev = (cb_obj.event_name || 'tap');
+        console.log('[mask-debug]', ev, 'x=', x.toFixed(1), 'y=', y.toFixed(1));
+        """,
+    )
+    p.js_on_event("tap", tap_cb)
+    p.js_on_event("doubletap", tap_cb)
+
+    # ----- Dynamic-mask overlay (rasterised PyHyper mask, optional) -------
+    # Render as an RGBA image; alpha=0 for valid pixels, semi-transparent
+    # red for invalid pixels.  Populated by _render_dynamic_mask().
+    # image_rgba requires a 2D uint32 array (or a uint8 (h,w,4) view as uint32).
+    empty_rgba = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint32)
+    dyn_source = ColumnDataSource(
+        data=dict(image=[empty_rgba], x=[0], y=[0], dw=[w], dh=[h]),
+    )
+    dyn_renderer = p.image_rgba(
+        image="image", x="x", y="y", dw="dw", dh="dh", source=dyn_source,
+    )
+    dyn_renderer.visible = False
+
+    # Stash on image cache so the Explore controls can read/write it
+    _image_cache["mask_source"] = mask_source
+    _image_cache["new_mask_source"] = new_mask_source
+    _image_cache["mask_renderer"] = mask_renderer
+    _image_cache["new_mask_renderer"] = new_mask_renderer
+    _image_cache["draw_tool"] = draw_tool
+    _image_cache["edit_tool"] = edit_tool
+    _image_cache["image_height"] = h
+    _image_cache["image_width"] = w
+    _image_cache["dyn_source"] = dyn_source
+    _image_cache["dyn_renderer"] = dyn_renderer
+
+    # Initial visibility follows the Show-mask checkbox state
+    mask_renderer.visible = bool(w_mask_show.value)
+
     return p, source, mapper
 
 
 def _update_image_in_place(arr, title):
     """Update the existing image figure in-place, preserving zoom/pan state."""
+    from bokeh.models import LogColorMapper, LinearColorMapper
+
     fig = _image_cache.get("figure")
     source = _image_cache.get("source")
     mapper = _image_cache.get("mapper")
@@ -284,6 +849,10 @@ def _update_image_in_place(arr, title):
         _image_cache["mapper"] = mapper
         _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
+        # Auto-load the default mask if Show-mask is enabled (handles the
+        # initial render and detector switches).  Defer to the next tick
+        # so Bokeh has finished syncing the freshly-attached figure before
+        # we push polygon data into its mask source.
         if w_mask_show.value:
             def _deferred_reload():
                 try:
@@ -300,9 +869,37 @@ def _update_image_in_place(arr, title):
                 _deferred_reload()
         return
 
+    h, w = arr.shape
+    display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
+
+    # Reset axis ranges only when the *underlying* image dimensions change
+    # (e.g. switching detector/scan).  Comparing against fig.x_range.end
+    # would also fire after the user zooms, clobbering their zoom state.
     cached_shape = _image_cache.get("fig_image_shape")
-    h, w = _update_image_data_impl(fig, source, mapper, arr, title, cached_shape)
-    _image_cache["fig_image_shape"] = (h, w)
+    if cached_shape != (h, w):
+        fig.x_range.start = 0
+        fig.x_range.end = w
+        fig.y_range.start = 0
+        fig.y_range.end = h
+        _image_cache["fig_image_shape"] = (h, w)
+
+    # Update color mapper range
+    finite = arr[np.isfinite(arr) & (arr > 0)]
+    if finite.size:
+        vlo = max(float(np.percentile(finite, 1)), 1e-3)
+        vhi = float(np.percentile(finite, 99.5))
+        vhi = max(vhi, vlo + 1.0)
+        mapper.low = vlo
+        mapper.high = vhi
+    else:
+        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
+        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
+        mapper.low = lo
+        mapper.high = hi
+
+    # Update image data (keeps zoom/pan state)
+    source.data = dict(image=[display], x=[0], y=[0], dw=[w], dh=[h])
+    fig.title.text = title
 
 
 # ---------------------------------------------------------------------------
@@ -310,16 +907,17 @@ def _update_image_in_place(arr, title):
 # ---------------------------------------------------------------------------
 
 # Dynamic filter rows: each is a dict {type, key, val, suggest, remove}
-_filter_rows = _app.filter_rows
+_filter_rows: list[dict] = []
 w_filter_column = pn.Column(sizing_mode="stretch_width")
 
 # Cancellation flag — set by Reset to abort in-flight queries
-_cancel = _app.cancel
+_cancel = threading.Event()
 
 # ---------------------------------------------------------------------------
 # Debounced live count — lightweight count query while typing
 # ---------------------------------------------------------------------------
 
+_live_count_timer: threading.Timer | None = None
 _LIVE_COUNT_DEBOUNCE_S = 0.4  # seconds after last keystroke before firing
 
 
@@ -369,11 +967,12 @@ def _live_count_fire():
 
 def _schedule_live_count(*_events):
     """Debounce: reset the timer on each keystroke, fire after the delay."""
-    if _app.live_count_timer is not None:
-        _app.live_count_timer.cancel()
-    _app.live_count_timer = threading.Timer(_LIVE_COUNT_DEBOUNCE_S, _live_count_fire)
-    _app.live_count_timer.daemon = True
-    _app.live_count_timer.start()
+    global _live_count_timer
+    if _live_count_timer is not None:
+        _live_count_timer.cancel()
+    _live_count_timer = threading.Timer(_LIVE_COUNT_DEBOUNCE_S, _live_count_fire)
+    _live_count_timer.daemon = True
+    _live_count_timer.start()
 
 
 def _make_filter_row(ftype: str = "Text in field", key: str = "", val: str = "") -> dict:
@@ -633,7 +1232,11 @@ w_btn_mask_use = pn.widgets.Button(
 )
 w_mask_status = pn.pane.Markdown("", width=600)
 
-_image_cache = _app.image_cache
+_image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
+                "figure": None, "source": None, "mapper": None,
+                "mask_source": None, "mask_renderer": None,
+                "draw_tool": None, "edit_tool": None,
+                "mask_image_shape": None}
 
 
 def _render_image_frame(field, idx):
@@ -709,24 +1312,50 @@ w_mv_log = pn.widgets.Checkbox(name="Log color scale", value=True, width=140)
 w_mv_range = pn.widgets.RangeSlider(
     name="Intensity (log10)", start=-2.0, end=6.0, value=(-1.0, 4.0),
     step=0.05, sizing_mode="stretch_width", format="0.00",
-    tooltips=True,
 )
 w_mv_status = pn.pane.Markdown("*Click tab to load.*")
 w_mv_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
-w_mv_label = pn.widgets.Select(
-    name="Frame label", options=["(frame #)"], value="(frame #)", width=180,
-)
 w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
 
-_multiview_cache = _app.multiview_cache
+_multiview_cache: dict = {
+    "uid": None, "field": None, "n_frames": 0,
+    "frames": None, "renderers": None, "mapper": None,
+    "log": None, "data_lo": None, "data_hi": None,
+    "suspend_range_cb": False,
+}
 
 
 def _mv_grid_dims(n: int) -> tuple[int, int]:
-    return _mv_grid_dims_impl(n)
+    """Pick (rows, cols) so cols/rows ≈ 2 (approx 2:1 grid aspect)."""
+    if n <= 0:
+        return 1, 1
+    rows = max(1, int(round(np.sqrt(n / 2.0))))
+    cols = int(np.ceil(n / rows))
+    # Make sure it actually fits
+    while rows * cols < n:
+        cols += 1
+    return rows, cols
 
 
 def _mv_compute_data_range(frames):
-    return _mv_compute_data_range_impl(frames)
+    """Return (lo, hi) finite-positive percentile bounds across all frames."""
+    lo, hi = None, None
+    for arr in frames:
+        finite = arr[np.isfinite(arr) & (arr > 0)]
+        if not finite.size:
+            continue
+        flo = float(np.percentile(finite, 1))
+        fhi = float(np.percentile(finite, 99.5))
+        if lo is None or flo < lo:
+            lo = flo
+        if hi is None or fhi > hi:
+            hi = fhi
+    if lo is None:
+        return 1e-3, 1.0
+    lo = max(lo, 1e-6)
+    if hi <= lo:
+        hi = lo * 10
+    return lo, hi
 
 
 def _build_multiview_grid(frames, field):
@@ -741,25 +1370,6 @@ def _build_multiview_grid(frames, field):
     if not frames:
         w_mv_grid.object = None
         return
-
-    # Build per-frame labels from primary scalar column if selected
-    label_col = w_mv_label.value
-    frame_labels: list[str] = []
-    if label_col and label_col != "(frame #)":
-        df = w_primary_table.value
-        if df is not None and label_col in df.columns:
-            vals = df[label_col].values
-            for i in range(len(frames)):
-                if i < len(vals):
-                    v = vals[i]
-                    try:
-                        frame_labels.append(f"{label_col}={float(v):.4g}")
-                    except (ValueError, TypeError):
-                        frame_labels.append(f"{label_col}={v}")
-                else:
-                    frame_labels.append(f"frame {i}")
-    if not frame_labels:
-        frame_labels = [f"frame {i}" for i in range(len(frames))]
 
     # Per-frame display arrays + global data range
     displays = [np.where(np.isfinite(a), a, 0).astype(np.float32) for a in frames]
@@ -818,7 +1428,7 @@ def _build_multiview_grid(frames, field):
         else:
             kwargs["x_range"] = (0, w)
             kwargs["y_range"] = (0, h)
-        p = bk_figure(title=frame_labels[i], **kwargs)
+        p = bk_figure(title=f"frame {i}", **kwargs)
         if shared_x is None:
             shared_x = p.x_range
             shared_y = p.y_range
@@ -830,7 +1440,6 @@ def _build_multiview_grid(frames, field):
         hover = HoverTool(
             renderers=[r],
             tooltips=[
-                ("label", frame_labels[i]),
                 ("frame", str(i)),
                 ("(col, row)", "($x{0}, $y{0})"),
                 ("intensity", "@image{0.000}"),
@@ -881,20 +1490,6 @@ def _load_multiview():
         w_mv_status.object = "*No image fields found.*"
         w_mv_grid.object = None
         return
-
-    # Ensure primary scalars are loaded so the label dropdown has options
-    if not _detail_cache.get("primary_loaded"):
-        _load_primary()
-    df = w_primary_table.value
-    label_options = ["(frame #)"]
-    if df is not None and not df.empty:
-        label_options += [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    prev_label = w_mv_label.value
-    w_mv_label.options = label_options
-    if prev_label in label_options:
-        w_mv_label.value = prev_label
-    else:
-        w_mv_label.value = "(frame #)"
 
     image_fields = list(info["images"])
     # Populate detector dropdown (preserve previous choice if present)
@@ -998,24 +1593,7 @@ def _on_mv_range(event):
 w_mv_field.param.watch(_on_mv_field, "value")
 w_mv_cmap.param.watch(_on_mv_cmap, "value")
 w_mv_log.param.watch(_on_mv_log, "value")
-# Watch value_throttled — Panel streams this continuously during drag but
-# coalesces events so we only process the most recent position, avoiding
-# a backlog of Python round-trips.
-w_mv_range.param.watch(_on_mv_range, "value_throttled")
-# Also watch 'value' (fires on mouse-up) as a final sync to ensure the
-# mapper is always exactly at the released position.
 w_mv_range.param.watch(_on_mv_range, "value")
-
-
-def _on_mv_label(event):
-    """Rebuild grid with updated frame labels when the label column changes."""
-    field = _multiview_cache.get("field")
-    frames = _multiview_cache.get("frames")
-    if field and frames:
-        _build_multiview_grid(frames, field)
-
-
-w_mv_label.param.watch(_on_mv_label, "value")
 
 
 # ---------------------------------------------------------------------------
@@ -1298,12 +1876,24 @@ w_proc_geometry = pn.widgets.Select(
     value="transmission",
     width=130,
 )
+
+# --- Output grid ---
 w_proc_nq = pn.widgets.IntInput(
     name="n_q", value=DEFAULT_N_Q, start=100, end=10000, step=100, width=90,
 )
 w_proc_nchi = pn.widgets.IntInput(
     name="n_χ", value=DEFAULT_N_CHI, start=36, end=720, step=36, width=90,
 )
+w_proc_nqxy = pn.widgets.IntInput(
+    name="n_qxy", value=DEFAULT_N_QXY, start=100, end=2000, step=50, width=90,
+)
+w_proc_nqz = pn.widgets.IntInput(
+    name="n_qz", value=DEFAULT_N_QZ, start=100, end=2000, step=50, width=90,
+)
+w_trans_row = pn.Row(w_proc_nq, w_proc_nchi)
+w_gi_grid_row = pn.Row(w_proc_nqxy, w_proc_nqz)
+
+# --- Masks ---
 w_proc_saxs_mask = pn.widgets.TextInput(
     name="SAXS mask",
     value=DEFAULT_SAXS_MASK,
@@ -1316,11 +1906,29 @@ w_proc_waxs_mask = pn.widgets.TextInput(
     placeholder=f"(default: {DEFAULT_WAXS_MASK_NAME})",
     width=320,
 )
+
+# --- SAXS Q-range / aperture ---
+w_proc_saxs_q_cutoff = pn.widgets.FloatInput(
+    name="q cutoff (nm⁻¹)", value=0.0, step=0.1, start=0.0, width=120,
+)
+w_proc_saxs_agbh_ring = pn.widgets.IntInput(
+    name="AgBh ring order", value=DEFAULT_SAXS_AGBH_RING_ORDER,
+    start=1, end=20, width=100,
+)
+w_proc_saxs_q_margin = pn.widgets.FloatInput(
+    name="q margin frac", value=DEFAULT_SAXS_Q_MARGIN_FRACTION,
+    step=0.005, start=0.0, end=0.5, width=110,
+)
+
+# --- Geometry corrections ---
 w_proc_saxs_row_delta = pn.widgets.FloatInput(
     name="SAXS Δrow", value=DEFAULT_SAXS_ROW_DELTA, step=0.5, width=80,
 )
 w_proc_saxs_col_delta = pn.widgets.FloatInput(
     name="SAXS Δcol", value=DEFAULT_SAXS_COL_DELTA, step=0.5, width=80,
+)
+w_proc_dist_delta = pn.widgets.FloatInput(
+    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.0, width=110,
 )
 w_proc_waxs_row_delta = pn.widgets.FloatInput(
     name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.5, width=80,
@@ -1328,20 +1936,30 @@ w_proc_waxs_row_delta = pn.widgets.FloatInput(
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
     name="WAXS Δcol", value=DEFAULT_WAXS_COL_DELTA, step=0.5, width=80,
 )
-w_proc_dist_delta = pn.widgets.FloatInput(
-    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.0, width=110,
+w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
+    name="WAXS col/arc°", value=DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG,
+    step=0.01, width=100,
 )
+w_saxs_geom_section = pn.Column(
+    pn.pane.Markdown("**SAXS beam-centre Δ (px)**"),
+    pn.Row(w_proc_saxs_row_delta, w_proc_saxs_col_delta, w_proc_dist_delta),
+)
+
+# --- Hot-pixel rejection ---
 w_proc_dezinger = pn.widgets.FloatInput(
     name="Dezinger σ", value=DEFAULT_DEZINGER, step=100.0, width=100,
 )
+w_proc_dezinger_kernel = pn.widgets.IntInput(
+    name="Kernel size", value=DEFAULT_DEZINGER_KERNEL,
+    start=3, end=21, step=2, width=90,
+)
 
-# GI-specific parameters (shown only when geometry == "grazing")
-w_proc_nqxy = pn.widgets.IntInput(
-    name="n_qxy", value=DEFAULT_N_QXY, start=100, end=2000, step=50, width=90,
+# --- Intensity corrections ---
+w_proc_solid_angle = pn.widgets.Checkbox(
+    name="Solid-angle correction", value=DEFAULT_SOLID_ANGLE, width=180,
 )
-w_proc_nqz = pn.widgets.IntInput(
-    name="n_qz", value=DEFAULT_N_QZ, start=100, end=2000, step=50, width=90,
-)
+
+# --- GI-specific ---
 w_proc_incident_angle = pn.widgets.FloatInput(
     name="α_i (°)", value=DEFAULT_INCIDENT_ANGLE, step=0.01, width=90,
 )
@@ -1351,29 +1969,278 @@ w_proc_incident_angle_auto = pn.widgets.Checkbox(
 w_proc_theta_offset = pn.widgets.FloatInput(
     name="θ offset (°)", value=DEFAULT_THETA_OFFSET, step=0.1, width=90,
 )
-w_gi_row = pn.Row(
-    w_proc_nqxy, w_proc_nqz, w_proc_incident_angle,
-    w_proc_incident_angle_auto, w_proc_theta_offset,
+w_proc_beamstop_max_arc = pn.widgets.FloatInput(
+    name="Beamstop |arc| max (°)", value=DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG,
+    step=0.5, width=150,
 )
-# Transmission-specific row
-w_trans_row = pn.Row(w_proc_nq, w_proc_nchi)
+
+# --- Backend / display options ---
+w_proc_saxs_rotate = pn.widgets.Checkbox(
+    name="SAXS rotate CW 90°", value=False, width=160,
+)
+w_proc_waxs_flip = pn.widgets.Checkbox(
+    name="WAXS flip horizontal", value=False, width=170,
+)
+w_proc_waxs_qx_shift = pn.widgets.FloatInput(
+    name="WAXS Δqx (nm⁻¹)", value=0.0, step=0.1, width=120,
+)
+w_proc_waxs_qy_shift = pn.widgets.FloatInput(
+    name="WAXS Δqy (nm⁻¹)", value=0.0, step=0.1, width=120,
+)
+
+# --- Dynamic SAXS masking ---
+w_proc_dynamic_mask = pn.widgets.Checkbox(
+    name="Enable dynamic SAXS mask", value=False, width=200,
+)
+w_proc_dyn_shadow_enabled = pn.widgets.Checkbox(
+    name="WAXS shadow", value=True, width=120,
+)
+w_proc_dyn_shadow_beam_deg = pn.widgets.FloatInput(
+    name="Beam visible (°)", value=DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG,
+    step=0.5, width=120,
+)
+w_proc_dyn_shadow_clear_deg = pn.widgets.FloatInput(
+    name="Clear edge (°)", value=DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG,
+    step=0.5, width=120,
+)
+w_proc_dyn_aper_enabled = pn.widgets.Checkbox(
+    name="Aperture mask", value=True, width=120,
+)
+w_proc_dyn_aper_agbh_ring = pn.widgets.IntInput(
+    name="AgBh ring", value=DEFAULT_DYN_APER_AGBH_RING_ORDER,
+    start=1, end=20, width=90,
+)
+w_proc_dyn_aper_q_margin = pn.widgets.FloatInput(
+    name="q margin frac", value=DEFAULT_DYN_APER_Q_MARGIN_FRACTION,
+    step=0.005, start=0.0, end=0.5, width=110,
+)
+w_proc_dyn_aper_q_cutoff = pn.widgets.FloatInput(
+    name="q cutoff (nm⁻¹)", value=0.0, step=0.1, start=0.0, width=120,
+)
+
+# --- Advanced WAXS calibration ---
+w_proc_waxs_energy = pn.widgets.FloatInput(
+    name="Energy (keV)", value=DEFAULT_WAXS_ENERGY_KEV, step=0.1, width=110,
+)
+w_proc_waxs_dist = pn.widgets.FloatInput(
+    name="Distance (mm)", value=DEFAULT_WAXS_SAMPLE_DIST_MM, step=1.0, width=120,
+)
+w_proc_waxs_pixel = pn.widgets.FloatInput(
+    name="Pixel size (mm)", value=DEFAULT_WAXS_PIXEL_SIZE_MM,
+    step=0.001, width=120,
+)
+w_proc_waxs_beam_row = pn.widgets.FloatInput(
+    name="Beam row (px)", value=DEFAULT_WAXS_BEAM_CENTER_ROW, step=0.5, width=110,
+)
+w_proc_waxs_beam_col = pn.widgets.FloatInput(
+    name="Beam col (px)", value=DEFAULT_WAXS_BEAM_CENTER_COL, step=0.5, width=110,
+)
+w_proc_waxs_panel_cols = pn.widgets.TextInput(
+    name="Panel col ranges", value="(0,206),(206,413),(413,619)", width=280,
+)
+w_proc_waxs_panel_offsets = pn.widgets.TextInput(
+    name="Panel offsets (°)", value="-7.0, 0.0, 7.0", width=200,
+)
+w_proc_waxs_panel_row_shifts = pn.widgets.TextInput(
+    name="Panel row shifts (px)", value="0.0, 0.0, 0.0", width=200,
+)
+w_proc_waxs_panel_col_shifts = pn.widgets.TextInput(
+    name="Panel col shifts (px)", value="0.0, 0.0, 0.0", width=200,
+)
+w_proc_waxs_panel_delta = pn.widgets.TextInput(
+    name="Panel Δ tilt (°)", value="0.0, 0.0, 0.0", width=200,
+)
+w_proc_waxs_theta_zero = pn.widgets.FloatInput(
+    name="θ₀ arc (°)", value=DEFAULT_WAXS_THETA_ZERO_DEG, step=0.1, width=100,
+)
+w_proc_waxs_offset_x = pn.widgets.FloatInput(
+    name="Sample Δx (mm)", value=DEFAULT_WAXS_SAMPLE_OFFSET_X_MM,
+    step=0.1, width=110,
+)
+w_proc_waxs_offset_z = pn.widgets.FloatInput(
+    name="Sample Δz (mm)", value=DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM,
+    step=0.1, width=110,
+)
+w_proc_waxs_col_arc_cal = pn.widgets.FloatInput(
+    name="col/arc° (cal)", value=0.0, step=0.01, width=100,
+)
+w_proc_waxs_qh_sign = pn.widgets.FloatInput(
+    name="q_h sign", value=DEFAULT_WAXS_Q_HORIZONTAL_SIGN, step=1.0, width=80,
+)
+w_proc_waxs_qv_sign = pn.widgets.FloatInput(
+    name="q_v sign", value=DEFAULT_WAXS_Q_VERTICAL_SIGN, step=1.0, width=80,
+)
+w_proc_waxs_rot_k = pn.widgets.IntInput(
+    name="rot90 k", value=DEFAULT_WAXS_ROTATION_K, start=0, end=3, width=80,
+)
+
+# --- Advanced WAXS masking ---
+w_proc_waxs_bsx_ref = pn.widgets.FloatInput(
+    name="BSX ref (mm)", value=0.0, step=0.1, width=110,
+)
+
+# ---------------------------------------------------------------------------
+# Parameter cards — named so _on_geometry_change can toggle visibility
+# ---------------------------------------------------------------------------
+
+w_card_grid = pn.Card(
+    w_trans_row,
+    w_gi_grid_row,
+    title="Output grid",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_masks = pn.Card(
+    pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
+    pn.pane.Markdown(
+        "*Leave blank to use the bundled PyHyperScattering defaults.  "
+        "Use the **Explore → mask editor** to draw, edit, and save masks "
+        "interactively, then click **↪ Use in Process** to set the path here.*",
+    ),
+    title="Masks",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_saxs_qrange = pn.Card(
+    pn.Row(w_proc_saxs_q_cutoff, w_proc_saxs_agbh_ring, w_proc_saxs_q_margin),
+    pn.pane.Markdown(
+        "*q cutoff = 0 → auto from silver behenate calibration.  "
+        "Ring order and margin fraction control the AgBh auto-calculation.*",
+    ),
+    title="SAXS Q-range / aperture",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_geometry = pn.Card(
+    w_saxs_geom_section,
+    pn.pane.Markdown("**WAXS beam-centre Δ (px)**"),
+    pn.Row(w_proc_waxs_row_delta, w_proc_waxs_col_delta, w_proc_waxs_col_per_arc),
+    pn.pane.Markdown(
+        "*Beam-centre deltas are added to values from metadata.  "
+        "\"WAXS col/arc°\" compensates column drift per degree of "
+        "waxs_arc (GI default: 0.08).*",
+    ),
+    title="Geometry corrections",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_dezinger = pn.Card(
+    pn.Row(w_proc_dezinger, w_proc_dezinger_kernel),
+    pn.pane.Markdown(
+        "*σ = 0 disables hot-pixel rejection.  Kernel is the median-filter "
+        "window size (odd integer).  GI default σ is 30 000.*",
+    ),
+    title="Hot-pixel rejection (dezinger)",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_intensity = pn.Card(
+    w_proc_solid_angle,
+    title="Intensity corrections",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_gi = pn.Card(
+    pn.Row(
+        w_proc_incident_angle, w_proc_incident_angle_auto,
+        w_proc_theta_offset,
+    ),
+    pn.Row(w_proc_beamstop_max_arc),
+    pn.pane.Markdown(
+        "*Auto α_i: detect incident angle from sample name or motor "
+        "positions.  θ offset is added to (stage_th + piezo_th) during "
+        "auto-detection.  Beamstop mask is applied for |arc| ≤ max.*",
+    ),
+    title="Grazing-incidence parameters",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_card_backend = pn.Card(
+    pn.Row(w_proc_saxs_rotate, w_proc_waxs_flip),
+    pn.Row(w_proc_waxs_qx_shift, w_proc_waxs_qy_shift),
+    pn.pane.Markdown(
+        "*Display orientation and global q-space shift for the WAXS "
+        "detector.*",
+    ),
+    title="Backend / display options",
+    collapsed=True, sizing_mode="stretch_width",
+)
+
+w_card_dynamic_mask = pn.Card(
+    w_proc_dynamic_mask,
+    pn.pane.Markdown("**WAXS shadow on SAXS**"),
+    pn.Row(
+        w_proc_dyn_shadow_enabled, w_proc_dyn_shadow_beam_deg,
+        w_proc_dyn_shadow_clear_deg,
+    ),
+    pn.pane.Markdown("**Aperture mask**"),
+    pn.Row(
+        w_proc_dyn_aper_enabled, w_proc_dyn_aper_agbh_ring,
+        w_proc_dyn_aper_q_margin, w_proc_dyn_aper_q_cutoff,
+    ),
+    pn.pane.Markdown(
+        "*Per-frame WAXS-shadow and aperture masking on the SAXS "
+        "detector.  q cutoff = 0 → auto from AgBh ring.*",
+    ),
+    title="Dynamic SAXS masking",
+    collapsed=True, sizing_mode="stretch_width",
+)
+
+w_card_waxs_cal = pn.Card(
+    pn.Row(w_proc_waxs_energy, w_proc_waxs_dist, w_proc_waxs_pixel),
+    pn.Row(w_proc_waxs_beam_row, w_proc_waxs_beam_col),
+    w_proc_waxs_panel_cols,
+    pn.Row(w_proc_waxs_panel_offsets, w_proc_waxs_panel_delta),
+    pn.Row(w_proc_waxs_panel_row_shifts, w_proc_waxs_panel_col_shifts),
+    pn.Row(
+        w_proc_waxs_theta_zero, w_proc_waxs_offset_x, w_proc_waxs_offset_z,
+    ),
+    pn.Row(
+        w_proc_waxs_col_arc_cal, w_proc_waxs_qh_sign,
+        w_proc_waxs_qv_sign, w_proc_waxs_rot_k,
+    ),
+    pn.pane.Markdown(
+        "*Override WAXSCalibration defaults.  Only changed values are sent — "
+        "leave unchanged to use PyHyper's calibration.  In GI mode these are "
+        "passed as `waxs_cal_overrides`.*",
+    ),
+    title="Advanced WAXS calibration",
+    collapsed=True, sizing_mode="stretch_width",
+)
+
+w_card_waxs_mask_adv = pn.Card(
+    pn.Row(w_proc_waxs_bsx_ref),
+    pn.pane.Markdown(
+        "*BSX ref = 0 → auto-derived from metadata.  "
+        "Beamstop max |arc| is set in the GI parameters card above.*",
+    ),
+    title="Advanced WAXS masking",
+    collapsed=True, sizing_mode="stretch_width",
+)
 
 
 def _on_geometry_change(event):
     """Show/hide GI vs transmission params."""
     is_gi = event.new == "grazing"
-    w_gi_row.visible = is_gi
+    # Grid rows
+    w_gi_grid_row.visible = is_gi
     w_trans_row.visible = not is_gi
-    # SAXS not used in GI mode
+    # SAXS-specific (hidden in GI)
     w_proc_saxs_mask.visible = not is_gi
-    w_proc_saxs_row_delta.visible = not is_gi
-    w_proc_saxs_col_delta.visible = not is_gi
-    w_proc_dist_delta.visible = not is_gi
+    w_saxs_geom_section.visible = not is_gi
+    # Transmission-only cards
+    w_card_saxs_qrange.visible = not is_gi
+    w_card_intensity.visible = not is_gi
+    w_card_backend.visible = not is_gi
+    w_card_dynamic_mask.visible = not is_gi
+    # GI-only card
+    w_card_gi.visible = is_gi
 
 
 w_proc_geometry.param.watch(_on_geometry_change, "value")
 # Initial visibility
-w_gi_row.visible = False
+w_gi_grid_row.visible = False
+w_card_gi.visible = False
 
 w_btn_process = pn.widgets.Button(
     name="⚙ Process", button_type="success", width=110,
@@ -1388,10 +2255,10 @@ w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=
 w_proc_frame_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, width=400,
 )
-_proc_result_cache = _app.proc_result_cache
+_proc_result_cache = {"result": None, "gi_result": None}
 
 # Guard: suppress _update_proc_2d while _on_process is building its own plot
-_processing_guard = _app.processing_guard
+_processing_guard = {"active": False}
 
 # ---------------------------------------------------------------------------
 # Geometry cache monitoring / control
@@ -1446,38 +2313,125 @@ w_btn_cache_clear.on_click(_clear_cache)
 #   {"kind": "h"|"v", "center": float, "width": float}
 # For an h-cut, ``center`` is in y-units (chi or qz) and ``width`` is the
 # slice extent along y.  For a v-cut, both are in x-units (q or qxy).
-_persisted_cuts = _app.persisted_cuts
+_persisted_cuts: list[dict] = []
 
 # Cache of the data currently rendered in the Process tab's 2D plot, used
 # to recompute cross sections when cuts move/resize or the frame changes.
-_proc_2d_cache = _app.proc_2d_cache
+_proc_2d_cache: dict[str, Any] = {
+    "x": None, "y": None, "image": None,
+    "x_label": "", "y_label": "",
+    "title": "",
+    "cuts_source": None,
+    "cut_renderer": None,
+}
 
 # Recursion guard for the cuts ColumnDataSource.on_change callback —
 # avoids feedback loops when we snap rectangles back to canonical extents.
-_cuts_guard = _app.cuts_guard
+_cuts_guard = {"in_progress": False}
 
 _CUT_FILL = {"h": "#1f77b4", "v": "#d62728"}
 _CUT_LINE = {"h": "#0a3a6e", "v": "#7a1414"}
 
 
 def _cuts_to_source_data(cuts: list[dict]) -> dict:
-    return _cuts_to_source_data_impl(cuts, _proc_2d_cache["x"], _proc_2d_cache["y"])
+    """Project the persisted cuts list into Bokeh Rect glyph columns."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    if x is None or y is None or len(x) == 0 or len(y) == 0:
+        return dict(x=[], y=[], width=[], height=[],
+                    kind=[], fill_color=[], line_color=[])
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    xc = (xmin + xmax) / 2.0
+    yc = (ymin + ymax) / 2.0
+    xw = xmax - xmin
+    yh = ymax - ymin
+    cx, cy, w, h, kinds, fc, lc = [], [], [], [], [], [], []
+    for cut in cuts:
+        k = cut["kind"]
+        if k == "h":
+            cx.append(xc)
+            cy.append(float(cut["center"]))
+            w.append(xw)
+            h.append(float(cut["width"]))
+        else:
+            cx.append(float(cut["center"]))
+            cy.append(yc)
+            w.append(float(cut["width"]))
+            h.append(yh)
+        kinds.append(k)
+        fc.append(_CUT_FILL[k])
+        lc.append(_CUT_LINE[k])
+    return dict(x=cx, y=cy, width=w, height=h,
+                kind=kinds, fill_color=fc, line_color=lc)
 
 
 def _source_data_to_cuts(data: dict) -> list[dict]:
-    return _source_data_to_cuts_impl(data, _proc_2d_cache["x"], _proc_2d_cache["y"])
+    """Inverse of ``_cuts_to_source_data`` — also classifies any newly drawn
+    boxes (which lack a ``kind``) by aspect ratio against the plot extents."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    if x is None or y is None or len(x) == 0 or len(y) == 0:
+        return []
+    xspan = float(np.max(x) - np.min(x)) or 1.0
+    yspan = float(np.max(y) - np.min(y)) or 1.0
+    cuts = []
+    kinds = list(data.get("kind", []))
+    xs = list(data.get("x", []))
+    ys = list(data.get("y", []))
+    ws = list(data.get("width", []))
+    hs = list(data.get("height", []))
+    for i, (cx, cy, w, h) in enumerate(zip(xs, ys, ws, hs)):
+        k = kinds[i] if i < len(kinds) and kinds[i] else None
+        if not k:
+            # New box drawn via shift-drag in the toolbar — classify by
+            # how it compares to the data span on each axis.
+            k = "h" if (w / xspan) >= (h / yspan) else "v"
+        if k == "h":
+            cuts.append({"kind": "h",
+                         "center": float(cy),
+                         "width": float(abs(h))})
+        else:
+            cuts.append({"kind": "v",
+                         "center": float(cx),
+                         "width": float(abs(w))})
+    return cuts
 
 
 def _compute_cross_section(cut: dict):
-    return _compute_cross_section_impl(
-        cut, _proc_2d_cache["x"], _proc_2d_cache["y"],
-        _proc_2d_cache["image"],
-        _proc_2d_cache["x_label"], _proc_2d_cache["y_label"],
-    )
+    """Return ``(axis, intensity, axis_label)`` for one cut, or ``None``."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    img = cache["image"]
+    if x is None or y is None or img is None:
+        return None
+    c = float(cut["center"])
+    w = float(cut["width"]) or 0.0
+    half = max(w / 2.0, 0.0)
+    if cut["kind"] == "h":
+        mask = (y >= c - half) & (y <= c + half)
+        if not np.any(mask):
+            # Fall back to nearest single row
+            idx = int(np.argmin(np.abs(y - c)))
+            section = img[idx, :].astype(float)
+        else:
+            section = np.nanmean(img[mask, :], axis=0)
+        return x, section, cache["x_label"]
+    mask = (x >= c - half) & (x <= c + half)
+    if not np.any(mask):
+        idx = int(np.argmin(np.abs(x - c)))
+        section = img[:, idx].astype(float)
+    else:
+        section = np.nanmean(img[:, mask], axis=1)
+    return y, section, cache["y_label"]
 
 
 def _format_cut_label(i: int, cut: dict) -> str:
-    return _format_cut_label_impl(i, cut)
+    arrow = "─" if cut["kind"] == "h" else "│"
+    return f"{arrow} #{i + 1}: c={cut['center']:.3g}, Δ={cut['width']:.3g}"
 
 
 def _refresh_cuts_table():
@@ -1719,38 +2673,14 @@ w_btn_clear_cuts.on_click(_on_clear_cuts)
 
 
 # ---------------------------------------------------------------------------
-# Widgets — Collection
+# Widgets — Collection (delegated to smi_browser.ui.collection)
 # ---------------------------------------------------------------------------
 
-_COLL_COLS = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
+_coll_ns = _coll_mod.wire(_collection)
 
-
-def _coll_color_formatter(cell_value):
-    """Tabulator HTML formatter: render the color column as a swatch."""
-    return (
-        f'<div style="width:16px;height:16px;border-radius:3px;'
-        f'background:{cell_value};margin:auto;"></div>'
-    )
-
-
-w_coll_table = pn.widgets.Tabulator(
-    value=pd.DataFrame(columns=_COLL_COLS),
-    show_index=False, sizing_mode="stretch_both", height=300,
-    selectable="checkbox",
-    configuration={"rowHeight": 24, "layout": "fitColumns"},
-    hidden_columns=["uid"],
-    formatters={"color": {"type": "html"}},
-    editors={"color": {"type": "input"}},
-    widths={"color": 40},
-    titles={"color": "⬤"},
-)
-w_btn_coll_remove = pn.widgets.Button(
-    name="Remove Selected", button_type="danger", width=130,
-)
-w_coll_label = pn.widgets.Select(
-    name="Label column", options=["(none)"], value="(none)", width=180,
-)
-w_coll_compare_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_both")
+w_coll_table = _coll_ns.coll_table
+w_btn_coll_remove = _coll_ns.btn_remove
+w_coll_compare_plot = _coll_ns.compare_plot
 
 
 # ---------------------------------------------------------------------------
@@ -1759,19 +2689,92 @@ w_coll_compare_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_both")
 
 def _plot_2d_transmission(result, frame_idx=None):
     """Plot q-vs-chi as an interactive Bokeh figure."""
-    p, q, chi, display, x_label, y_label, title = _plot_2d_transmission_impl(
-        result, frame_idx)
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import LogColorMapper, LinearColorMapper, ColorBar
+
+    qchi = result.merged_qchi
+    if frame_idx is not None and "frame" in qchi.dims:
+        img = qchi["intensity"].isel(frame=frame_idx).values
+        title = f"q vs χ — frame {frame_idx}"
+    else:
+        img = qchi["intensity"].values
+        title = "q vs χ (merged)"
+    q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
+    chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
+
+    # Ensure img has shape (n_chi, n_q) so Bokeh renders chi on y, q on x.
+    if img.shape == (len(q), len(chi)):
+        img = img.T
+
+    display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    finite = img[np.isfinite(img) & (img > 0)]
+    if finite.size:
+        vlo = max(float(np.percentile(finite, 2)), 1e-6)
+        vhi = float(np.percentile(finite, 99.5))
+        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=max(vhi, vlo * 2))
+    else:
+        mapper = LinearColorMapper(palette="Greys256", low=float(np.nanmin(display)), high=max(float(np.nanmax(display)), 1))
+
+    q0, q1 = float(q.min()), float(q.max())
+    c0, c1 = float(chi.min()), float(chi.max())
+    p = bk_figure(
+        title=title, height=500,
+        sizing_mode="stretch_width",
+        x_range=(q0, q1), y_range=(c0, c1),
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+    )
+    p.image(image=[display], x=q0, y=c0, dw=q1 - q0, dh=c1 - c0, color_mapper=mapper)
+    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
+    p.xaxis.axis_label = "q (nm⁻¹)"
+    p.yaxis.axis_label = "χ (°)"
     _attach_cuts_to_figure(p, q, chi, display,
-                           x_label=x_label, y_label=y_label, title=title)
+                           x_label="q (nm⁻¹)", y_label="χ (°)", title=title)
     return p
 
 
 def _plot_2d_gi(gi_result, frame_idx=None):
     """Plot qxy-vs-qz as an interactive Bokeh figure."""
-    p, qxy, qz, display, x_label, y_label, title = _plot_2d_gi_impl(
-        gi_result, frame_idx)
-    _attach_cuts_to_figure(p, qxy, qz, display,
-                           x_label=x_label, y_label=y_label, title=title)
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import LogColorMapper, LinearColorMapper, ColorBar
+
+    if frame_idx is not None and frame_idx < len(gi_result.frames):
+        img = gi_result.frames[frame_idx]
+        ai = gi_result.alpha_i_deg[frame_idx]
+        title = f"qxy vs qz — frame {frame_idx} (α_i={ai:.3f}°)"
+    else:
+        img = gi_result.summed
+        title = "qxy vs qz (summed)"
+
+    qxy = gi_result.qxy_grid
+    qz = gi_result.qz_grid
+
+    display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    finite = img[np.isfinite(img) & (img > 0)]
+    if finite.size:
+        vlo = max(float(np.percentile(finite, 2)), 1e-6)
+        vhi = float(np.percentile(finite, 99.5))
+        mapper = LogColorMapper(palette="Viridis256", low=vlo, high=max(vhi, vlo * 2))
+    else:
+        mapper = LinearColorMapper(palette="Greys256", low=float(np.nanmin(display)), high=max(float(np.nanmax(display)), 1))
+
+    # qxy/qz are 1-D grids; image is (n_qxy, n_qz), displayed transposed
+    x0, x1 = float(qxy.min()), float(qxy.max())
+    y0, y1 = float(qz.min()), float(qz.max())
+    p = bk_figure(
+        title=title, height=500,
+        sizing_mode="stretch_width",
+        x_range=(x0, x1), y_range=(y0, y1),
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+    )
+    p.image(image=[display.T], x=x0, y=y0, dw=x1 - x0, dh=y1 - y0, color_mapper=mapper)
+    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
+    p.xaxis.axis_label = "q_xy (nm⁻¹)"
+    p.yaxis.axis_label = "q_z (nm⁻¹)"
+    _attach_cuts_to_figure(p, qxy, qz, display.T,
+                           x_label="q_xy (nm⁻¹)", y_label="q_z (nm⁻¹)",
+                           title=title)
     return p
 
 
@@ -2246,12 +3249,15 @@ def _update_primary_plot(*_events):
 # --- Linked explore plot (1D primary + cursor synced with image slider) ---
 
 _EXPLORE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+_explore_cursor_source = None  # ColumnDataSource for vertical cursor line
 
 
 def _build_explore_plot():
     """Build / rebuild the Bokeh 1D line plot with a vertical cursor."""
     from bokeh.plotting import figure as bk_figure
     from bokeh.models import ColumnDataSource, Span, Label
+
+    global _explore_cursor_source
 
     df = w_primary_table.value
     x_col = w_explore_x.value
@@ -2297,7 +3303,7 @@ def _build_explore_plot():
     )
     p.add_layout(cursor_label)
 
-    _app.explore_cursor_source = {
+    _explore_cursor_source = {
         "span": cursor, "label": cursor_label,
         "x_values": x, "y_data": y_data, "y_cols": y_cols,
     }
@@ -2307,13 +3313,13 @@ def _build_explore_plot():
 
 def _update_explore_cursor(idx):
     """Move the vertical cursor and update the value label."""
-    if _app.explore_cursor_source is None:
+    if _explore_cursor_source is None:
         return
-    span = _app.explore_cursor_source.get("span")
-    label = _app.explore_cursor_source.get("label")
-    x_arr = _app.explore_cursor_source.get("x_values")
-    y_data = _app.explore_cursor_source.get("y_data", {})
-    y_cols = _app.explore_cursor_source.get("y_cols", [])
+    span = _explore_cursor_source.get("span")
+    label = _explore_cursor_source.get("label")
+    x_arr = _explore_cursor_source.get("x_values")
+    y_data = _explore_cursor_source.get("y_data", {})
+    y_cols = _explore_cursor_source.get("y_cols", [])
     if span is not None and x_arr is not None and idx < len(x_arr):
         x_val = float(x_arr[idx])
         span.location = x_val
@@ -2369,15 +3375,37 @@ def _on_process(event):
 
     try:
         t0 = time.perf_counter()
-        run_fn, params, geometry = _build_proc_params(uid)
 
         if geometry == "grazing":
-            gi_result = run_fn(**params)
+            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+
+            # Build kwargs, omitting (or sending None for) any value that
+            # still matches the upstream PyHyper default.
+            gi_params: dict[str, Any] = dict(
+                uid=uid,
+                tiled_uri=DEFAULT_TILED_URI,
+                catalog=DEFAULT_CATALOG,
+                waxs_mask_path=w_proc_waxs_mask.value or None,
+            )
+            if w_proc_nqxy.value != DEFAULT_N_QXY:
+                gi_params["n_qxy"] = w_proc_nqxy.value
+            if w_proc_nqz.value != DEFAULT_N_QZ:
+                gi_params["n_qz"] = w_proc_nqz.value
+            if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
+                gi_params["theta_offset"] = w_proc_theta_offset.value
+            if w_proc_dezinger.value != DEFAULT_DEZINGER:
+                gi_params["dezinger_threshold"] = (
+                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+                )
+            if not w_proc_incident_angle_auto.value:
+                gi_params["incident_angle_deg"] = w_proc_incident_angle.value
+
+            gi_result = reduce_smi_gi(**gi_params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["gi_result"] = gi_result
             _last_result["result"] = gi_result
-            _last_result["params"] = params
+            _last_result["params"] = gi_params
 
             # Configure frame slider for GI result
             n_fr = len(gi_result.frames)
@@ -2401,7 +3429,53 @@ def _on_process(event):
             w_btn_add_collection.disabled = True  # GI not in collection yet
 
         else:
-            result = run_fn(**params)
+            # Transmission mode
+            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+
+            # Build kwargs, omitting (or sending None for) any value that
+            # still matches the upstream PyHyper / loader default so the
+            # loader can fill in its own calibrated values.
+            params: dict[str, Any] = dict(
+                uid=uid,
+                tiled_uri=DEFAULT_TILED_URI,
+                catalog=DEFAULT_CATALOG,
+                solid_angle_correction=True,
+                geometry=geometry,
+                saxs_mask_path=w_proc_saxs_mask.value or None,
+                waxs_mask_path=w_proc_waxs_mask.value or None,
+                cache_geometry=w_cache_enabled.value,
+            )
+            if w_proc_nq.value != DEFAULT_N_Q:
+                params["n_q"] = w_proc_nq.value
+            else:
+                params["n_q"] = DEFAULT_N_Q  # smi-browser keeps 2000 default
+            if w_proc_nchi.value != DEFAULT_N_CHI:
+                params["n_chi"] = w_proc_nchi.value
+
+            # Beam-centre Δ — only send if the user changed at least one
+            # axis from the loader's calibrated default.
+            saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
+            saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
+            if saxs_row_changed or saxs_col_changed:
+                params["saxs_beam_delta_px"] = (
+                    w_proc_saxs_row_delta.value,
+                    w_proc_saxs_col_delta.value,
+                )
+            waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
+            waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
+            if waxs_row_changed or waxs_col_changed:
+                params["waxs_beam_delta_px"] = (
+                    w_proc_waxs_row_delta.value,
+                    w_proc_waxs_col_delta.value,
+                )
+            if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
+                params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
+            if w_proc_dezinger.value != DEFAULT_DEZINGER:
+                params["dezinger_threshold"] = (
+                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+                )
+
+            result = reduce_smi_combined(**params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["result"] = result
@@ -2483,25 +3557,7 @@ def _on_add_to_collection(event):
         return
     summary = _detail_cache.get("summary") or {}
     params = _last_result.get("params") or {}
-    # Bundle primary/baseline/raw metadata with the processed scan
-    primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
-    # Baseline: fetch as a proper scalar DataFrame (the UI table is transposed
-    # into field/before/after rows, which isn't suitable for numeric lookups).
-    baseline_df = None
-    if _detail_cache.get("baseline_loaded"):
-        run = _ensure_run()
-        if run and "baseline" in tb.stream_names(run):
-            try:
-                baseline_df = _scalar_stream_to_frame(run, "baseline")
-            except Exception:
-                pass
-    raw_metadata = w_meta_json.object if w_meta_json.object else None
-    _collection.add(
-        result, summary, params,
-        primary_df=primary_df,
-        baseline_df=baseline_df,
-        raw_metadata=raw_metadata,
-    )
+    _collection.add(result, summary, params)
     _refresh_collection()
     _open_collection_panel()  # pop open the floating panel
     pn.state.notifications.success(
@@ -2514,87 +3570,14 @@ w_btn_add_collection.on_click(_on_add_to_collection)
 
 
 # ---------------------------------------------------------------------------
-# Callbacks — Collection
+# Callbacks — Collection (delegated to smi_browser.ui.collection)
 # ---------------------------------------------------------------------------
 
-def _coll_summary_text() -> str:
-    n = len(_collection)
-    if n == 0:
-        return "*Empty — process scans and add them here*"
-    uids = ", ".join(uid[:8] for uid in _collection.uids[:5])
-    if n > 5:
-        uids += f" … +{n - 5} more"
-    return f"**{n} scan{'s' if n != 1 else ''}**: {uids}"
-
-
-w_coll_summary = pn.pane.Markdown(_coll_summary_text(), margin=(0, 5))
+w_coll_summary = _coll_ns.summary_md
 
 
 def _refresh_collection():
-    old_len = len(w_coll_table.value) if w_coll_table.value is not None else 0
-    # Refresh available label columns from stored primary/baseline data
-    avail = _collection.available_label_columns()
-    label_opts = ["(none)"] + avail
-    prev_label = w_coll_label.value
-    w_coll_label.options = label_opts
-    if prev_label in label_opts:
-        w_coll_label.value = prev_label
-    else:
-        w_coll_label.value = "(none)"
-    # Build table with optional label column
-    label_col = w_coll_label.value if w_coll_label.value != "(none)" else None
-    df = _collection.summary_table(label_column=label_col)
-    # Render the color column as HTML swatches.
-    if "color" in df.columns:
-        df["color"] = df["color"].apply(
-            lambda c: (
-                f'<div style="width:16px;height:16px;border-radius:3px;'
-                f'background:{c};margin:auto;"></div>'
-            )
-        )
-    w_coll_table.value = df
-    w_coll_summary.object = _coll_summary_text()
-    # Auto-select newly added scans so the I(q) comparison updates live.
-    new_len = len(w_coll_table.value)
-    if new_len > old_len:
-        w_coll_table.selection = list(range(new_len))
-
-
-def _on_coll_remove(event):
-    sel = w_coll_table.selection
-    if not sel:
-        return
-    df = w_coll_table.value
-    for idx in sorted(sel, reverse=True):
-        if idx < len(df):
-            uid = df.iloc[idx]["uid"]
-            _collection.remove(uid)
-    _refresh_collection()
-
-
-def _update_coll_compare(*_events):
-    """Rebuild I(q) comparison from current table selection."""
-    sel = w_coll_table.selection
-    df = w_coll_table.value
-    if df is None or len(df) == 0 or not sel:
-        w_coll_compare_plot.object = None
-        return
-    uids = [df.iloc[i]["uid"] for i in sel if i < len(df)]
-    label_col = w_coll_label.value if w_coll_label.value != "(none)" else None
-    fig = _collection.iq_comparison_bokeh(uids, label_column=label_col)
-    w_coll_compare_plot.object = fig
-
-
-def _on_coll_label_change(*_events):
-    """Refresh collection table and I(q) comparison when label column changes."""
-    _refresh_collection()
-    _update_coll_compare()
-
-
-w_coll_table.param.watch(_update_coll_compare, "selection")
-w_coll_label.param.watch(_on_coll_label_change, "value")
-
-w_btn_coll_remove.on_click(_on_coll_remove)
+    _coll_ns.refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -2634,7 +3617,7 @@ _BATCH_ROW_COLORS = {
     "queued":  "",
 }
 w_batch_max_workers = pn.widgets.IntInput(
-    name="Workers", value=1, start=1, end=8, width=90,
+    name="Workers", value=1, start=1, end=16, width=90,
 )
 w_batch_skip_existing = pn.widgets.Checkbox(
     name="Skip uids already in collection", value=True,
@@ -2644,7 +3627,7 @@ w_batch_max_jobs = pn.widgets.IntInput(
     width=110,
 )
 w_btn_batch_queue = pn.widgets.Button(
-    name="Queue current page", button_type="primary",
+    name="Queue scans", button_type="primary",
 )
 w_btn_batch_cancel = pn.widgets.Button(
     name="Cancel", button_type="warning", disabled=True,
@@ -2653,99 +3636,234 @@ w_btn_batch_clear = pn.widgets.Button(
     name="Clear log", button_type="light", disabled=True,
 )
 
-_batch_state = _app.batch_state
+_batch_state: dict[str, Any] = {"doc": None, "processor": None}
 
 
-def _snapshot_proc_widgets() -> dict[str, Any]:
-    """Read current Process-tab widget values into a plain dict."""
-    return dict(
-        geometry=w_proc_geometry.value,
-        saxs_mask_path=w_proc_saxs_mask.value,
-        waxs_mask_path=w_proc_waxs_mask.value,
-        n_q=w_proc_nq.value,
-        n_chi=w_proc_nchi.value,
-        n_qxy=w_proc_nqxy.value,
-        n_qz=w_proc_nqz.value,
-        theta_offset=w_proc_theta_offset.value,
-        dezinger=w_proc_dezinger.value,
-        incident_angle_auto=w_proc_incident_angle_auto.value,
-        incident_angle=w_proc_incident_angle.value,
-        saxs_row_delta=w_proc_saxs_row_delta.value,
-        saxs_col_delta=w_proc_saxs_col_delta.value,
-        waxs_row_delta=w_proc_waxs_row_delta.value,
-        waxs_col_delta=w_proc_waxs_col_delta.value,
-        saxs_dist_delta=w_proc_dist_delta.value,
-        cache_geometry=w_cache_enabled.value,
+def _try_parse_tuple(d: dict, key: str, text: str, default: tuple) -> None:
+    """Parse comma-separated string to float tuple; add to *d* if ≠ *default*."""
+    try:
+        vals = tuple(float(x.strip()) for x in text.split(",") if x.strip())
+        if vals and vals != default:
+            d[key] = vals
+    except (ValueError, TypeError):
+        pass
+
+
+def _try_parse_panel_cols(d: dict, text: str) -> None:
+    """Parse panel col ranges '(0,206),(206,413),(413,619)' to tuple of tuples."""
+    import re
+    default = ((0, 206), (206, 413), (413, 619))
+    try:
+        pairs = re.findall(r'\((\d+)\s*,\s*(\d+)\)', text)
+        if pairs:
+            result = tuple((int(a), int(b)) for a, b in pairs)
+            if result != default:
+                d["panel_col_ranges"] = result
+    except (ValueError, TypeError):
+        pass
+
+
+def _build_waxs_overrides() -> dict[str, Any]:
+    """Collect WAXS calibration + masking overrides from widgets."""
+    waxs_kw: dict[str, Any] = {}
+    if w_proc_waxs_energy.value != DEFAULT_WAXS_ENERGY_KEV:
+        waxs_kw["energy_kev"] = w_proc_waxs_energy.value
+    if w_proc_waxs_dist.value != DEFAULT_WAXS_SAMPLE_DIST_MM:
+        waxs_kw["sample_distance_mm"] = w_proc_waxs_dist.value
+    if w_proc_waxs_pixel.value != DEFAULT_WAXS_PIXEL_SIZE_MM:
+        waxs_kw["pixel_size_mm"] = w_proc_waxs_pixel.value
+    if w_proc_waxs_beam_row.value != DEFAULT_WAXS_BEAM_CENTER_ROW:
+        waxs_kw["beam_center_row"] = w_proc_waxs_beam_row.value
+    if w_proc_waxs_beam_col.value != DEFAULT_WAXS_BEAM_CENTER_COL:
+        waxs_kw["beam_center_col"] = w_proc_waxs_beam_col.value
+    _try_parse_panel_cols(waxs_kw, w_proc_waxs_panel_cols.value)
+    _try_parse_tuple(
+        waxs_kw, "panel_offsets_deg",
+        w_proc_waxs_panel_offsets.value, (-7.0, 0.0, 7.0),
     )
+    _try_parse_tuple(
+        waxs_kw, "panel_row_shifts",
+        w_proc_waxs_panel_row_shifts.value, (0.0, 0.0, 0.0),
+    )
+    _try_parse_tuple(
+        waxs_kw, "panel_col_shifts",
+        w_proc_waxs_panel_col_shifts.value, (0.0, 0.0, 0.0),
+    )
+    _try_parse_tuple(
+        waxs_kw, "panel_delta_deg",
+        w_proc_waxs_panel_delta.value, (0.0, 0.0, 0.0),
+    )
+    if w_proc_waxs_theta_zero.value != DEFAULT_WAXS_THETA_ZERO_DEG:
+        waxs_kw["theta_zero_deg"] = w_proc_waxs_theta_zero.value
+    if w_proc_waxs_offset_x.value != DEFAULT_WAXS_SAMPLE_OFFSET_X_MM:
+        waxs_kw["sample_offset_x_mm"] = w_proc_waxs_offset_x.value
+    if w_proc_waxs_offset_z.value != DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM:
+        waxs_kw["sample_offset_z_mm"] = w_proc_waxs_offset_z.value
+    if w_proc_waxs_col_arc_cal.value != 0.0:
+        waxs_kw["beam_col_per_arc_deg"] = w_proc_waxs_col_arc_cal.value
+    if w_proc_waxs_qh_sign.value != DEFAULT_WAXS_Q_HORIZONTAL_SIGN:
+        waxs_kw["q_horizontal_sign"] = w_proc_waxs_qh_sign.value
+    if w_proc_waxs_qv_sign.value != DEFAULT_WAXS_Q_VERTICAL_SIGN:
+        waxs_kw["q_vertical_sign"] = w_proc_waxs_qv_sign.value
+    if w_proc_waxs_rot_k.value != DEFAULT_WAXS_ROTATION_K:
+        waxs_kw["rotation_k"] = w_proc_waxs_rot_k.value
+    # WAXS masking overrides
+    if w_proc_waxs_bsx_ref.value != 0.0:
+        waxs_kw["waxs_bsx_ref"] = w_proc_waxs_bsx_ref.value
+    if w_proc_beamstop_max_arc.value != DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG:
+        waxs_kw["beamstop_max_abs_arc_deg"] = w_proc_beamstop_max_arc.value
+    return waxs_kw
 
 
 def _build_proc_params(uid: str) -> tuple:
     """Snapshot current Process-tab widget values into reduction params.
 
+    Mirrors the param-construction in :func:`_on_process` so a batch job
+    runs with whatever the user has configured in the Parameters sub-tab.
     Returns ``(callable, params_dict, geometry_label)``.
     """
-    snap = _snapshot_proc_widgets()
-    fn_name, params = _build_proc_params_impl(
-        uid, snap["geometry"],
+    geometry = w_proc_geometry.value
+    waxs_kw = _build_waxs_overrides()
+
+    if geometry == "grazing":
+        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+
+        gi_params: dict[str, Any] = dict(
+            uid=uid,
+            tiled_uri=DEFAULT_TILED_URI,
+            catalog=DEFAULT_CATALOG,
+            waxs_mask_path=w_proc_waxs_mask.value or None,
+        )
+        if w_proc_nqxy.value != DEFAULT_N_QXY:
+            gi_params["n_qxy"] = w_proc_nqxy.value
+        if w_proc_nqz.value != DEFAULT_N_QZ:
+            gi_params["n_qz"] = w_proc_nqz.value
+        if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
+            gi_params["theta_offset"] = w_proc_theta_offset.value
+        if w_proc_dezinger.value != DEFAULT_DEZINGER:
+            gi_params["dezinger_threshold"] = (
+                w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+            )
+        if w_proc_dezinger_kernel.value != DEFAULT_DEZINGER_KERNEL:
+            gi_params["dezinger_kernel"] = w_proc_dezinger_kernel.value
+        if not w_proc_incident_angle_auto.value:
+            gi_params["incident_angle_deg"] = w_proc_incident_angle.value
+        if w_proc_beamstop_max_arc.value != DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG:
+            gi_params["beamstop_max_abs_arc_deg"] = w_proc_beamstop_max_arc.value
+        if w_proc_waxs_col_per_arc.value != DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG:
+            gi_params["waxs_beam_col_per_arc_deg"] = w_proc_waxs_col_per_arc.value
+        if waxs_kw:
+            gi_params["waxs_cal_overrides"] = waxs_kw
+        return reduce_smi_gi, gi_params, geometry
+
+    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+
+    params: dict[str, Any] = dict(
+        uid=uid,
         tiled_uri=DEFAULT_TILED_URI,
         catalog=DEFAULT_CATALOG,
-        saxs_mask_path=snap["saxs_mask_path"],
-        waxs_mask_path=snap["waxs_mask_path"],
-        n_q=snap["n_q"], n_chi=snap["n_chi"],
-        n_qxy=snap["n_qxy"], n_qz=snap["n_qz"],
-        theta_offset=snap["theta_offset"],
-        dezinger=snap["dezinger"],
-        incident_angle_auto=snap["incident_angle_auto"],
-        incident_angle=snap["incident_angle"],
-        saxs_row_delta=snap["saxs_row_delta"],
-        saxs_col_delta=snap["saxs_col_delta"],
-        waxs_row_delta=snap["waxs_row_delta"],
-        waxs_col_delta=snap["waxs_col_delta"],
-        saxs_dist_delta=snap["saxs_dist_delta"],
-        cache_geometry=snap["cache_geometry"],
-        default_n_q=DEFAULT_N_Q, default_n_chi=DEFAULT_N_CHI,
-        default_n_qxy=DEFAULT_N_QXY, default_n_qz=DEFAULT_N_QZ,
-        default_theta_offset=DEFAULT_THETA_OFFSET,
-        default_dezinger=DEFAULT_DEZINGER,
-        default_saxs_row_delta=DEFAULT_SAXS_ROW_DELTA,
-        default_saxs_col_delta=DEFAULT_SAXS_COL_DELTA,
-        default_waxs_row_delta=DEFAULT_WAXS_ROW_DELTA,
-        default_waxs_col_delta=DEFAULT_WAXS_COL_DELTA,
-        default_saxs_dist_delta=DEFAULT_SAXS_DIST_DELTA,
+        solid_angle_correction=w_proc_solid_angle.value,
+        geometry=geometry,
+        saxs_mask_path=w_proc_saxs_mask.value or None,
+        waxs_mask_path=w_proc_waxs_mask.value or None,
+        cache_geometry=w_cache_enabled.value,
     )
-    if fn_name == "reduce_smi_gi":
-        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
-        return reduce_smi_gi, params, snap["geometry"]
-    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
-    return reduce_smi_combined, params, snap["geometry"]
+    if w_proc_nq.value != DEFAULT_N_Q:
+        params["n_q"] = w_proc_nq.value
+    else:
+        params["n_q"] = DEFAULT_N_Q
+    if w_proc_nchi.value != DEFAULT_N_CHI:
+        params["n_chi"] = w_proc_nchi.value
+
+    # SAXS beam-centre deltas
+    saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
+    saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
+    if saxs_row_changed or saxs_col_changed:
+        params["saxs_beam_delta_px"] = (
+            w_proc_saxs_row_delta.value, w_proc_saxs_col_delta.value,
+        )
+    # WAXS beam-centre deltas
+    waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
+    waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
+    if waxs_row_changed or waxs_col_changed:
+        params["waxs_beam_delta_px"] = (
+            w_proc_waxs_row_delta.value, w_proc_waxs_col_delta.value,
+        )
+    if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
+        params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
+    if w_proc_waxs_col_per_arc.value != DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG:
+        params["waxs_beam_col_per_arc_deg"] = w_proc_waxs_col_per_arc.value
+
+    # Dezinger
+    if w_proc_dezinger.value != DEFAULT_DEZINGER:
+        params["dezinger_threshold"] = (
+            w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
+        )
+    if w_proc_dezinger_kernel.value != DEFAULT_DEZINGER_KERNEL:
+        params["dezinger_kernel"] = w_proc_dezinger_kernel.value
+
+    # SAXS Q-range / aperture
+    if w_proc_saxs_q_cutoff.value > 0:
+        params["saxs_q_cutoff"] = w_proc_saxs_q_cutoff.value
+    if w_proc_saxs_agbh_ring.value != DEFAULT_SAXS_AGBH_RING_ORDER:
+        params["saxs_agbh_ring_order"] = w_proc_saxs_agbh_ring.value
+    if w_proc_saxs_q_margin.value != DEFAULT_SAXS_Q_MARGIN_FRACTION:
+        params["saxs_q_margin_fraction"] = w_proc_saxs_q_margin.value
+
+    # Backend options
+    backend_opts: dict[str, Any] = {}
+    if w_proc_saxs_rotate.value:
+        backend_opts["saxs_rotate_cw_90"] = True
+    if w_proc_waxs_flip.value:
+        backend_opts["waxs_flip_horizontal"] = True
+    if w_proc_waxs_qx_shift.value != 0.0:
+        backend_opts["waxs_qx_shift_nm"] = w_proc_waxs_qx_shift.value
+    if w_proc_waxs_qy_shift.value != 0.0:
+        backend_opts["waxs_qy_shift_nm"] = w_proc_waxs_qy_shift.value
+    if backend_opts:
+        params["backend_options"] = backend_opts
+
+    # Dynamic SAXS masking
+    if w_proc_dynamic_mask.value:
+        saxs_kw: dict[str, Any] = {"dynamic_saxs_mask": True}
+        dyn_kwargs: dict[str, Any] = {}
+        shadow: dict[str, Any] = {}
+        if not w_proc_dyn_shadow_enabled.value:
+            shadow["enabled"] = False
+        if w_proc_dyn_shadow_beam_deg.value != DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG:
+            shadow["beam_visible_deg"] = w_proc_dyn_shadow_beam_deg.value
+        if w_proc_dyn_shadow_clear_deg.value != DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG:
+            shadow["clear_edge_deg"] = w_proc_dyn_shadow_clear_deg.value
+        if shadow:
+            dyn_kwargs["waxs_shadow"] = shadow
+        aperture: dict[str, Any] = {}
+        if not w_proc_dyn_aper_enabled.value:
+            aperture["enabled"] = False
+        if w_proc_dyn_aper_agbh_ring.value != DEFAULT_DYN_APER_AGBH_RING_ORDER:
+            aperture["agbh_ring_order"] = w_proc_dyn_aper_agbh_ring.value
+        if w_proc_dyn_aper_q_margin.value != DEFAULT_DYN_APER_Q_MARGIN_FRACTION:
+            aperture["q_margin_fraction"] = w_proc_dyn_aper_q_margin.value
+        if w_proc_dyn_aper_q_cutoff.value > 0:
+            aperture["q_cutoff"] = w_proc_dyn_aper_q_cutoff.value
+        if aperture:
+            dyn_kwargs["aperture"] = aperture
+        if dyn_kwargs:
+            saxs_kw["dynamic_saxs_kwargs"] = dyn_kwargs
+        params["saxs_kwargs"] = saxs_kw
+
+    # WAXS kwargs (calibration + masking overrides)
+    if waxs_kw:
+        params["waxs_kwargs"] = waxs_kw
+
+    return reduce_smi_combined, params, geometry
 
 
 def _batch_process_fn(uid: str):
     """BatchProcessor.process_fn: run one reduction and return the result."""
     run_fn, params, geometry = _build_proc_params(uid)
-    if geometry == "grazing":
-        # ScanCollection currently only handles transmission results.
-        raise NotImplementedError(
-            "Batch processing for GI (grazing) geometry is not supported yet."
-        )
     # Use pre-snapshotted summary from enqueue time (thread-safe).
     summary = _batch_state.get("summaries", {}).get(uid, {})
     result = run_fn(**params)
-    # Fetch primary/baseline scalars and raw metadata so the collection
-    # can offer label columns and eventual export.
-    try:
-        run = _get_cat()[uid]
-        primary_df = _scalar_stream_to_frame(run, "primary")
-        baseline_df = _scalar_stream_to_frame(run, "baseline")
-        raw_md = dict(run.metadata)
-    except Exception:
-        primary_df = None
-        baseline_df = None
-        raw_md = None
-    # Pack extra data into params (BatchProcessor passes it through).
-    params["_primary_df"] = primary_df
-    params["_baseline_df"] = baseline_df
-    params["_raw_metadata"] = raw_md
     return result, summary, params
 
 
@@ -2846,15 +3964,7 @@ def _batch_add_fn(result, summary, params):
     # ScanCollection internals are plain dicts; updates are GIL-protected.
     # We add on the worker thread so the snapshot fired immediately after
     # already reflects the new collection size.
-    primary_df = params.pop("_primary_df", None)
-    baseline_df = params.pop("_baseline_df", None)
-    raw_metadata = params.pop("_raw_metadata", None)
-    _collection.add(
-        result, summary, params,
-        primary_df=primary_df,
-        baseline_df=baseline_df,
-        raw_metadata=raw_metadata,
-    )
+    _collection.add(result, summary, params)
 
 
 def _ensure_batch_processor() -> BatchProcessor:
@@ -2878,8 +3988,8 @@ def _ensure_batch_processor() -> BatchProcessor:
 
 
 def _on_batch_queue(event):
-    df = w_table.value
-    if df is None or len(df) == 0:
+    total = _state.get("total", 0)
+    if total == 0:
         pn.state.notifications.warning("No search results to queue.")
         return
     # Capture the current Bokeh document on the UI thread for cross-thread
@@ -2890,22 +4000,40 @@ def _on_batch_queue(event):
         _batch_state["doc"] = None
 
     max_jobs = max(1, int(w_batch_max_jobs.value or 25))
-    uids = df["uid"].tolist()[:max_jobs]
-    samples = (
-        df["sample_name"].tolist()[:max_jobs]
-        if "sample_name" in df.columns else [""] * len(uids)
-    )
-    items = [(u, s) for u, s in zip(uids, samples) if u]
+    skip_existing = w_batch_skip_existing.value
+
+    # Fetch UIDs across all pages until we have enough non-skipped items.
+    items: list[tuple[str, str]] = []
+    summaries: dict[str, dict] = {}
+    page_size = _state.get("page_size", PAGE_SIZE)
+    unified = _state.get("unified_filters", [])
+    offset = 0
+
+    while len(items) < max_jobs and offset < total:
+        page_summaries, total = tb.fetch_page_fast(
+            _get_cat(), unified_filters=unified or None,
+            offset=offset, limit=page_size,
+        )
+        if not page_summaries:
+            break
+        for s in page_summaries:
+            uid = s.get("uid", "")
+            if not uid:
+                continue
+            label = s.get("sample_name", "")
+            # Don't count skipped scans toward the max
+            if skip_existing and uid in _collection:
+                continue
+            summaries[uid] = s
+            items.append((uid, label))
+            if len(items) >= max_jobs:
+                break
+        offset += page_size
+
     if not items:
-        pn.state.notifications.warning("No valid uids in current page.")
+        pn.state.notifications.info("Nothing to queue (all already processed).")
         return
 
-    # Snapshot search-table rows so the worker thread never reads w_table.
-    summaries: dict[str, dict] = {}
-    for _, row in df.iterrows():
-        uid_val = row.get("uid")
-        if uid_val:
-            summaries[uid_val] = row.to_dict()
     _batch_state["summaries"] = summaries
 
     bp = _ensure_batch_processor()
@@ -2948,8 +4076,7 @@ batch_panel = pn.Column(
         "sub-tab above.  Reductions run on a background thread so the "
         "interface stays interactive; results land in the Scan Collection "
         "as they complete.  Already-processed uids are skipped if the "
-        "checkbox is on.  GI (grazing) geometry is not yet supported in "
-        "batch mode.",
+        "checkbox is on.",
     ),
     pn.Row(w_btn_batch_queue, w_btn_batch_cancel, w_btn_batch_clear),
     pn.Row(w_batch_max_jobs, w_batch_max_workers, w_batch_skip_existing),
@@ -2974,7 +4101,12 @@ batch_panel = pn.Column(
 
 EXPLORE_TAB_INDEX = 3
 
-_live = _app.live
+_live: dict[str, Any] = {
+    "manager": None,
+    "active": False,
+    "saved": {},  # widget -> {param_name: prev_value}
+    "doc": None,  # captured Bokeh document for cross-thread dispatch
+}
 
 # ---------------------------------------------------------------------------
 # Tiled authentication (login / logout / status)
@@ -3034,7 +4166,8 @@ def _tiled_login(username: str, password: str) -> str:
     ctx.configure_auth(tokens, remember_me=True)
 
     # Drop the cached catalog so the next access uses the refreshed tokens.
-    _app.cat = None
+    global _cat
+    _cat = None
 
     info = ctx.whoami()
     identities = (info or {}).get("identities") or []
@@ -3056,7 +4189,8 @@ def _tiled_logout() -> None:
         except Exception:
             pass
     finally:
-        _app.cat = None
+        global _cat
+        _cat = None
 
 
 w_login_status = pn.pane.Markdown("*checking…*", width=220)
@@ -3524,7 +4658,7 @@ w_detail_tabs = pn.Tabs(
         "Grid",
         pn.Column(
             pn.Row(w_mv_status, w_mv_spinner),
-            pn.Row(w_mv_field, w_mv_cmap, w_mv_log, w_mv_label, sizing_mode="stretch_width"),
+            pn.Row(w_mv_field, w_mv_cmap, w_mv_log, sizing_mode="stretch_width"),
             w_mv_range,
             pn.Column(w_mv_grid, sizing_mode="stretch_both", min_height=500),
             sizing_mode="stretch_both",
@@ -3569,44 +4703,17 @@ w_detail_tabs = pn.Tabs(
                 (
                     "Parameters",
                     pn.Column(
-                        pn.Card(
-                            w_trans_row,
-                            w_gi_row,
-                            title="Output grid",
-                            collapsed=False, sizing_mode="stretch_width",
-                        ),
-                        pn.Card(
-                            pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
-                            pn.pane.Markdown(
-                                "*Leave blank to use the bundled PyHyperScattering "
-                                "defaults shown in the placeholder text.  Use the "
-                                "Explore tab to view or edit a mask interactively.*",
-                            ),
-                            title="Masks",
-                            collapsed=False, sizing_mode="stretch_width",
-                        ),
-                        pn.Card(
-                            pn.pane.Markdown("**Beam-centre Δ (px)**"),
-                            pn.Row(
-                                w_proc_saxs_row_delta, w_proc_saxs_col_delta,
-                                w_proc_waxs_row_delta, w_proc_waxs_col_delta,
-                            ),
-                            pn.Row(w_proc_dist_delta),
-                            pn.pane.Markdown(
-                                "*Defaults match the SMI loader's calibrated values "
-                                "(SAXS Δrow=2, Δcol=3, Δdist=−20 mm; WAXS Δrow=0, "
-                                "Δcol=−2).  Change only if you know the calibration "
-                                "has shifted.*",
-                            ),
-                            title="Geometry overrides",
-                            collapsed=False, sizing_mode="stretch_width",
-                        ),
-                        pn.Card(
-                            pn.Row(w_proc_dezinger),
-                            pn.pane.Markdown("*Set to 0 to disable hot-pixel rejection.*"),
-                            title="Hot-pixel rejection",
-                            collapsed=False, sizing_mode="stretch_width",
-                        ),
+                        w_card_grid,
+                        w_card_masks,
+                        w_card_saxs_qrange,
+                        w_card_geometry,
+                        w_card_dezinger,
+                        w_card_intensity,
+                        w_card_gi,
+                        w_card_backend,
+                        w_card_dynamic_mask,
+                        w_card_waxs_cal,
+                        w_card_waxs_mask_adv,
                         sizing_mode="stretch_width",
                     ),
                 ),
@@ -3657,7 +4764,7 @@ detail_panel = pn.Column(
 collection_card = pn.Card(
     pn.Row(
         pn.Column(
-            pn.Row(w_btn_coll_remove, w_coll_label),
+            pn.Row(w_btn_coll_remove),
             w_coll_table,
             sizing_mode="stretch_width",
             min_width=300,

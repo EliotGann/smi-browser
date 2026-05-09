@@ -18,18 +18,43 @@ class TestBuildProcParams:
             n_qxy=500, n_qz=500,
             theta_offset=-0.5,
             dezinger=3000.0,
+            dezinger_kernel=5,
             incident_angle_auto=True,
             incident_angle=0.0,
             saxs_row_delta=0.0, saxs_col_delta=0.0,
             waxs_row_delta=0.0, waxs_col_delta=0.0,
             saxs_dist_delta=0.0,
+            waxs_beam_col_per_arc_deg=0.0,
             cache_geometry=True,
+            solid_angle_correction=True,
+            saxs_q_cutoff=0.0,
+            saxs_agbh_ring_order=5,
+            saxs_q_margin_fraction=0.01,
+            beamstop_max_abs_arc_deg=15.0,
+            saxs_rotate_cw_90=False,
+            waxs_flip_horizontal=False,
+            waxs_qx_shift_nm=0.0,
+            waxs_qy_shift_nm=0.0,
+            dynamic_saxs_mask=False,
+            dyn_shadow_enabled=True,
+            dyn_shadow_beam_visible_deg=14.5,
+            dyn_shadow_clear_edge_deg=18.0,
+            dyn_aper_enabled=True,
+            dyn_aper_agbh_ring_order=5,
+            dyn_aper_q_margin_fraction=0.01,
+            dyn_aper_q_cutoff=0.0,
+            waxs_kwargs=None,
             default_n_q=2000, default_n_chi=360,
             default_n_qxy=500, default_n_qz=500,
             default_theta_offset=-0.5, default_dezinger=3000.0,
+            default_dezinger_kernel=5,
             default_saxs_row_delta=0.0, default_saxs_col_delta=0.0,
             default_waxs_row_delta=0.0, default_waxs_col_delta=0.0,
             default_saxs_dist_delta=0.0,
+            default_waxs_beam_col_per_arc_deg=0.0,
+            default_beamstop_max_abs_arc_deg=15.0,
+            default_saxs_agbh_ring_order=5,
+            default_saxs_q_margin_fraction=0.01,
         )
         kw.update(overrides)
         return kw
@@ -110,3 +135,68 @@ class TestBuildProcParams:
         fn, params = build_proc_params(self.UID, "grazing",
                                        **self._defaults(theta_offset=0.0))
         assert params["theta_offset"] == 0.0
+
+    # -- New parameters --
+
+    def test_transmission_dezinger_kernel(self):
+        fn, params = build_proc_params(self.UID, "transmission",
+                                       **self._defaults(dezinger_kernel=7))
+        assert params["dezinger_kernel"] == 7
+
+    def test_transmission_saxs_q_cutoff(self):
+        fn, params = build_proc_params(self.UID, "transmission",
+                                       **self._defaults(saxs_q_cutoff=2.5))
+        assert params["saxs_q_cutoff"] == 2.5
+
+    def test_transmission_saxs_q_cutoff_zero_omitted(self):
+        fn, params = build_proc_params(self.UID, "transmission",
+                                       **self._defaults())
+        assert "saxs_q_cutoff" not in params
+
+    def test_transmission_backend_options(self):
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(saxs_rotate_cw_90=True, waxs_qx_shift_nm=1.5))
+        assert params["backend_options"]["saxs_rotate_cw_90"] is True
+        assert params["backend_options"]["waxs_qx_shift_nm"] == 1.5
+
+    def test_transmission_no_backend_when_defaults(self):
+        fn, params = build_proc_params(self.UID, "transmission",
+                                       **self._defaults())
+        assert "backend_options" not in params
+
+    def test_transmission_dynamic_mask(self):
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(dynamic_saxs_mask=True))
+        assert params["saxs_kwargs"]["dynamic_saxs_mask"] is True
+
+    def test_transmission_solid_angle(self):
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(solid_angle_correction=False))
+        assert params["solid_angle_correction"] is False
+
+    def test_transmission_waxs_col_per_arc(self):
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(waxs_beam_col_per_arc_deg=0.05))
+        assert params["waxs_beam_col_per_arc_deg"] == 0.05
+
+    def test_gi_beamstop_max_arc(self):
+        fn, params = build_proc_params(
+            self.UID, "grazing",
+            **self._defaults(beamstop_max_abs_arc_deg=20.0))
+        assert params["beamstop_max_abs_arc_deg"] == 20.0
+
+    def test_gi_waxs_kwargs(self):
+        fn, params = build_proc_params(
+            self.UID, "grazing",
+            **self._defaults(waxs_kwargs={"energy_kev": 18.0}))
+        assert params["waxs_cal_overrides"] == {"energy_kev": 18.0}
+
+    def test_transmission_waxs_kwargs(self):
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(waxs_kwargs={"sample_distance_mm": 300.0}))
+        assert params["waxs_kwargs"] == {"sample_distance_mm": 300.0}
