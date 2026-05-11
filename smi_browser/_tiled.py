@@ -289,6 +289,56 @@ def fetch_page_fast(
     return summaries, total
 
 
+def fetch_uids_fast(
+    cat,
+    unified_filters: list[tuple[str, str, str]] | None = None,
+    max_uids: int = 200,
+) -> list[str]:
+    """
+    Fetch up to *max_uids* UIDs matching the filters, newest-first.
+
+    Uses a single REST request with ``fields=none`` so no metadata is
+    transferred — only item IDs (which are the UIDs).  This is
+    dramatically faster than fetch_page_fast for queue population.
+    """
+    node = _apply_filters(cat, unified_filters)
+    http_client = node.context.http_client
+    search_url = node.item["links"]["search"]
+    filter_params = getattr(node, "_queries_as_params", {})
+
+    # Get count first (limit=0 request is fast).
+    params = {
+        "page[offset]": "0",
+        "page[limit]": "0",
+        **filter_params,
+    }
+    resp = http_client.get(search_url, params=params)
+    resp.raise_for_status()
+    total = resp.json().get("meta", {}).get("count", 0)
+    if total == 0:
+        return []
+
+    # Fetch from end (newest-first) in one big request.
+    # fields="" maps to EntryFields.none — server returns item IDs only,
+    # no metadata blobs, making this dramatically faster.
+    fetch_count = min(max_uids, total)
+    real_offset = max(0, total - fetch_count)
+
+    params = {
+        "page[offset]": str(real_offset),
+        "page[limit]": str(fetch_count),
+        "fields": "",
+        **filter_params,
+    }
+    resp = http_client.get(search_url, params=params)
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+
+    # Reverse so newest is first; item "id" is the UID
+    uids = [item["id"] for item in reversed(items) if item.get("id")]
+    return uids
+
+
 def count_fast(
     cat,
     unified_filters: list[tuple[str, str, str]] | None = None,

@@ -104,9 +104,9 @@ class ScanCollection:
     def available_label_columns(self) -> list[str]:
         """Return sorted list of numeric column names from stored primary/baseline data."""
         cols: set[str] = set()
-        for df in self._primary_dfs.values():
+        for df in list(self._primary_dfs.values()):
             cols.update(c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]))
-        for df in self._baseline_dfs.values():
+        for df in list(self._baseline_dfs.values()):
             cols.update(
                 f"baseline:{c}" for c in df.columns
                 if pd.api.types.is_numeric_dtype(df[c])
@@ -266,6 +266,8 @@ class ScanCollection:
             label = " — ".join(label_parts)
             color = self._colors.get(uid, "#888888")
             iq = res.merged_iq
+            if iq is None:
+                continue
             q = iq["q"].values
             I = iq["I"].values
             mask = np.isfinite(I) & (I > 0)
@@ -275,9 +277,13 @@ class ScanCollection:
                     line_width=1.2, line_alpha=0.4,
                     color=color, name=label,
                 )
-                r.hover_glyph = BkLine(
-                    line_color=color, line_alpha=1.0, line_width=3.5,
-                )
+                # Set hover glyph properties individually to avoid
+                # Bokeh 3.x Value() wrapper serialization issues.
+                hover_glyph = BkLine()
+                hover_glyph.line_color = color
+                hover_glyph.line_alpha = 1.0
+                hover_glyph.line_width = 3.5
+                r.hover_glyph = hover_glyph
                 renderers.append(r)
 
         p.xaxis.axis_label = "q (nm⁻¹)"

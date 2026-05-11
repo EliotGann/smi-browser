@@ -46,6 +46,7 @@ import panel as pn
 import tiled_browser as tb
 from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
+from smi_browser import nsls2api
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,24 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 pn.extension("tabulator", sizing_mode="stretch_width", notifications=True)
+
+# ---------------------------------------------------------------------------
+# Bokeh compat patch: BokehJS 3.9 sends visual properties as
+# {"type": "value", "value": X} but the Python-side set_from_json expects
+# a plain scalar.  Unwrap silently to avoid noisy ValueErrors on every
+# PATCH-DOC round-trip (line_width, line_alpha, etc.).
+# ---------------------------------------------------------------------------
+from bokeh.core.property.descriptors import PropertyDescriptor as _PD
+
+_orig_set_from_json = _PD.set_from_json
+
+def _patched_set_from_json(self, obj, value, *, setter=None):
+    if isinstance(value, dict) and value.get("type") == "value" and "value" in value:
+        value = value["value"]
+    return _orig_set_from_json(self, obj, value, setter=setter)
+
+_PD.set_from_json = _patched_set_from_json
+# ---------------------------------------------------------------------------
 
 # UI modules must be imported AFTER pn.extension() so that Tabulator widgets
 # created inside wire() register the JS extension correctly.
@@ -1065,11 +1084,18 @@ w_mv_label = pn.widgets.Select(
 )
 w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
 
+# Pagination controls for scans with more frames than MV_MAX_FRAMES
+w_mv_prev = pn.widgets.Button(name="\u25C0 Prev", width=80, button_type="default", disabled=True)
+w_mv_next = pn.widgets.Button(name="Next \u25B6", width=80, button_type="default", disabled=True)
+w_mv_page_status = pn.pane.Markdown("", width=180)
+
 _multiview_cache: dict = {
     "uid": None, "field": None, "n_frames": 0,
+    "total_frames": 0, "page": 0,
     "frames": None, "renderers": None, "mapper": None,
     "log": None, "data_lo": None, "data_hi": None,
     "suspend_range_cb": False,
+    "loading": False,
 }
 
 
@@ -1120,6 +1146,7 @@ def _build_multiview_grid(frames, field):
         return
 
     # Build per-frame labels from primary scalar column if selected
+    frame_offset = _multiview_cache.get("page", 0) * MV_MAX_FRAMES
     label_col = w_mv_label.value
     frame_labels: list[str] = []
     if label_col and label_col != "(frame #)":
@@ -1127,16 +1154,17 @@ def _build_multiview_grid(frames, field):
         if df is not None and label_col in df.columns:
             vals = df[label_col].values
             for i in range(len(frames)):
-                if i < len(vals):
-                    v = vals[i]
+                abs_i = frame_offset + i
+                if abs_i < len(vals):
+                    v = vals[abs_i]
                     try:
                         frame_labels.append(f"{label_col}={float(v):.4g}")
                     except (ValueError, TypeError):
                         frame_labels.append(f"{label_col}={v}")
                 else:
-                    frame_labels.append(f"frame {i}")
+                    frame_labels.append(f"frame {abs_i}")
     if not frame_labels:
-        frame_labels = [f"frame {i}" for i in range(len(frames))]
+        frame_labels = [f"frame {frame_offset + i}" for i in range(len(frames))]
 
     # Per-frame display arrays + global data range
     displays = [np.where(np.isfinite(a), a, 0).astype(np.float32) for a in frames]
@@ -1208,7 +1236,7 @@ def _build_multiview_grid(frames, field):
             renderers=[r],
             tooltips=[
                 ("label", frame_labels[i]),
-                ("frame", str(i)),
+                ("frame", str(frame_offset + i)),
                 ("(col, row)", "($x{0}, $y{0})"),
                 ("intensity", "@image{0.000}"),
             ],
@@ -1247,6 +1275,8 @@ def _load_multiview():
     run = _ensure_run()
     if not run:
         return
+    w_mv_status.object = "*Loading…*"
+
     # Re-use primary stream info (loaded by Explore / Primary tabs too)
     info = _detail_cache.get("primary_info")
     if info is None and "primary" in tb.stream_names(run):
@@ -1266,30 +1296,34 @@ def _load_multiview():
     label_options = ["(frame #)"]
     if df is not None and not df.empty:
         label_options += [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    prev_label = w_mv_label.value
-    w_mv_label.options = label_options
-    if prev_label in label_options:
-        w_mv_label.value = prev_label
-    else:
-        w_mv_label.value = "(frame #)"
 
     image_fields = list(info["images"])
-    # Populate detector dropdown (preserve previous choice if present)
-    prev = w_mv_field.value
-    if list(w_mv_field.options) != image_fields:
-        w_mv_field.options = []
-        w_mv_field.options = image_fields
-    field = prev if prev in image_fields else image_fields[0]
-    if w_mv_field.value != field:
-        # Setting value will trigger _on_mv_field which does the fetch.
-        w_mv_field.value = field
-        return
+
+    # Guard: suppress _on_mv_field / _on_mv_label callbacks while we
+    # reconfigure widget options/values to avoid nested Bokeh doc writes.
+    _multiview_cache["loading"] = True
+    try:
+        # Update label dropdown — skip if unchanged to avoid spurious events
+        if list(w_mv_label.options) != label_options:
+            w_mv_label.options = label_options
+        if w_mv_label.value not in label_options:
+            w_mv_label.value = "(frame #)"
+
+        # Update detector dropdown — set directly (no clear-then-reset)
+        prev = w_mv_field.value
+        if list(w_mv_field.options) != image_fields:
+            w_mv_field.options = image_fields
+        field = prev if prev in image_fields else image_fields[0]
+        if w_mv_field.value != field:
+            w_mv_field.value = field
+    finally:
+        _multiview_cache["loading"] = False
 
     _fetch_and_build_multiview(field)
 
 
-def _fetch_and_build_multiview(field: str):
-    """Fetch every frame of `field` and (re)build the grid."""
+def _fetch_and_build_multiview(field: str, *, page: int = 0):
+    """Fetch a page of frames for `field` and (re)build the grid."""
     run = _ensure_run()
     if not run or not field:
         return
@@ -1297,38 +1331,62 @@ def _fetch_and_build_multiview(field: str):
     if not info:
         return
     shape = info["fields"].get(field, ())
-    n_frames = shape[0] if len(shape) >= 3 else 1
-    if n_frames > MV_MAX_FRAMES:
-        capped_n = MV_MAX_FRAMES
-        cap_msg = f" (showing first {MV_MAX_FRAMES} of {n_frames})"
-    else:
-        capped_n = n_frames
-        cap_msg = ""
+    total_frames = shape[0] if len(shape) >= 3 else 1
+
+    # Pagination
+    start = page * MV_MAX_FRAMES
+    end = min(start + MV_MAX_FRAMES, total_frames)
+    if start >= total_frames:
+        page = 0
+        start = 0
+        end = min(MV_MAX_FRAMES, total_frames)
+    page_count = max(1, int(np.ceil(total_frames / MV_MAX_FRAMES)))
 
     w_mv_spinner.value = True
     w_mv_spinner.visible = True
-    w_mv_status.object = f"*Loading {capped_n} frames…*"
+    w_mv_status.object = f"*Loading frames {start}–{end - 1} of {total_frames}…*"
     t0 = time.perf_counter()
     ds = _detail_cache.get("primary_dataset")
     frames = []
-    for i in range(capped_n):
+    for i in range(start, end):
         arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
         if arr is None:
             continue
         frames.append(_orient_frame(arr, field))
     _multiview_cache["frames"] = frames
-    _multiview_cache["n_frames"] = capped_n
+    _multiview_cache["n_frames"] = len(frames)
+    _multiview_cache["total_frames"] = total_frames
+    _multiview_cache["page"] = page
     _multiview_cache["uid"] = _state.get("selected_uid")
-    _build_multiview_grid(frames, field)
+
+    # Update pagination buttons
+    w_mv_prev.disabled = (page <= 0)
+    w_mv_next.disabled = (end >= total_frames)
+    if page_count > 1:
+        w_mv_page_status.object = f"Page **{page + 1}** / {page_count}"
+    else:
+        w_mv_page_status.object = ""
+
+    try:
+        _build_multiview_grid(frames, field)
+    except Exception as exc:
+        log.exception("multiview grid build failed")
+        w_mv_grid.object = None
+        w_mv_spinner.value = False
+        w_mv_spinner.visible = False
+        w_mv_status.object = f"**Grid build error:** `{exc}`"
+        return
     dt_ms = (time.perf_counter() - t0) * 1000
     w_mv_spinner.value = False
     w_mv_spinner.visible = False
     w_mv_status.object = (
-        f"**primary/{field}** — {len(frames)} frames{cap_msg} ({dt_ms:.0f} ms)"
+        f"**primary/{field}** — frames {start}–{end - 1} of {total_frames} ({dt_ms:.0f} ms)"
     )
 
 
 def _on_mv_field(event):
+    if _multiview_cache.get("loading"):
+        return
     field = event.new
     if not field:
         return
@@ -1380,6 +1438,8 @@ w_mv_range.param.watch(_on_mv_range, "value")
 
 def _on_mv_label(event):
     """Rebuild grid with updated frame labels when the label column changes."""
+    if _multiview_cache.get("loading"):
+        return
     field = _multiview_cache.get("field")
     frames = _multiview_cache.get("frames")
     if field and frames:
@@ -1387,6 +1447,27 @@ def _on_mv_label(event):
 
 
 w_mv_label.param.watch(_on_mv_label, "value")
+
+
+def _on_mv_prev(_event=None):
+    """Go to the previous page of frames."""
+    page = _multiview_cache.get("page", 0)
+    field = _multiview_cache.get("field")
+    if page > 0 and field:
+        _fetch_and_build_multiview(field, page=page - 1)
+
+
+def _on_mv_next(_event=None):
+    """Go to the next page of frames."""
+    page = _multiview_cache.get("page", 0)
+    field = _multiview_cache.get("field")
+    total = _multiview_cache.get("total_frames", 0)
+    if (page + 1) * MV_MAX_FRAMES < total and field:
+        _fetch_and_build_multiview(field, page=page + 1)
+
+
+w_mv_prev.on_click(_on_mv_prev)
+w_mv_next.on_click(_on_mv_next)
 
 
 # ---------------------------------------------------------------------------
@@ -2703,20 +2784,28 @@ def _reset_detail(preserve_figure=False):
             dyn_source=None, dyn_renderer=None,
         )
     w_image_status.object = ""
+    # Clear image cache field BEFORE touching slider so _on_image_slider
+    # sees no field and returns early — avoids Bokeh model mutations that
+    # can fail with _pending_writes errors when the document lock context
+    # doesn't match (e.g. cascading from param.watch callbacks).
+    _image_cache.update(field=None, n_frames=0, dataset=None, fields=[],
+                        raw_shape=None)
     w_image_slider.value = 0
     w_image_slider.end = 1
     # Don't clear image_field options — preserve detector selection
-    _image_cache.update(n_frames=0, dataset=None, fields=[],
-                        raw_shape=None)
     w_explore_plot.object = None
     # Grid (multi-view) tab — drop the figure so a new scan rebuilds fresh
     w_mv_grid.object = None
     w_mv_status.object = "*Click tab to load.*"
     _multiview_cache.update(
-        uid=None, field=None, n_frames=0, frames=None,
-        renderers=None, mapper=None, log=None,
+        uid=None, field=None, n_frames=0, total_frames=0, page=0,
+        frames=None, renderers=None, mapper=None, log=None,
         data_lo=None, data_hi=None,
+        loading=False,
     )
+    w_mv_prev.disabled = True
+    w_mv_next.disabled = True
+    w_mv_page_status.object = ""
     w_proc_status.object = "*Select a scan and click Process.*"
     w_proc_spinner.value = False
     w_proc_spinner.visible = False
@@ -3005,6 +3094,11 @@ def _on_detail_tab(event):
         _load_active_tab(event.new)
     except Exception as exc:
         log.exception("Detail tab load error")
+        # Surface the error on the relevant status widget so the user sees it
+        if event.new == 4:
+            w_mv_status.object = f"**Error loading grid:** `{exc}`"
+            w_mv_spinner.value = False
+            w_mv_spinner.visible = False
 
 
 def _update_primary_plot(*_events):
@@ -3194,6 +3288,9 @@ def _on_process(event):
             if not w_proc_incident_angle_auto.value:
                 gi_params["incident_angle_deg"] = w_proc_incident_angle.value
 
+            _args_str = ", ".join(f"{k}={v!r}" for k, v in gi_params.items())
+            print(f"\n>>> reduce_smi_gi({_args_str})\n")
+
             gi_result = reduce_smi_gi(**gi_params)
             dt = time.perf_counter() - t0
 
@@ -3268,6 +3365,9 @@ def _on_process(event):
                 params["dezinger_threshold"] = (
                     w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
                 )
+
+            _args_str = ", ".join(f"{k}={v!r}" for k, v in params.items())
+            print(f"\n>>> reduce_smi_combined({_args_str})\n")
 
             result = reduce_smi_combined(**params)
             dt = time.perf_counter() - t0
@@ -3673,20 +3773,31 @@ def _build_proc_params(uid: str) -> tuple:
 def _batch_process_fn(uid: str):
     """BatchProcessor.process_fn: run one reduction and return the result."""
     run_fn, params, geometry = _build_proc_params(uid)
-    # Use pre-snapshotted summary from enqueue time (thread-safe).
-    summary = _batch_state.get("summaries", {}).get(uid, {})
     result = run_fn(**params)
     # Fetch primary/baseline scalars and raw metadata so the collection
     # can offer label columns and eventual export.
+    # Also build the summary from run metadata (no longer pre-fetched at
+    # queue time for speed).
     try:
         run = _get_cat()[uid]
         primary_df = _scalar_stream_to_frame(run, "primary")
         baseline_df = _scalar_stream_to_frame(run, "baseline")
         raw_md = dict(run.metadata)
+        start_md = raw_md.get("start", {})
+        summary = {
+            "uid": uid,
+            "sample_name": start_md.get(
+                "sample_name",
+                start_md.get("sample", start_md.get("Sample", "?")),
+            ),
+            "plan_name": start_md.get("plan_name", "?"),
+            "scan_id": start_md.get("scan_id", "?"),
+        }
     except Exception:
         primary_df = None
         baseline_df = None
         raw_md = None
+        summary = _batch_state.get("summaries", {}).get(uid, {})
     # Pack extra data into params (BatchProcessor passes it through).
     params["_primary_df"] = primary_df
     params["_baseline_df"] = baseline_df
@@ -3837,15 +3948,29 @@ def _on_batch_queue(event):
     max_jobs = max(1, int(w_batch_max_jobs.value or 25))
     skip_existing = w_batch_skip_existing.value
 
-    # Fetch UIDs across all pages until we have enough non-skipped items.
+    # Use UIDs from the current search table (already fetched for display)
+    # then page forward through more results if needed.  This guarantees
+    # the same search filters and ordering the user sees.
     items: list[tuple[str, str]] = []
-    summaries: dict[str, dict] = {}
-    page_size = _state.get("page_size", PAGE_SIZE)
     unified = _state.get("unified_filters", [])
-    offset = 0
+    page_size = _state.get("page_size", PAGE_SIZE)
 
+    # Start from UIDs already visible in the table
+    df = w_table.value
+    if df is not None and len(df) > 0 and "uid" in df.columns:
+        for uid in df["uid"].tolist():
+            if not uid:
+                continue
+            if skip_existing and uid in _collection:
+                continue
+            items.append((uid, ""))
+            if len(items) >= max_jobs:
+                break
+
+    # If we need more, page through additional results
+    offset = page_size  # skip current page (already processed above)
     while len(items) < max_jobs and offset < total:
-        page_summaries, total = tb.fetch_page_fast(
+        page_summaries, _ = tb.fetch_page_fast(
             _get_cat(), unified_filters=unified or None,
             offset=offset, limit=page_size,
         )
@@ -3855,12 +3980,9 @@ def _on_batch_queue(event):
             uid = s.get("uid", "")
             if not uid:
                 continue
-            label = s.get("sample_name", "")
-            # Don't count skipped scans toward the max
             if skip_existing and uid in _collection:
                 continue
-            summaries[uid] = s
-            items.append((uid, label))
+            items.append((uid, ""))
             if len(items) >= max_jobs:
                 break
         offset += page_size
@@ -3869,7 +3991,7 @@ def _on_batch_queue(event):
         pn.state.notifications.info("Nothing to queue (all already processed).")
         return
 
-    _batch_state["summaries"] = summaries
+    _batch_state["summaries"] = {}  # populated lazily during processing
 
     bp = _ensure_batch_processor()
     n = bp.enqueue(items)
@@ -4093,6 +4215,8 @@ def _on_login_submit(event=None):
         w_login_pass.value = ""
         w_login_form.visible = False
         _refresh_login_status()
+        # Load proposals for the newly logged-in user
+        _refresh_proposals(w_proposal_cycle.value)
         try:
             pn.state.notifications.success(f"Tiled login OK ({user})")
         except Exception:
@@ -4106,6 +4230,10 @@ def _on_login_submit(event=None):
 def _on_logout(event=None):
     _tiled_logout()
     _refresh_login_status()
+    # Clear proposals on logout
+    w_proposal_select.options = ["(log in first)"]
+    w_proposal_select.value = "(log in first)"
+    w_proposal_status.object = ""
     try:
         pn.state.notifications.info("Logged out of tiled.")
     except Exception:
@@ -4420,6 +4548,237 @@ def _filter_summary_text() -> str:
 
 w_filter_summary = pn.pane.Markdown(_filter_summary_text(), margin=(0, 5))
 
+# ---------------------------------------------------------------------------
+# Proposal selector (powered by api.nsls2.bnl.gov)
+# ---------------------------------------------------------------------------
+
+# Cached proposal list and lookup map
+_proposal_cache: list[nsls2api.ProposalInfo] = []
+_proposal_map: dict[str, nsls2api.ProposalInfo] = {}  # data_session → info
+
+w_proposal_cycle = pn.widgets.Select(
+    name="Cycle", options=["(loading…)"], value="(loading…)", width=110,
+)
+w_proposal_select = pn.widgets.Select(
+    name="Data session", options=["(select cycle first)"],
+    value="(select cycle first)", width=320,
+)
+w_proposal_project = pn.widgets.Select(
+    name="Project", options=["(all)"], value="(all)", width=320,
+)
+w_proposal_status = pn.pane.Markdown("", width=320, margin=(0, 5))
+w_proposal_spinner = pn.indicators.LoadingSpinner(
+    value=False, size=18, visible=False,
+)
+
+proposal_card = pn.Card(
+    pn.Row(w_proposal_cycle, w_proposal_spinner),
+    w_proposal_select,
+    w_proposal_project,
+    w_proposal_status,
+    title="📋 My Proposals",
+    collapsed=False,
+    sizing_mode="stretch_width",
+    margin=(0, 0, 5, 0),
+)
+
+
+def _load_cycles():
+    """Populate the cycle dropdown (fast, unauthenticated)."""
+    cycles = nsls2api.fetch_cycles()
+    current = nsls2api.fetch_current_cycle()
+    if not cycles:
+        w_proposal_cycle.options = ["(unavailable)"]
+        w_proposal_cycle.value = "(unavailable)"
+        return
+    # Most recent first; prepend "All cycles" and "commissioning"
+    cycle_opts = ["All cycles", "commissioning"] + list(reversed(cycles))
+    w_proposal_cycle.options = cycle_opts
+    if current and current in cycle_opts:
+        w_proposal_cycle.value = current
+    else:
+        w_proposal_cycle.value = cycle_opts[2] if len(cycle_opts) > 2 else cycle_opts[0]
+
+
+def _refresh_proposals(cycle: str | None = None):
+    """Fetch proposals for the logged-in user and populate the dropdown."""
+    username = _tiled_whoami()
+    if not username:
+        w_proposal_select.options = ["(log in first)"]
+        w_proposal_select.value = "(log in first)"
+        w_proposal_status.object = "*Log in to see your proposals*"
+        return
+
+    w_proposal_spinner.value = True
+    w_proposal_spinner.visible = True
+    w_proposal_status.object = "*Loading proposals…*"
+
+    try:
+        cycle_filter = cycle if cycle and cycle != "All cycles" else None
+        proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
+    except Exception as exc:
+        log.warning("Proposal fetch failed: %s", exc)
+        w_proposal_select.options = ["(error loading)"]
+        w_proposal_select.value = "(error loading)"
+        w_proposal_status.object = f"*Error: {exc}*"
+        return
+    finally:
+        w_proposal_spinner.value = False
+        w_proposal_spinner.visible = False
+
+    global _proposal_cache, _proposal_map
+    _proposal_cache = proposals
+    _proposal_map = {p.data_session: p for p in proposals}
+
+    if not proposals:
+        # User may have beamline-wide access — show that info
+        beamline_access = nsls2api.fetch_user_beamline_access(username)
+        has_smi = any(b.lower() == "smi" for b in beamline_access)
+        if has_smi:
+            w_proposal_select.options = ["(all — beamline access)"]
+            w_proposal_select.value = "(all — beamline access)"
+            w_proposal_status.object = (
+                f"*{username} has full SMI access — "
+                "use Search Filters below to find scans*"
+            )
+        else:
+            w_proposal_select.options = ["(none found)"]
+            w_proposal_select.value = "(none found)"
+            cy = cycle_filter or "all cycles"
+            w_proposal_status.object = f"*No SMI proposals for {cy}*"
+        return
+
+    # Build dropdown options: data_session as value, display_label as text
+    opts = {p.display_label: p.data_session for p in proposals}
+    w_proposal_select.options = opts
+    # Select the first by default
+    w_proposal_select.value = proposals[0].data_session
+    w_proposal_status.object = f"*{len(proposals)} proposal{'s' if len(proposals) != 1 else ''}*"
+
+
+def _on_cycle_change(*_events):
+    """Re-fetch proposals when the cycle selection changes."""
+    cycle = w_proposal_cycle.value
+    if cycle in ("(loading…)", "(unavailable)"):
+        return
+
+    # Reset detail pane and clear table to avoid stale state
+    _state["selected_uid"] = None
+    w_table.selection = []
+    _reset_detail()
+
+    if cycle == "All cycles":
+        # Clear any data_session filter and search unfiltered
+        _filter_rows.clear()
+        _add_filter()
+        w_table.value = _EMPTY_DF.copy()
+        w_status.object = "*Select a proposal or add filters*"
+        _refresh_pagination()
+        w_filter_summary.object = _filter_summary_text()
+
+    _refresh_proposals(cycle)
+
+
+def _on_proposal_select(*_events):
+    """Apply the selected data-session as a search filter and search."""
+    ds = w_proposal_select.value
+    if not ds or ds.startswith("("):
+        return
+
+    # Reset project dropdown while we load new options
+    w_proposal_project.options = ["(all)"]
+    w_proposal_project.value = "(all)"
+
+    # Reset detail pane and clear table selection BEFORE search to avoid
+    # Bokeh document-lock errors from the _on_row_select cascade.
+    _state["selected_uid"] = None
+    w_table.selection = []
+    _reset_detail()
+
+    # Clear existing filters and set a single exact data_session filter
+    _filter_rows.clear()
+    _add_filter(ftype="Exact", key="data_session", val=ds)
+    _do_search(0)
+
+    # Show proposal info in the status line
+    info = _proposal_map.get(ds)
+    if info:
+        w_proposal_status.object = (
+            f"**{info.pi_name}** — {info.title[:80]}"
+        )
+
+    # Fetch distinct project_name values within this data_session
+    _populate_project_names(ds)
+
+
+def _populate_project_names(data_session: str):
+    """Query tiled for distinct project_name values within a data_session."""
+    try:
+        ds_filter = [("exact", "data_session", data_session)]
+        vals = tb.distinct_values(
+            _get_cat(),
+            key="project_name",
+            unified_filters=ds_filter,
+            counts=True,
+            size_limit=0,  # skip size check — already filtered to one proposal
+        )
+    except Exception as exc:
+        log.warning("project_name distinct query failed: %s", exc)
+        w_proposal_project.options = ["(all)"]
+        w_proposal_project.value = "(all)"
+        return
+
+    if vals is None:
+        w_proposal_project.options = ["(all)"]
+        w_proposal_project.value = "(all)"
+        return
+
+    # Build options: "(all)" plus each project name with count
+    project_names = sorted(
+        [v["value"] for v in vals if v.get("value")],
+        key=str.lower,
+    )
+    if not project_names:
+        w_proposal_project.options = ["(all)"]
+        w_proposal_project.value = "(all)"
+        return
+
+    # Add count info to display
+    count_map = {v["value"]: v.get("count") for v in vals if v.get("value")}
+    opts = {"(all)": "(all)"}
+    for name in project_names:
+        cnt = count_map.get(name)
+        label = f"{name} ({cnt})" if cnt else name
+        opts[label] = name
+    w_proposal_project.options = opts
+    w_proposal_project.value = "(all)"
+
+
+def _on_project_select(*_events):
+    """Apply project_name filter on top of the data-session filter."""
+    project = w_proposal_project.value
+    ds = w_proposal_select.value
+    if not ds or ds.startswith("("):
+        return
+
+    # Reset detail pane and clear table selection BEFORE search to avoid
+    # Bokeh document-lock errors from the _on_row_select cascade.
+    _state["selected_uid"] = None
+    w_table.selection = []
+    _reset_detail()
+
+    # Rebuild filters: always include data_session, optionally project_name
+    _filter_rows.clear()
+    _add_filter(ftype="Exact", key="data_session", val=ds)
+    if project and project != "(all)":
+        _add_filter(ftype="Exact", key="project_name", val=project)
+    _do_search(0)
+
+
+w_proposal_cycle.param.watch(_on_cycle_change, "value")
+w_proposal_select.param.watch(_on_proposal_select, "value")
+w_proposal_project.param.watch(_on_project_select, "value")
+
 search_card = pn.Card(
     w_filter_column,
     pn.Row(w_btn_add_filter,
@@ -4436,6 +4795,7 @@ page_row = pn.Row(
 )
 
 left_panel = pn.Column(
+    proposal_card,
     w_filter_summary,
     search_card,
     pn.Row(w_status, w_search_spinner),
@@ -4494,7 +4854,8 @@ w_detail_tabs = pn.Tabs(
         pn.Column(
             pn.Row(w_mv_status, w_mv_spinner),
             pn.Row(w_mv_field, w_mv_cmap, w_mv_log, w_mv_label, sizing_mode="stretch_width"),
-            w_mv_range,
+            pn.Row(w_mv_range, w_mv_prev, w_mv_next, w_mv_page_status,
+                   sizing_mode="stretch_width"),
             pn.Column(w_mv_grid, sizing_mode="stretch_both", min_height=500),
             sizing_mode="stretch_both",
         ),
@@ -4662,6 +5023,10 @@ _refresh_login_status()
 _refresh_pagination()
 _reset_detail()
 _refresh_collection()
+
+# Populate cycle dropdown and load proposals if already logged in
+_load_cycles()
+_refresh_proposals(w_proposal_cycle.value)
 
 # Load the 25 most recent scans in the background so the UI renders
 # immediately.  Uses a cached count to skip the expensive count probe.
