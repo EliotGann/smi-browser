@@ -121,6 +121,7 @@ DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
 DEFAULT_WAXS_MASK = ""
 DEFAULT_DEZINGER = 3000.0
 DEFAULT_DEZINGER_KERNEL = 5
+DEFAULT_PIXEL_SPLITTING = 1
 DEFAULT_INCIDENT_ANGLE = 0.0
 DEFAULT_THETA_OFFSET = -0.5
 DEFAULT_N_QXY = 500
@@ -1827,6 +1828,10 @@ w_proc_dezinger_kernel = pn.widgets.IntInput(
     name="Kernel size", value=DEFAULT_DEZINGER_KERNEL,
     start=3, end=21, step=2, width=90,
 )
+w_proc_pixel_splitting = pn.widgets.IntInput(
+    name="Pixel splitting", value=DEFAULT_PIXEL_SPLITTING,
+    start=1, end=8, step=1, width=100,
+)
 
 # --- Intensity corrections ---
 w_proc_solid_angle = pn.widgets.Checkbox(
@@ -1994,6 +1999,7 @@ _CARD_PARAM_REGISTRY: dict[str, list[tuple[Any, Any]]] = {
     "dezinger": [
         (w_proc_dezinger, DEFAULT_DEZINGER),
         (w_proc_dezinger_kernel, DEFAULT_DEZINGER_KERNEL),
+        (w_proc_pixel_splitting, DEFAULT_PIXEL_SPLITTING),
     ],
     "intensity": [
         (w_proc_solid_angle, DEFAULT_SOLID_ANGLE),
@@ -2151,12 +2157,14 @@ w_card_geometry = pn.Card(
 
 w_card_dezinger = pn.Card(
     _card_restore_buttons["dezinger"],
-    pn.Row(w_proc_dezinger, w_proc_dezinger_kernel),
+    pn.Row(w_proc_dezinger, w_proc_dezinger_kernel, w_proc_pixel_splitting),
     pn.pane.Markdown(
         "*σ = 0 disables hot-pixel rejection.  Kernel is the median-filter "
-        "window size (odd integer).  GI default σ is 30 000.*",
+        "window size (odd integer).  GI default σ is 30 000.  "
+        "Pixel splitting N×N sub-divides each pixel for fractional "
+        "binning (1 = no splitting, 2–4 typical).*",
     ),
-    title="Hot-pixel rejection (dezinger)",
+    title="Hot-pixel rejection / pixel splitting",
     collapsed=False, sizing_mode="stretch_width",
 )
 
@@ -3756,6 +3764,8 @@ def _build_proc_params(uid: str) -> tuple:
             )
         if w_proc_dezinger_kernel.value != DEFAULT_DEZINGER_KERNEL:
             gi_params["dezinger_kernel"] = w_proc_dezinger_kernel.value
+        if w_proc_pixel_splitting.value != DEFAULT_PIXEL_SPLITTING:
+            gi_params["pixel_splitting"] = w_proc_pixel_splitting.value
         if not w_proc_incident_angle_auto.value:
             gi_params["incident_angle_deg"] = w_proc_incident_angle.value
         if w_proc_beamstop_max_arc.value != DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG:
@@ -3811,6 +3821,8 @@ def _build_proc_params(uid: str) -> tuple:
         )
     if w_proc_dezinger_kernel.value != DEFAULT_DEZINGER_KERNEL:
         params["dezinger_kernel"] = w_proc_dezinger_kernel.value
+    if w_proc_pixel_splitting.value != DEFAULT_PIXEL_SPLITTING:
+        params["pixel_splitting"] = w_proc_pixel_splitting.value
 
     # SAXS Q-range / aperture
     if w_proc_saxs_q_cutoff.value > 0:
