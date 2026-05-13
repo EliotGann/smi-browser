@@ -1783,7 +1783,7 @@ w_proc_waxs_mask = pn.widgets.TextInput(
 
 # --- SAXS Q-range / aperture ---
 w_proc_saxs_q_cutoff = pn.widgets.FloatInput(
-    name="q cutoff (nm⁻¹)", value=0.0, step=0.1, start=0.0, width=120,
+    name="q cutoff (nm⁻¹)", value=0.0, step=0.01, start=0.0, width=120,
 )
 w_proc_saxs_agbh_ring = pn.widgets.IntInput(
     name="AgBh ring order", value=DEFAULT_SAXS_AGBH_RING_ORDER,
@@ -1796,19 +1796,19 @@ w_proc_saxs_q_margin = pn.widgets.FloatInput(
 
 # --- Geometry corrections ---
 w_proc_saxs_row_delta = pn.widgets.FloatInput(
-    name="SAXS Δrow", value=DEFAULT_SAXS_ROW_DELTA, step=0.5, width=80,
+    name="SAXS Δrow", value=DEFAULT_SAXS_ROW_DELTA, step=0.50, width=80,
 )
 w_proc_saxs_col_delta = pn.widgets.FloatInput(
-    name="SAXS Δcol", value=DEFAULT_SAXS_COL_DELTA, step=0.5, width=80,
+    name="SAXS Δcol", value=DEFAULT_SAXS_COL_DELTA, step=0.50, width=80,
 )
 w_proc_dist_delta = pn.widgets.FloatInput(
-    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.0, width=110,
+    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.00, width=110,
 )
 w_proc_waxs_row_delta = pn.widgets.FloatInput(
-    name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.5, width=80,
+    name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.50, width=80,
 )
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
-    name="WAXS Δcol", value=DEFAULT_WAXS_COL_DELTA, step=0.5, width=80,
+    name="WAXS Δcol", value=DEFAULT_WAXS_COL_DELTA, step=0.50, width=80,
 )
 w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
     name="WAXS col/arc°", value=DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG,
@@ -1821,7 +1821,7 @@ w_saxs_geom_section = pn.Column(
 
 # --- Hot-pixel rejection ---
 w_proc_dezinger = pn.widgets.FloatInput(
-    name="Dezinger σ", value=DEFAULT_DEZINGER, step=100.0, width=100,
+    name="Dezinger σ", value=DEFAULT_DEZINGER, step=100.00, width=100,
 )
 w_proc_dezinger_kernel = pn.widgets.IntInput(
     name="Kernel size", value=DEFAULT_DEZINGER_KERNEL,
@@ -1841,11 +1841,11 @@ w_proc_incident_angle_auto = pn.widgets.Checkbox(
     name="Auto α_i", value=True, width=80,
 )
 w_proc_theta_offset = pn.widgets.FloatInput(
-    name="θ offset (°)", value=DEFAULT_THETA_OFFSET, step=0.1, width=90,
+    name="θ offset (°)", value=DEFAULT_THETA_OFFSET, step=0.01, width=90,
 )
 w_proc_beamstop_max_arc = pn.widgets.FloatInput(
     name="Beamstop |arc| max (°)", value=DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG,
-    step=0.5, width=150,
+    step=0.50, width=150,
 )
 
 # --- Backend / display options ---
@@ -1856,10 +1856,10 @@ w_proc_waxs_flip = pn.widgets.Checkbox(
     name="WAXS flip horizontal", value=False, width=170,
 )
 w_proc_waxs_qx_shift = pn.widgets.FloatInput(
-    name="WAXS Δqx (nm⁻¹)", value=0.0, step=0.1, width=120,
+    name="WAXS Δqx (nm⁻¹)", value=0.0, step=0.01, width=120,
 )
 w_proc_waxs_qy_shift = pn.widgets.FloatInput(
-    name="WAXS Δqy (nm⁻¹)", value=0.0, step=0.1, width=120,
+    name="WAXS Δqy (nm⁻¹)", value=0.0, step=0.01, width=120,
 )
 
 # --- Dynamic SAXS masking ---
@@ -1871,11 +1871,11 @@ w_proc_dyn_shadow_enabled = pn.widgets.Checkbox(
 )
 w_proc_dyn_shadow_beam_deg = pn.widgets.FloatInput(
     name="Beam visible (°)", value=DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG,
-    step=0.5, width=120,
+    step=0.50, width=120,
 )
 w_proc_dyn_shadow_clear_deg = pn.widgets.FloatInput(
     name="Clear edge (°)", value=DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG,
-    step=0.5, width=120,
+    step=0.50, width=120,
 )
 w_proc_dyn_aper_enabled = pn.widgets.Checkbox(
     name="Aperture mask", value=True, width=120,
@@ -1889,25 +1889,25 @@ w_proc_dyn_aper_q_margin = pn.widgets.FloatInput(
     step=0.005, start=0.0, end=0.5, width=110,
 )
 w_proc_dyn_aper_q_cutoff = pn.widgets.FloatInput(
-    name="q cutoff (nm⁻¹)", value=0.0, step=0.1, start=0.0, width=120,
+    name="q cutoff (nm⁻¹)", value=0.0, step=0.01, start=0.0, width=120,
 )
 
 # --- Advanced WAXS calibration ---
 w_proc_waxs_energy = pn.widgets.FloatInput(
-    name="Energy (keV)", value=DEFAULT_WAXS_ENERGY_KEV, step=0.1, width=110,
+    name="Energy (keV)", value=DEFAULT_WAXS_ENERGY_KEV, step=0.01, width=110,
 )
 w_proc_waxs_dist = pn.widgets.FloatInput(
-    name="Distance (mm)", value=DEFAULT_WAXS_SAMPLE_DIST_MM, step=1.0, width=120,
+    name="Distance (mm)", value=DEFAULT_WAXS_SAMPLE_DIST_MM, step=1.00, width=120,
 )
 w_proc_waxs_pixel = pn.widgets.FloatInput(
     name="Pixel size (mm)", value=DEFAULT_WAXS_PIXEL_SIZE_MM,
     step=0.001, width=120,
 )
 w_proc_waxs_beam_row = pn.widgets.FloatInput(
-    name="Beam row (px)", value=DEFAULT_WAXS_BEAM_CENTER_ROW, step=0.5, width=110,
+    name="Beam row (px)", value=DEFAULT_WAXS_BEAM_CENTER_ROW, step=0.50, width=110,
 )
 w_proc_waxs_beam_col = pn.widgets.FloatInput(
-    name="Beam col (px)", value=DEFAULT_WAXS_BEAM_CENTER_COL, step=0.5, width=110,
+    name="Beam col (px)", value=DEFAULT_WAXS_BEAM_CENTER_COL, step=0.50, width=110,
 )
 w_proc_waxs_panel_cols = pn.widgets.TextInput(
     name="Panel col ranges", value="(0,206),(206,413),(413,619)", width=280,
@@ -1925,24 +1925,24 @@ w_proc_waxs_panel_delta = pn.widgets.TextInput(
     name="Panel Δ tilt (°)", value="0.0, 0.0, 0.0", width=200,
 )
 w_proc_waxs_theta_zero = pn.widgets.FloatInput(
-    name="θ₀ arc (°)", value=DEFAULT_WAXS_THETA_ZERO_DEG, step=0.1, width=100,
+    name="θ₀ arc (°)", value=DEFAULT_WAXS_THETA_ZERO_DEG, step=0.01, width=100,
 )
 w_proc_waxs_offset_x = pn.widgets.FloatInput(
     name="Sample Δx (mm)", value=DEFAULT_WAXS_SAMPLE_OFFSET_X_MM,
-    step=0.1, width=110,
+    step=0.01, width=110,
 )
 w_proc_waxs_offset_z = pn.widgets.FloatInput(
     name="Sample Δz (mm)", value=DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM,
-    step=0.1, width=110,
+    step=0.01, width=110,
 )
 w_proc_waxs_col_arc_cal = pn.widgets.FloatInput(
     name="col/arc° (cal)", value=0.0, step=0.01, width=100,
 )
 w_proc_waxs_qh_sign = pn.widgets.FloatInput(
-    name="q_h sign", value=DEFAULT_WAXS_Q_HORIZONTAL_SIGN, step=1.0, width=80,
+    name="q_h sign", value=DEFAULT_WAXS_Q_HORIZONTAL_SIGN, step=1.00, width=80,
 )
 w_proc_waxs_qv_sign = pn.widgets.FloatInput(
-    name="q_v sign", value=DEFAULT_WAXS_Q_VERTICAL_SIGN, step=1.0, width=80,
+    name="q_v sign", value=DEFAULT_WAXS_Q_VERTICAL_SIGN, step=1.00, width=80,
 )
 w_proc_waxs_rot_k = pn.widgets.IntInput(
     name="rot90 k", value=DEFAULT_WAXS_ROTATION_K, start=0, end=3, width=80,
@@ -1950,14 +1950,162 @@ w_proc_waxs_rot_k = pn.widgets.IntInput(
 
 # --- Advanced WAXS masking ---
 w_proc_waxs_bsx_ref = pn.widgets.FloatInput(
-    name="BSX ref (mm)", value=0.0, step=0.1, width=110,
+    name="BSX ref (mm)", value=0.0, step=0.01, width=110,
 )
+
+# ---------------------------------------------------------------------------
+# Default-value tracking — grey-out widgets at default, highlight changed
+# ---------------------------------------------------------------------------
+
+_PARAM_DEFAULT_CSS = """
+:host(.param-default) { opacity: 0.45; }
+:host(.param-changed) {
+  opacity: 1.0;
+  border-left: 3px solid #1f77b4;
+  padding-left: 2px;
+}
+"""
+
+# Registry: card-label → [(widget, default_value), ...]
+_CARD_PARAM_REGISTRY: dict[str, list[tuple[Any, Any]]] = {
+    "grid": [
+        (w_proc_nq, DEFAULT_N_Q),
+        (w_proc_nchi, DEFAULT_N_CHI),
+        (w_proc_nqxy, DEFAULT_N_QXY),
+        (w_proc_nqz, DEFAULT_N_QZ),
+    ],
+    "masks": [
+        (w_proc_saxs_mask, DEFAULT_SAXS_MASK),
+        (w_proc_waxs_mask, DEFAULT_WAXS_MASK),
+    ],
+    "saxs_qrange": [
+        (w_proc_saxs_q_cutoff, 0.0),
+        (w_proc_saxs_agbh_ring, DEFAULT_SAXS_AGBH_RING_ORDER),
+        (w_proc_saxs_q_margin, DEFAULT_SAXS_Q_MARGIN_FRACTION),
+    ],
+    "geometry": [
+        (w_proc_saxs_row_delta, DEFAULT_SAXS_ROW_DELTA),
+        (w_proc_saxs_col_delta, DEFAULT_SAXS_COL_DELTA),
+        (w_proc_dist_delta, DEFAULT_SAXS_DIST_DELTA),
+        (w_proc_waxs_row_delta, DEFAULT_WAXS_ROW_DELTA),
+        (w_proc_waxs_col_delta, DEFAULT_WAXS_COL_DELTA),
+        (w_proc_waxs_col_per_arc, DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG),
+    ],
+    "dezinger": [
+        (w_proc_dezinger, DEFAULT_DEZINGER),
+        (w_proc_dezinger_kernel, DEFAULT_DEZINGER_KERNEL),
+    ],
+    "intensity": [
+        (w_proc_solid_angle, DEFAULT_SOLID_ANGLE),
+    ],
+    "gi": [
+        (w_proc_incident_angle, DEFAULT_INCIDENT_ANGLE),
+        (w_proc_incident_angle_auto, True),
+        (w_proc_theta_offset, DEFAULT_THETA_OFFSET),
+        (w_proc_beamstop_max_arc, DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG),
+    ],
+    "backend": [
+        (w_proc_saxs_rotate, False),
+        (w_proc_waxs_flip, False),
+        (w_proc_waxs_qx_shift, 0.0),
+        (w_proc_waxs_qy_shift, 0.0),
+    ],
+    "dynamic_mask": [
+        (w_proc_dynamic_mask, False),
+        (w_proc_dyn_shadow_enabled, True),
+        (w_proc_dyn_shadow_beam_deg, DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG),
+        (w_proc_dyn_shadow_clear_deg, DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG),
+        (w_proc_dyn_aper_enabled, True),
+        (w_proc_dyn_aper_agbh_ring, DEFAULT_DYN_APER_AGBH_RING_ORDER),
+        (w_proc_dyn_aper_q_margin, DEFAULT_DYN_APER_Q_MARGIN_FRACTION),
+        (w_proc_dyn_aper_q_cutoff, 0.0),
+    ],
+    "waxs_cal": [
+        (w_proc_waxs_energy, DEFAULT_WAXS_ENERGY_KEV),
+        (w_proc_waxs_dist, DEFAULT_WAXS_SAMPLE_DIST_MM),
+        (w_proc_waxs_pixel, DEFAULT_WAXS_PIXEL_SIZE_MM),
+        (w_proc_waxs_beam_row, DEFAULT_WAXS_BEAM_CENTER_ROW),
+        (w_proc_waxs_beam_col, DEFAULT_WAXS_BEAM_CENTER_COL),
+        (w_proc_waxs_panel_cols, "(0,206),(206,413),(413,619)"),
+        (w_proc_waxs_panel_offsets, "-7.0, 0.0, 7.0"),
+        (w_proc_waxs_panel_row_shifts, "0.0, 0.0, 0.0"),
+        (w_proc_waxs_panel_col_shifts, "0.0, 0.0, 0.0"),
+        (w_proc_waxs_panel_delta, "0.0, 0.0, 0.0"),
+        (w_proc_waxs_theta_zero, DEFAULT_WAXS_THETA_ZERO_DEG),
+        (w_proc_waxs_offset_x, DEFAULT_WAXS_SAMPLE_OFFSET_X_MM),
+        (w_proc_waxs_offset_z, DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM),
+        (w_proc_waxs_col_arc_cal, 0.0),
+        (w_proc_waxs_qh_sign, DEFAULT_WAXS_Q_HORIZONTAL_SIGN),
+        (w_proc_waxs_qv_sign, DEFAULT_WAXS_Q_VERTICAL_SIGN),
+        (w_proc_waxs_rot_k, DEFAULT_WAXS_ROTATION_K),
+    ],
+    "waxs_mask_adv": [
+        (w_proc_waxs_bsx_ref, 0.0),
+    ],
+}
+
+
+def _is_at_default(widget, default_val) -> bool:
+    """Compare widget value to its default, with tolerance for floats."""
+    val = widget.value
+    if isinstance(val, float) and isinstance(default_val, (int, float)):
+        return abs(val - float(default_val)) < 1e-9
+    return val == default_val
+
+
+def _apply_param_style(widget, default_val) -> None:
+    """Toggle param-default / param-changed CSS class on *widget*."""
+    css = widget.css_classes or []
+    css = [c for c in css if c not in ("param-default", "param-changed")]
+    if _is_at_default(widget, default_val):
+        css.append("param-default")
+    else:
+        css.append("param-changed")
+    widget.css_classes = css
+
+
+def _make_param_watcher(widget, default_val):
+    """Return a callback that re-styles *widget* when its value changes."""
+    def _cb(event):
+        _apply_param_style(widget, default_val)
+    return _cb
+
+
+# Inject stylesheet and wire watchers on every tracked widget
+for _card_key, _entries in _CARD_PARAM_REGISTRY.items():
+    for _w, _dv in _entries:
+        if not hasattr(_w, "stylesheets") or _w.stylesheets is None:
+            _w.stylesheets = [_PARAM_DEFAULT_CSS]
+        else:
+            _w.stylesheets = list(_w.stylesheets) + [_PARAM_DEFAULT_CSS]
+        _apply_param_style(_w, _dv)
+        _w.param.watch(_make_param_watcher(_w, _dv), "value")
+
+
+def _make_restore_defaults_cb(card_key: str):
+    """Return a callback that resets all widgets in *card_key* to defaults."""
+    def _cb(event):
+        for widget, default_val in _CARD_PARAM_REGISTRY[card_key]:
+            widget.value = default_val
+    return _cb
+
+
+_card_restore_buttons: dict[str, pn.widgets.Button] = {}
+for _card_key in _CARD_PARAM_REGISTRY:
+    _btn = pn.widgets.Button(
+        name="↩ Defaults", button_type="light", width=90,
+        margin=(0, 0, 5, 0),
+    )
+    _btn.on_click(_make_restore_defaults_cb(_card_key))
+    _card_restore_buttons[_card_key] = _btn
+
 
 # ---------------------------------------------------------------------------
 # Parameter cards — named so _on_geometry_change can toggle visibility
 # ---------------------------------------------------------------------------
 
 w_card_grid = pn.Card(
+    _card_restore_buttons["grid"],
     w_trans_row,
     w_gi_grid_row,
     title="Output grid",
@@ -1965,6 +2113,7 @@ w_card_grid = pn.Card(
 )
 
 w_card_masks = pn.Card(
+    _card_restore_buttons["masks"],
     pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
     pn.pane.Markdown(
         "*Leave blank to use the bundled PyHyperScattering defaults.  "
@@ -1976,6 +2125,7 @@ w_card_masks = pn.Card(
 )
 
 w_card_saxs_qrange = pn.Card(
+    _card_restore_buttons["saxs_qrange"],
     pn.Row(w_proc_saxs_q_cutoff, w_proc_saxs_agbh_ring, w_proc_saxs_q_margin),
     pn.pane.Markdown(
         "*q cutoff = 0 → auto from silver behenate calibration.  "
@@ -1986,6 +2136,7 @@ w_card_saxs_qrange = pn.Card(
 )
 
 w_card_geometry = pn.Card(
+    _card_restore_buttons["geometry"],
     w_saxs_geom_section,
     pn.pane.Markdown("**WAXS beam-centre Δ (px)**"),
     pn.Row(w_proc_waxs_row_delta, w_proc_waxs_col_delta, w_proc_waxs_col_per_arc),
@@ -1999,6 +2150,7 @@ w_card_geometry = pn.Card(
 )
 
 w_card_dezinger = pn.Card(
+    _card_restore_buttons["dezinger"],
     pn.Row(w_proc_dezinger, w_proc_dezinger_kernel),
     pn.pane.Markdown(
         "*σ = 0 disables hot-pixel rejection.  Kernel is the median-filter "
@@ -2009,12 +2161,14 @@ w_card_dezinger = pn.Card(
 )
 
 w_card_intensity = pn.Card(
+    _card_restore_buttons["intensity"],
     w_proc_solid_angle,
     title="Intensity corrections",
     collapsed=False, sizing_mode="stretch_width",
 )
 
 w_card_gi = pn.Card(
+    _card_restore_buttons["gi"],
     pn.Row(
         w_proc_incident_angle, w_proc_incident_angle_auto,
         w_proc_theta_offset,
@@ -2030,6 +2184,7 @@ w_card_gi = pn.Card(
 )
 
 w_card_backend = pn.Card(
+    _card_restore_buttons["backend"],
     pn.Row(w_proc_saxs_rotate, w_proc_waxs_flip),
     pn.Row(w_proc_waxs_qx_shift, w_proc_waxs_qy_shift),
     pn.pane.Markdown(
@@ -2041,6 +2196,7 @@ w_card_backend = pn.Card(
 )
 
 w_card_dynamic_mask = pn.Card(
+    _card_restore_buttons["dynamic_mask"],
     w_proc_dynamic_mask,
     pn.pane.Markdown("**WAXS shadow on SAXS**"),
     pn.Row(
@@ -2061,6 +2217,7 @@ w_card_dynamic_mask = pn.Card(
 )
 
 w_card_waxs_cal = pn.Card(
+    _card_restore_buttons["waxs_cal"],
     pn.Row(w_proc_waxs_energy, w_proc_waxs_dist, w_proc_waxs_pixel),
     pn.Row(w_proc_waxs_beam_row, w_proc_waxs_beam_col),
     w_proc_waxs_panel_cols,
@@ -2083,6 +2240,7 @@ w_card_waxs_cal = pn.Card(
 )
 
 w_card_waxs_mask_adv = pn.Card(
+    _card_restore_buttons["waxs_mask_adv"],
     pn.Row(w_proc_waxs_bsx_ref),
     pn.pane.Markdown(
         "*BSX ref = 0 → auto-derived from metadata.  "
@@ -3264,34 +3422,17 @@ def _on_process(event):
     try:
         t0 = time.perf_counter()
 
-        if geometry == "grazing":
-            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+        # Use _build_proc_params() for both GI and transmission so the
+        # printed command and actual kwargs always stay in sync.
+        reduce_fn, call_params, _geom_label = _build_proc_params(uid)
 
-            # Build kwargs, omitting (or sending None for) any value that
-            # still matches the upstream PyHyper default.
-            gi_params: dict[str, Any] = dict(
-                uid=uid,
-                tiled_uri=DEFAULT_TILED_URI,
-                catalog=DEFAULT_CATALOG,
-                waxs_mask_path=w_proc_waxs_mask.value or None,
-            )
-            if w_proc_nqxy.value != DEFAULT_N_QXY:
-                gi_params["n_qxy"] = w_proc_nqxy.value
-            if w_proc_nqz.value != DEFAULT_N_QZ:
-                gi_params["n_qz"] = w_proc_nqz.value
-            if w_proc_theta_offset.value != DEFAULT_THETA_OFFSET:
-                gi_params["theta_offset"] = w_proc_theta_offset.value
-            if w_proc_dezinger.value != DEFAULT_DEZINGER:
-                gi_params["dezinger_threshold"] = (
-                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                )
-            if not w_proc_incident_angle_auto.value:
-                gi_params["incident_angle_deg"] = w_proc_incident_angle.value
+        if geometry == "grazing":
+            gi_params = call_params
 
             _args_str = ", ".join(f"{k}={v!r}" for k, v in gi_params.items())
             print(f"\n>>> reduce_smi_gi({_args_str})\n")
 
-            gi_result = reduce_smi_gi(**gi_params)
+            gi_result = reduce_fn(**gi_params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["gi_result"] = gi_result
@@ -3321,55 +3462,12 @@ def _on_process(event):
 
         else:
             # Transmission mode
-            from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
-
-            # Build kwargs, omitting (or sending None for) any value that
-            # still matches the upstream PyHyper / loader default so the
-            # loader can fill in its own calibrated values.
-            params: dict[str, Any] = dict(
-                uid=uid,
-                tiled_uri=DEFAULT_TILED_URI,
-                catalog=DEFAULT_CATALOG,
-                solid_angle_correction=True,
-                geometry=geometry,
-                saxs_mask_path=w_proc_saxs_mask.value or None,
-                waxs_mask_path=w_proc_waxs_mask.value or None,
-                cache_geometry=w_cache_enabled.value,
-            )
-            if w_proc_nq.value != DEFAULT_N_Q:
-                params["n_q"] = w_proc_nq.value
-            else:
-                params["n_q"] = DEFAULT_N_Q  # smi-browser keeps 2000 default
-            if w_proc_nchi.value != DEFAULT_N_CHI:
-                params["n_chi"] = w_proc_nchi.value
-
-            # Beam-centre Δ — only send if the user changed at least one
-            # axis from the loader's calibrated default.
-            saxs_row_changed = w_proc_saxs_row_delta.value != DEFAULT_SAXS_ROW_DELTA
-            saxs_col_changed = w_proc_saxs_col_delta.value != DEFAULT_SAXS_COL_DELTA
-            if saxs_row_changed or saxs_col_changed:
-                params["saxs_beam_delta_px"] = (
-                    w_proc_saxs_row_delta.value,
-                    w_proc_saxs_col_delta.value,
-                )
-            waxs_row_changed = w_proc_waxs_row_delta.value != DEFAULT_WAXS_ROW_DELTA
-            waxs_col_changed = w_proc_waxs_col_delta.value != DEFAULT_WAXS_COL_DELTA
-            if waxs_row_changed or waxs_col_changed:
-                params["waxs_beam_delta_px"] = (
-                    w_proc_waxs_row_delta.value,
-                    w_proc_waxs_col_delta.value,
-                )
-            if w_proc_dist_delta.value != DEFAULT_SAXS_DIST_DELTA:
-                params["saxs_distance_delta_mm"] = w_proc_dist_delta.value
-            if w_proc_dezinger.value != DEFAULT_DEZINGER:
-                params["dezinger_threshold"] = (
-                    w_proc_dezinger.value if w_proc_dezinger.value > 0 else None
-                )
+            params = call_params
 
             _args_str = ", ".join(f"{k}={v!r}" for k, v in params.items())
             print(f"\n>>> reduce_smi_combined({_args_str})\n")
 
-            result = reduce_smi_combined(**params)
+            result = reduce_fn(**params)
             dt = time.perf_counter() - t0
 
             _proc_result_cache["result"] = result
@@ -4559,6 +4657,10 @@ _proposal_map: dict[str, nsls2api.ProposalInfo] = {}  # data_session → info
 w_proposal_cycle = pn.widgets.Select(
     name="Cycle", options=["(loading…)"], value="(loading…)", width=110,
 )
+w_proposal_all = pn.widgets.Checkbox(
+    name="All proposals", value=False, width=120,
+    margin=(25, 0, 0, 5),
+)
 w_proposal_select = pn.widgets.Select(
     name="Data session", options=["(select cycle first)"],
     value="(select cycle first)", width=320,
@@ -4572,11 +4674,11 @@ w_proposal_spinner = pn.indicators.LoadingSpinner(
 )
 
 proposal_card = pn.Card(
-    pn.Row(w_proposal_cycle, w_proposal_spinner),
+    pn.Row(w_proposal_cycle, w_proposal_all, w_proposal_spinner),
     w_proposal_select,
     w_proposal_project,
     w_proposal_status,
-    title="📋 My Proposals",
+    title="📋 Proposals",
     collapsed=False,
     sizing_mode="stretch_width",
     margin=(0, 0, 5, 0),
@@ -4615,7 +4717,11 @@ def _refresh_proposals(cycle: str | None = None):
 
     try:
         cycle_filter = cycle if cycle and cycle != "All cycles" else None
-        proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
+        if w_proposal_all.value and cycle_filter:
+            # Fetch ALL beamline proposals for this cycle (beamline-scientist mode)
+            proposals = nsls2api.build_cycle_proposal_list(cycle_filter)
+        else:
+            proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
     except Exception as exc:
         log.warning("Proposal fetch failed: %s", exc)
         w_proposal_select.options = ["(error loading)"]
@@ -4778,6 +4884,7 @@ def _on_project_select(*_events):
 w_proposal_cycle.param.watch(_on_cycle_change, "value")
 w_proposal_select.param.watch(_on_proposal_select, "value")
 w_proposal_project.param.watch(_on_project_select, "value")
+w_proposal_all.param.watch(lambda *_: _refresh_proposals(w_proposal_cycle.value), "value")
 
 search_card = pn.Card(
     w_filter_column,

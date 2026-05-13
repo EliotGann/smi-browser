@@ -6,6 +6,7 @@ are unauthenticated (no API key needed for the read endpoints used here).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -134,6 +135,22 @@ def fetch_commissioning_proposals(beamline: str = BEAMLINE) -> list[str]:
         return []
 
 
+def fetch_proposal_directory(proposal_id: str) -> str | None:
+    """Return the filesystem path for a proposal's working directory.
+
+    Calls ``GET /v1/proposal/{id}/directories`` and returns the first
+    directory path, or *None* if unavailable.
+    """
+    try:
+        data = _get(f"/proposal/{proposal_id}/directories")
+        dirs = data.get("directories", [])
+        if dirs:
+            return dirs[0].get("path")
+    except Exception:
+        log.debug("Failed to fetch directory for proposal %s", proposal_id)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # High-level: build enriched proposal list for a user
 # ---------------------------------------------------------------------------
@@ -228,5 +245,86 @@ def build_proposal_list(
         ))
 
     # Sort newest first (higher proposal_id = newer)
+    results.sort(key=lambda p: p.proposal_id, reverse=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# High-level: build full beamline proposal list for a cycle
+# ---------------------------------------------------------------------------
+
+def build_cycle_proposal_list(
+    cycle: str,
+    beamline: str = BEAMLINE,
+    max_workers: int = 20,
+) -> list[ProposalInfo]:
+    """Build a list of ALL proposals for a beamline in a given cycle.
+
+    This fetches every proposal in the cycle concurrently and filters
+    by instrument.  Useful for beamline scientists who have access to
+    all proposals but aren't explicitly listed on each one.
+
+    Parameters
+    ----------
+    cycle : str
+        The cycle name, e.g. '2026-1'.
+    beamline : str
+        Beamline name to filter by (default: SMI).
+    max_workers : int
+        Concurrency for API calls.
+
+    Returns
+    -------
+    list[ProposalInfo]
+        Sorted by proposal_id descending (most recent first).
+    """
+    if cycle.lower() == "commissioning":
+        proposal_ids = fetch_commissioning_proposals(beamline)
+    else:
+        proposal_ids = fetch_proposals_for_cycle(cycle)
+
+    if not proposal_ids:
+        return []
+
+    def _fetch_and_filter(pid: str) -> ProposalInfo | None:
+        """Fetch a single proposal; return ProposalInfo if it matches beamline."""
+        try:
+            prop = fetch_proposal(pid)
+            if not prop:
+                return None
+            instruments = [i.upper() for i in prop.get("instruments", [])]
+            if beamline.upper() not in instruments:
+                return None
+
+            # Extract PI name
+            pi_name = "?"
+            for u in prop.get("users", []):
+                if u.get("is_pi"):
+                    pi_name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                    break
+            if pi_name == "?":
+                pi = fetch_pi(pid)
+                if pi:
+                    pi_name = f"{pi.get('first_name', '')} {pi.get('last_name', '')}".strip()
+
+            return ProposalInfo(
+                proposal_id=pid,
+                data_session=prop.get("data_session", f"pass-{pid}"),
+                title=prop.get("title", "(no title)"),
+                pi_name=pi_name,
+                cycles=prop.get("cycles", []),
+            )
+        except Exception:
+            log.debug("Failed to fetch/filter proposal %s", pid)
+            return None
+
+    results: list[ProposalInfo] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_and_filter, pid): pid for pid in proposal_ids}
+        for future in concurrent.futures.as_completed(futures):
+            info = future.result()
+            if info is not None:
+                results.append(info)
+
     results.sort(key=lambda p: p.proposal_id, reverse=True)
     return results
