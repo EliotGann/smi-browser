@@ -224,7 +224,8 @@ class ScanCollection:
         return fig
 
     def iq_comparison_bokeh(self, uids: list[str] | None = None,
-                            label_column: str | None = None):
+                            label_column: str | None = None,
+                            plot_style: str = "markers"):
         """Bokeh figure overlaying I(q) for selected uids (or all).
 
         Uses stored per-scan colours (matching the table swatch) and
@@ -272,19 +273,30 @@ class ScanCollection:
             I = iq["I"].values
             mask = np.isfinite(I) & (I > 0)
             if mask.any():
-                r = p.line(
-                    q[mask], I[mask],
-                    line_width=1.2, line_alpha=0.4,
-                    color=color, name=label,
-                )
-                # Set hover glyph properties individually to avoid
-                # Bokeh 3.x Value() wrapper serialization issues.
-                hover_glyph = BkLine()
-                hover_glyph.line_color = color
-                hover_glyph.line_alpha = 1.0
-                hover_glyph.line_width = 3.5
-                r.hover_glyph = hover_glyph
-                renderers.append(r)
+                r = None
+                if plot_style in ("line", "both"):
+                    r = p.line(
+                        q[mask], I[mask],
+                        line_width=1.2, line_alpha=0.4,
+                        color=color, name=label,
+                    )
+                if plot_style in ("markers", "both"):
+                    r_s = p.scatter(
+                        q[mask], I[mask],
+                        size=4, alpha=0.4,
+                        color=color, name=label,
+                    )
+                    if r is None:
+                        r = r_s
+                if r is not None:
+                    # Set hover glyph properties individually to avoid
+                    # Bokeh 3.x Value() wrapper serialization issues.
+                    hover_glyph = BkLine()
+                    hover_glyph.line_color = color
+                    hover_glyph.line_alpha = 1.0
+                    hover_glyph.line_width = 3.5
+                    r.hover_glyph = hover_glyph
+                    renderers.append(r)
 
         p.xaxis.axis_label = "q (nm⁻¹)"
         p.yaxis.axis_label = "I(q)"

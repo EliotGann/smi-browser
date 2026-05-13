@@ -28,6 +28,8 @@ def plot_2d_transmission(result, frame_idx=None):
         img = img.T
 
     display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    # Keep NaNs for cuts so nanmean excludes masked pixels properly
+    cuts_image = np.where(np.isfinite(img), img, np.nan).astype(np.float64)
     finite = img[np.isfinite(img) & (img > 0)]
     if finite.size:
         vlo = max(float(np.percentile(finite, 2)), 1e-6)
@@ -54,7 +56,7 @@ def plot_2d_transmission(result, frame_idx=None):
     p.xaxis.axis_label = "q (nm⁻¹)"
     p.yaxis.axis_label = "χ (°)"
 
-    return p, q, chi, display, "q (nm⁻¹)", "χ (°)", title
+    return p, q, chi, cuts_image, "q (nm⁻¹)", "χ (°)", title
 
 
 def plot_2d_gi(gi_result, frame_idx=None):
@@ -77,6 +79,8 @@ def plot_2d_gi(gi_result, frame_idx=None):
     qz = gi_result.qz_grid
 
     display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    # Keep NaNs for cuts so nanmean excludes masked pixels properly
+    cuts_image = np.where(np.isfinite(img), img, np.nan).astype(np.float64)
     finite = img[np.isfinite(img) & (img > 0)]
     if finite.size:
         vlo = max(float(np.percentile(finite, 2)), 1e-6)
@@ -103,4 +107,4 @@ def plot_2d_gi(gi_result, frame_idx=None):
     p.xaxis.axis_label = "q_xy (nm⁻¹)"
     p.yaxis.axis_label = "q_z (nm⁻¹)"
 
-    return p, qxy, qz, display.T, "q_xy (nm⁻¹)", "q_z (nm⁻¹)", title
+    return p, qxy, qz, cuts_image.T, "q_xy (nm⁻¹)", "q_z (nm⁻¹)", title

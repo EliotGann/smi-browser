@@ -87,9 +87,29 @@ def connect(uri: str = TILED_URI, catalog: str = CATALOG):
     tiled catalog node (lazy).
     """
     import httpx
-    from tiled.client import from_uri
+    from tiled.client.context import Context
 
-    root = from_uri(uri, timeout=httpx.Timeout(60.0))
+    # Build a context without triggering interactive authentication.
+    # If cached tokens exist they will be used; otherwise the connection
+    # raises so the GUI can prompt for credentials.
+    context, node_path_parts = Context.from_any_uri(
+        uri, timeout=httpx.Timeout(60.0),
+    )
+    # Try to load cached tokens (saved from a previous session).
+    if context.server_info.authentication.providers:
+        context.use_cached_tokens()
+    # Prevent from_context from falling into interactive terminal prompts.
+    # We mark external auth so it skips context.authenticate(); the GUI
+    # login form handles credentials instead.
+    context.has_external_auth = True
+
+    from tiled.client.constructors import from_context
+    root = from_context(
+        context,
+        structure_clients="numpy",
+        node_path_parts=node_path_parts,
+        remember_me=True,
+    )
     for part in catalog.split("/"):
         root = root[part]
     return root

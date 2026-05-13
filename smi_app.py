@@ -2295,6 +2295,13 @@ w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=
 w_proc_frame_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, width=400,
 )
+
+# Plot style selector — controls line cuts, 1D I(q), and collection plots
+_PLOT_STYLES = ["markers", "line", "both"]
+w_plot_style = pn.widgets.Select(
+    name="Plot style", options=_PLOT_STYLES, value="markers", width=120,
+)
+
 _proc_result_cache = {"result": None, "gi_result": None}
 
 # Guard: suppress _update_proc_2d while _on_process is building its own plot
@@ -2486,6 +2493,16 @@ def _refresh_cuts_table():
                           if rows else pd.DataFrame(columns=cols))
 
 
+def _add_trace(fig, x, y, *, color, width=1.2, alpha=1.0, legend_label=None, size=4):
+    """Add a trace to a Bokeh figure respecting the current plot style setting."""
+    style = w_plot_style.value
+    kw = dict(legend_label=legend_label) if legend_label else {}
+    if style in ("line", "both"):
+        fig.line(x, y, line_color=color, line_width=width, alpha=alpha, **kw)
+    if style in ("markers", "both"):
+        fig.scatter(x, y, color=color, size=size, alpha=alpha, **kw)
+
+
 def _render_cuts_plot():
     """Redraw cross-section plots: separate axes for h and v cuts."""
     from bokeh.plotting import figure as bk_figure
@@ -2523,9 +2540,9 @@ def _render_cuts_plot():
             if not np.any(finite):
                 continue
             alpha = max(0.4, 1.0 - 0.15 * i)
-            p_h.line(axis[finite], section[finite],
-                     line_color=_CUT_FILL["h"], line_width=1.4, alpha=alpha,
-                     legend_label=_format_cut_label(i, cut))
+            _add_trace(p_h, axis[finite], section[finite],
+                       color=_CUT_FILL["h"], width=1.4, alpha=alpha,
+                       legend_label=_format_cut_label(i, cut))
             plotted = True
         if plotted:
             p_h.xaxis.axis_label = _proc_2d_cache["x_label"]
@@ -2552,9 +2569,9 @@ def _render_cuts_plot():
             if not np.any(finite):
                 continue
             alpha = max(0.4, 1.0 - 0.15 * i)
-            p_v.line(axis[finite], section[finite],
-                     line_color=_CUT_FILL["v"], line_width=1.4, alpha=alpha,
-                     legend_label=_format_cut_label(i, cut))
+            _add_trace(p_v, axis[finite], section[finite],
+                       color=_CUT_FILL["v"], width=1.4, alpha=alpha,
+                       legend_label=_format_cut_label(i, cut))
             plotted = True
         if plotted:
             p_v.xaxis.axis_label = _proc_2d_cache["y_label"]
@@ -2698,6 +2715,13 @@ def _on_cuts_log_change(*_events):
 w_cuts_log_x.param.watch(_on_cuts_log_change, "value")
 w_cuts_log_y.param.watch(_on_cuts_log_change, "value")
 
+
+def _on_plot_style_change(*_events):
+    _render_cuts_plot()
+
+
+w_plot_style.param.watch(_on_plot_style_change, "value")
+
 w_cuts_table = pn.widgets.Tabulator(
     value=pd.DataFrame(columns=["#", "kind", "center", "width"]),
     show_index=False, sizing_mode="stretch_width", height=160,
@@ -2716,7 +2740,7 @@ w_btn_clear_cuts.on_click(_on_clear_cuts)
 # Widgets — Collection (delegated to smi_browser.ui.collection)
 # ---------------------------------------------------------------------------
 
-_coll_ns = _coll_mod.wire(_collection)
+_coll_ns = _coll_mod.wire(_collection, plot_style_widget=w_plot_style)
 
 w_coll_table = _coll_ns.coll_table
 w_btn_coll_remove = _coll_ns.btn_remove
@@ -2748,6 +2772,8 @@ def _plot_2d_transmission(result, frame_idx=None):
         img = img.T
 
     display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    # Keep NaNs for cuts so nanmean excludes masked pixels properly
+    cuts_image = np.where(np.isfinite(img), img, np.nan).astype(np.float64)
     finite = img[np.isfinite(img) & (img > 0)]
     if finite.size:
         vlo = max(float(np.percentile(finite, 2)), 1e-6)
@@ -2769,7 +2795,7 @@ def _plot_2d_transmission(result, frame_idx=None):
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
     p.xaxis.axis_label = "q (nm⁻¹)"
     p.yaxis.axis_label = "χ (°)"
-    _attach_cuts_to_figure(p, q, chi, display,
+    _attach_cuts_to_figure(p, q, chi, cuts_image,
                            x_label="q (nm⁻¹)", y_label="χ (°)", title=title)
     return p
 
@@ -2791,6 +2817,8 @@ def _plot_2d_gi(gi_result, frame_idx=None):
     qz = gi_result.qz_grid
 
     display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    # Keep NaNs for cuts so nanmean excludes masked pixels properly
+    cuts_image = np.where(np.isfinite(img), img, np.nan).astype(np.float64)
     finite = img[np.isfinite(img) & (img > 0)]
     if finite.size:
         vlo = max(float(np.percentile(finite, 2)), 1e-6)
@@ -2813,7 +2841,7 @@ def _plot_2d_gi(gi_result, frame_idx=None):
     p.add_layout(ColorBar(color_mapper=mapper, label_standoff=8, width=12), "right")
     p.xaxis.axis_label = "q_xy (nm⁻¹)"
     p.yaxis.axis_label = "q_z (nm⁻¹)"
-    _attach_cuts_to_figure(p, qxy, qz, display.T,
+    _attach_cuts_to_figure(p, qxy, qz, cuts_image.T,
                            x_label="q_xy (nm⁻¹)", y_label="q_z (nm⁻¹)",
                            title=title)
     return p
@@ -3515,17 +3543,17 @@ def _on_process(event):
 
             mask = np.isfinite(I) & (I > 0)
             if mask.any():
-                p.line(q[mask], I[mask], line_color="black", line_width=1.2, legend_label="merged")
+                _add_trace(p, q[mask], I[mask], color="black", width=1.2, legend_label="merged")
             if "saxs_I" in iq:
                 sI = iq["saxs_I"].values
                 sm = np.isfinite(sI) & (sI > 0)
                 if sm.any():
-                    p.line(q[sm], sI[sm], line_color="blue", line_width=0.8, alpha=0.6, legend_label="SAXS")
+                    _add_trace(p, q[sm], sI[sm], color="blue", width=0.8, alpha=0.6, legend_label="SAXS")
             if "waxs_I" in iq:
                 wI = iq["waxs_I"].values
                 wm = np.isfinite(wI) & (wI > 0)
                 if wm.any():
-                    p.line(q[wm], wI[wm], line_color="red", line_width=0.8, alpha=0.6, legend_label="WAXS")
+                    _add_trace(p, q[wm], wI[wm], color="red", width=0.8, alpha=0.6, legend_label="WAXS")
             p.xaxis.axis_label = "q (nm⁻¹)"
             p.yaxis.axis_label = "I(q)"
             p.legend.click_policy = "hide"
@@ -4195,9 +4223,12 @@ _live: dict[str, Any] = {
 def _tiled_whoami() -> str | None:
     """Return the username for the currently cached tiled session, or None."""
     try:
-        from tiled.client import from_uri
-        client = from_uri(DEFAULT_TILED_URI)
-        info = client.context.whoami()
+        from tiled.client.context import Context
+
+        context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
+        if not context.use_cached_tokens():
+            return None
+        info = context.whoami()
     except Exception:
         return None
     if not info:
@@ -4214,29 +4245,27 @@ def _tiled_login(username: str, password: str) -> str:
 
     Returns the logged-in username on success; raises on failure.
     """
-    from tiled.client import from_uri
-    from tiled.client.context import password_grant
+    from tiled.client.context import Context, password_grant
 
     if not username or not password:
         raise ValueError("Username and password are required.")
 
-    client = from_uri(DEFAULT_TILED_URI)
-    ctx = client.context
-    providers = ctx.server_info.authentication.providers
+    context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
+    providers = context.server_info.authentication.providers
     if not providers:
         raise RuntimeError("Tiled server reports no authentication providers.")
     spec = providers[0]
     auth_endpoint = spec.links["auth_endpoint"]
     tokens = password_grant(
-        ctx.http_client, auth_endpoint, spec.provider, username, password,
+        context.http_client, auth_endpoint, spec.provider, username, password,
     )
-    ctx.configure_auth(tokens, remember_me=True)
+    context.configure_auth(tokens, remember_me=True)
 
     # Drop the cached catalog so the next access uses the refreshed tokens.
     global _cat
     _cat = None
 
-    info = ctx.whoami()
+    info = context.whoami()
     identities = (info or {}).get("identities") or []
     return identities[0]["id"] if identities else username
 
@@ -4244,17 +4273,16 @@ def _tiled_login(username: str, password: str) -> str:
 def _tiled_logout() -> None:
     """Clear the cached tiled session for this server."""
     try:
-        from tiled.client import from_uri
-        client = from_uri(DEFAULT_TILED_URI)
-        try:
-            client.logout()
-        except Exception:
-            # logout() can fail if there's no live session; clear cache anyway.
-            pass
-        try:
-            client.context.tokens.clear()
-        except Exception:
-            pass
+        from tiled.client.context import Context
+
+        context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
+        if context.use_cached_tokens():
+            try:
+                context.logout()
+            except Exception:
+                pass
+    except Exception:
+        pass
     finally:
         global _cat
         _cat = None
@@ -4327,6 +4355,11 @@ def _on_login_submit(event=None):
         _refresh_login_status()
         # Load proposals for the newly logged-in user
         _refresh_proposals(w_proposal_cycle.value)
+        # Trigger a search now that we have credentials
+        try:
+            _do_search(page=0)
+        except Exception:
+            pass
         try:
             pn.state.notifications.success(f"Tiled login OK ({user})")
         except Exception:
@@ -5005,7 +5038,7 @@ w_detail_tabs = pn.Tabs(
                                 "every newly processed result.*",
                             ),
                             pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts,
-                                   w_cuts_log_x, w_cuts_log_y),
+                                   w_cuts_log_x, w_cuts_log_y, w_plot_style),
                             w_cuts_table,
                             w_proc_cuts_plot,
                             title="\u2702 Cross sections",
@@ -5205,7 +5238,11 @@ def _startup_search():
         search_card.collapsed = True
     except Exception as exc:
         log.warning("startup search failed: %s", exc)
-        w_status.object = "*Ready — add filters and press Search*"
+        msg = str(exc)
+        if "401" in msg or "Unauthorized" in msg or "permissions" in msg.lower():
+            w_status.object = "🔒 **Login required** — use the Login button above"
+        else:
+            w_status.object = "*Ready — add filters and press Search*"
     finally:
         w_search_spinner.value = False
         w_search_spinner.visible = False

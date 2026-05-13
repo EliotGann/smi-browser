@@ -20,9 +20,12 @@ log = logging.getLogger(__name__)
 def tiled_whoami(tiled_uri: str) -> str | None:
     """Return the username for the currently cached tiled session, or None."""
     try:
-        from tiled.client import from_uri
-        client = from_uri(tiled_uri)
-        info = client.context.whoami()
+        from tiled.client.context import Context
+
+        context, _ = Context.from_any_uri(tiled_uri)
+        if not context.use_cached_tokens():
+            return None
+        info = context.whoami()
     except Exception:
         return None
     if not info:
@@ -39,25 +42,23 @@ def tiled_login(tiled_uri: str, username: str, password: str) -> str:
 
     Returns the logged-in username on success; raises on failure.
     """
-    from tiled.client import from_uri
-    from tiled.client.context import password_grant
+    from tiled.client.context import Context, password_grant
 
     if not username or not password:
         raise ValueError("Username and password are required.")
 
-    client = from_uri(tiled_uri)
-    ctx = client.context
-    providers = ctx.server_info.authentication.providers
+    context, _ = Context.from_any_uri(tiled_uri)
+    providers = context.server_info.authentication.providers
     if not providers:
         raise RuntimeError("Tiled server reports no authentication providers.")
     spec = providers[0]
     auth_endpoint = spec.links["auth_endpoint"]
     tokens = password_grant(
-        ctx.http_client, auth_endpoint, spec.provider, username, password,
+        context.http_client, auth_endpoint, spec.provider, username, password,
     )
-    ctx.configure_auth(tokens, remember_me=True)
+    context.configure_auth(tokens, remember_me=True)
 
-    info = ctx.whoami()
+    info = context.whoami()
     identities = (info or {}).get("identities") or []
     return identities[0]["id"] if identities else username
 
@@ -65,16 +66,14 @@ def tiled_login(tiled_uri: str, username: str, password: str) -> str:
 def tiled_logout(tiled_uri: str) -> None:
     """Clear the cached tiled session for this server."""
     try:
-        from tiled.client import from_uri
-        client = from_uri(tiled_uri)
-        try:
-            client.logout()
-        except Exception:
-            pass
-        try:
-            client.context.tokens.clear()
-        except Exception:
-            pass
+        from tiled.client.context import Context
+
+        context, _ = Context.from_any_uri(tiled_uri)
+        if context.use_cached_tokens():
+            try:
+                context.logout()
+            except Exception:
+                pass
     except Exception:
         pass
 

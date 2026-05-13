@@ -35,7 +35,7 @@ _COLL_COLS = [
 # ---------------------------------------------------------------------------
 
 
-def wire(collection: ScanCollection) -> SimpleNamespace:
+def wire(collection: ScanCollection, plot_style_widget=None) -> SimpleNamespace:
     """Create collection widgets and connect them to *collection*.
 
     Returns a ``SimpleNamespace`` with attributes:
@@ -128,8 +128,10 @@ def wire(collection: ScanCollection) -> SimpleNamespace:
             return
         uids = [df.iloc[i]["uid"] for i in sel if i < len(df)]
         label_col = label_select.value if label_select.value != "(none)" else None
+        style = plot_style_widget.value if plot_style_widget else "markers"
         try:
-            fig = collection.iq_comparison_bokeh(uids, label_column=label_col)
+            fig = collection.iq_comparison_bokeh(uids, label_column=label_col,
+                                                 plot_style=style)
             compare_plot.object = fig
         except Exception:
             log.exception("_update_compare failed")
@@ -142,6 +144,8 @@ def wire(collection: ScanCollection) -> SimpleNamespace:
     coll_table.param.watch(_update_compare, "selection")
     label_select.param.watch(_on_label_change, "value")
     btn_remove.on_click(_on_remove)
+    if plot_style_widget is not None:
+        plot_style_widget.param.watch(lambda *_: _update_compare(), "value")
 
     return SimpleNamespace(
         coll_table=coll_table,
