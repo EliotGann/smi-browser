@@ -2327,6 +2327,14 @@ w_proc_frame_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, width=400,
 )
 
+# Display mode: merged (summed 2D + averaged I(q)) vs per-frame (slider + individual curves)
+w_proc_iq_mode = pn.widgets.RadioButtonGroup(
+    name="Display mode", options=["merged", "per-frame"], value="merged", width=200,
+)
+w_proc_iq_label = pn.widgets.Select(
+    name="Frame label", options=["(frame #)"], value="(frame #)", width=180,
+)
+
 # Plot style selector — controls line cuts, 1D I(q), and collection plots
 _PLOT_STYLES = ["markers", "line", "both"]
 w_plot_style = pn.widgets.Select(
@@ -2890,11 +2898,246 @@ def _update_proc_2d(event):
             w_proc_2d_plot.object = _plot_2d_gi(gi, frame_idx=idx)
         elif trans is not None:
             w_proc_2d_plot.object = _plot_2d_transmission(trans, frame_idx=idx)
+        # Update frame slider label
+        _update_frame_slider_label()
     except Exception as exc:
         log.warning("2D plot update failed: %s", exc)
 
 
 w_proc_frame_slider.param.watch(_update_proc_2d, "value")
+
+
+def _get_frame_labels():
+    """Build a list of frame labels using primary scalars and the selected label column."""
+    label_col = w_proc_iq_label.value
+    result = _proc_result_cache.get("result")
+    if result is None:
+        return []
+    # Determine number of frames
+    pf_iq = getattr(result, "per_frame_iq", None)
+    qchi = getattr(result, "merged_qchi", None)
+    if pf_iq is not None and "frame" in pf_iq.dims:
+        n_frames = pf_iq.sizes["frame"]
+    elif qchi is not None and "frame" in qchi.dims:
+        n_frames = qchi.sizes["frame"]
+    else:
+        return ["merged"]
+    if not label_col or label_col == "(frame #)":
+        return [f"frame {i}" for i in range(n_frames)]
+    # Prefer bundled primary scalars from per_frame_iq
+    vals = None
+    if pf_iq is not None and label_col in pf_iq.data_vars:
+        vals = pf_iq[label_col].values
+    else:
+        # Fallback to primary table
+        df = w_primary_table.value
+        if df is not None and label_col in df.columns:
+            vals = df[label_col].values
+    if vals is not None:
+        labels = []
+        for i in range(n_frames):
+            if i < len(vals):
+                try:
+                    labels.append(f"{label_col}={float(vals[i]):.4g}")
+                except (ValueError, TypeError):
+                    labels.append(f"{label_col}={vals[i]}")
+            else:
+                labels.append(f"frame {i}")
+        return labels
+    return [f"frame {i}" for i in range(n_frames)]
+
+
+def _build_proc_iq_plot():
+    """Build the I(q) Bokeh figure in either merged or per-frame mode."""
+    from bokeh.plotting import figure as bk_figure
+
+    result = _proc_result_cache.get("result")
+    if result is None or not hasattr(result, "merged_iq"):
+        w_proc_iq_plot.object = None
+        return
+
+    iq = result.merged_iq
+    mode = w_proc_iq_mode.value
+    uid = _state.get("selected_uid") or ""
+
+    if mode == "per-frame" and hasattr(result, "per_frame_iq") and result.per_frame_iq is not None:
+        # Per-frame I(q) from PyHyper (preferred path)
+        pf_iq = result.per_frame_iq
+        q = pf_iq["q"].values
+        frame_labels = _get_frame_labels()
+        n_frames = pf_iq.sizes.get("frame", 1)
+
+        # Use a perceptually-spaced colormap for many frames
+        from bokeh.palettes import Category10, Turbo256
+        if n_frames <= 10:
+            colors = Category10[max(3, n_frames)][:n_frames]
+        else:
+            step = max(1, len(Turbo256) // n_frames)
+            colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
+
+        p = bk_figure(
+            title=f"{uid[:8]} — per-frame I(q)",
+            width=1000, height=400,
+            x_axis_type="log", y_axis_type="log",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+        )
+        for i in range(n_frames):
+            I_frame = pf_iq["I"].isel(frame=i).values
+            mask = np.isfinite(I_frame) & (I_frame > 0)
+            if mask.any():
+                lbl = frame_labels[i] if i < len(frame_labels) else f"frame {i}"
+                _add_trace(p, q[mask], I_frame[mask], color=colors[i],
+                           width=0.9, alpha=0.8, legend_label=lbl)
+        p.xaxis.axis_label = "q (nm⁻¹)"
+        p.yaxis.axis_label = "I(q)"
+        if n_frames <= 20:
+            p.legend.click_policy = "hide"
+            p.legend.label_text_font_size = "8pt"
+        else:
+            p.legend.visible = False
+        w_proc_iq_plot.object = p
+
+    elif mode == "per-frame":
+        # Fallback: per-frame from merged_qchi by integrating over chi
+        qchi = getattr(result, "merged_qchi", None)
+        if qchi is None or "frame" not in qchi.dims:
+            # No per-frame data available — show merged with a note
+            _build_merged_iq_plot(result, uid, note=" (no per-frame data)")
+            return
+        q = qchi["q"].values if "q" in qchi.coords else np.arange(qchi["intensity"].shape[-1])
+        n_frames = qchi.sizes["frame"]
+        frame_labels = _get_frame_labels()
+
+        from bokeh.palettes import Category10, Turbo256
+        if n_frames <= 10:
+            colors = Category10[max(3, n_frames)][:n_frames]
+        else:
+            step = max(1, len(Turbo256) // n_frames)
+            colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
+
+        p = bk_figure(
+            title=f"{uid[:8]} — per-frame I(q) (χ-integrated)",
+            width=1000, height=400,
+            x_axis_type="log", y_axis_type="log",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+        )
+        for i in range(n_frames):
+            img_frame = qchi["intensity"].isel(frame=i).values
+            # Integrate over chi axis (axis 0 after ensuring shape is (chi, q))
+            if img_frame.shape == (len(q), len(qchi["chi"].values)):
+                img_frame = img_frame.T
+            I_frame = np.nanmean(img_frame, axis=0)
+            mask = np.isfinite(I_frame) & (I_frame > 0)
+            if mask.any():
+                lbl = frame_labels[i] if i < len(frame_labels) else f"frame {i}"
+                _add_trace(p, q[mask], I_frame[mask], color=colors[i],
+                           width=0.9, alpha=0.8, legend_label=lbl)
+        p.xaxis.axis_label = "q (nm⁻¹)"
+        p.yaxis.axis_label = "I(q)"
+        if n_frames <= 20:
+            p.legend.click_policy = "hide"
+            p.legend.label_text_font_size = "8pt"
+        else:
+            p.legend.visible = False
+        w_proc_iq_plot.object = p
+
+    else:
+        # Merged mode (default)
+        _build_merged_iq_plot(result, uid)
+
+
+def _build_merged_iq_plot(result, uid, note=""):
+    """Render the standard merged I(q) plot."""
+    from bokeh.plotting import figure as bk_figure
+
+    iq = result.merged_iq
+    q = iq["q"].values
+    I = iq["I"].values
+
+    p = bk_figure(
+        title=f"{uid[:8]} — merged I(q){note}", width=1000, height=400,
+        x_axis_type="log", y_axis_type="log",
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+    )
+
+    mask = np.isfinite(I) & (I > 0)
+    if mask.any():
+        _add_trace(p, q[mask], I[mask], color="black", width=1.2, legend_label="merged")
+    if "saxs_I" in iq:
+        sI = iq["saxs_I"].values
+        sm = np.isfinite(sI) & (sI > 0)
+        if sm.any():
+            _add_trace(p, q[sm], sI[sm], color="blue", width=0.8, alpha=0.6, legend_label="SAXS")
+    if "waxs_I" in iq:
+        wI = iq["waxs_I"].values
+        wm = np.isfinite(wI) & (wI > 0)
+        if wm.any():
+            _add_trace(p, q[wm], wI[wm], color="red", width=0.8, alpha=0.6, legend_label="WAXS")
+    p.xaxis.axis_label = "q (nm⁻¹)"
+    p.yaxis.axis_label = "I(q)"
+    p.legend.click_policy = "hide"
+    w_proc_iq_plot.object = p
+
+
+def _on_proc_iq_mode_change(event):
+    """Redraw both 2D map and I(q) when the user switches merged ↔ per-frame."""
+    mode = event.new if hasattr(event, "new") else w_proc_iq_mode.value
+    result = _proc_result_cache.get("result")
+    gi = _proc_result_cache.get("gi_result")
+
+    if mode == "per-frame":
+        # Show frame slider and display selected frame
+        if gi is not None:
+            n_fr = len(gi.frames)
+            w_proc_frame_slider.end = max(0, n_fr - 1)
+            w_proc_frame_slider.visible = n_fr > 1
+            idx = w_proc_frame_slider.value
+            w_proc_2d_plot.object = _plot_2d_gi(gi, frame_idx=idx)
+        elif result is not None:
+            qchi = getattr(result, "merged_qchi", None)
+            if qchi is not None and "frame" in qchi.dims:
+                n_fr = qchi.sizes["frame"]
+                w_proc_frame_slider.end = max(0, n_fr - 1)
+                w_proc_frame_slider.visible = n_fr > 1
+                idx = w_proc_frame_slider.value
+                w_proc_2d_plot.object = _plot_2d_transmission(result, frame_idx=idx)
+            else:
+                w_proc_frame_slider.visible = False
+    else:
+        # Merged: hide slider, show summed/merged 2D
+        w_proc_frame_slider.visible = False
+        if gi is not None:
+            w_proc_2d_plot.object = _plot_2d_gi(gi)
+        elif result is not None:
+            w_proc_2d_plot.object = _plot_2d_transmission(result)
+
+    _build_proc_iq_plot()
+    _update_frame_slider_label()
+
+
+def _on_proc_iq_label_change(event):
+    """Redraw I(q) when the frame label column changes (only in per-frame mode)."""
+    if w_proc_iq_mode.value == "per-frame":
+        _build_proc_iq_plot()
+    # Also update frame slider label on the 2D plot
+    _update_frame_slider_label()
+
+
+def _update_frame_slider_label():
+    """Update the frame slider name to include primary axis label."""
+    labels = _get_frame_labels()
+    idx = w_proc_frame_slider.value
+    if labels and idx < len(labels):
+        w_proc_frame_slider.name = f"Frame — {labels[idx]}"
+    else:
+        w_proc_frame_slider.name = "Frame"
+
+
+w_proc_iq_mode.param.watch(_on_proc_iq_mode_change, "value")
+w_proc_iq_label.param.watch(_on_proc_iq_label_change, "value")
 
 
 # ---------------------------------------------------------------------------
@@ -3516,10 +3759,15 @@ def _on_process(event):
             n_fr = len(gi_result.frames)
             w_proc_frame_slider.end = max(0, n_fr - 1)
             w_proc_frame_slider.value = 0
-            w_proc_frame_slider.visible = n_fr > 1
+            w_proc_iq_mode.visible = n_fr > 1
 
-            # Show summed qxy-vs-qz map
-            w_proc_2d_plot.object = _plot_2d_gi(gi_result)
+            # Display 2D map respecting mode toggle
+            if w_proc_iq_mode.value == "per-frame" and n_fr > 1:
+                w_proc_frame_slider.visible = True
+                w_proc_2d_plot.object = _plot_2d_gi(gi_result, frame_idx=0)
+            else:
+                w_proc_frame_slider.visible = False
+                w_proc_2d_plot.object = _plot_2d_gi(gi_result)
 
             # No merged I(q) for GI — clear the I(q) plot
             w_proc_iq_plot.object = None
@@ -3547,54 +3795,66 @@ def _on_process(event):
             _last_result["result"] = result
             _last_result["params"] = params
 
+            # Detect whether per-frame data is available from any source
+            pf_iq = getattr(result, "per_frame_iq", None)
+            has_perframe = (
+                (pf_iq is not None and "frame" in pf_iq.dims and pf_iq.sizes["frame"] > 1)
+            )
+
             # 2D q-chi map
             try:
                 qchi = result.merged_qchi
-                has_frames = "frame" in qchi.dims
-                if has_frames:
+                has_qchi_frames = "frame" in qchi.dims
+                if has_qchi_frames:
                     n_fr = qchi.sizes["frame"]
                     w_proc_frame_slider.end = max(0, n_fr - 1)
                     w_proc_frame_slider.value = 0
+                # Show per-frame controls if frames exist in either source
+                w_proc_iq_mode.visible = has_qchi_frames or has_perframe
+                if not w_proc_iq_mode.visible:
+                    w_proc_iq_mode.value = "merged"
+                # Display 2D map respecting the current mode toggle
+                if w_proc_iq_mode.value == "per-frame" and has_qchi_frames:
                     w_proc_frame_slider.visible = n_fr > 1
+                    w_proc_2d_plot.object = _plot_2d_transmission(
+                        result, frame_idx=w_proc_frame_slider.value)
                 else:
                     w_proc_frame_slider.visible = False
-                w_proc_2d_plot.object = _plot_2d_transmission(result)
+                    w_proc_2d_plot.object = _plot_2d_transmission(result)
             except Exception as exc:
                 log.exception("2D q-chi plot failed")
                 w_proc_2d_plot.object = None
                 w_proc_frame_slider.visible = False
+                # Still show per-frame I(q) controls if per_frame_iq exists
+                w_proc_iq_mode.visible = has_perframe
+                if not has_perframe:
+                    w_proc_iq_mode.value = "merged"
 
-            # I(q) plot (Bokeh)
-            from bokeh.plotting import figure as bk_figure
+            # Populate frame label selector from per_frame_iq bundled
+            # primary scalars (preferred) plus primary table (fallback)
+            label_options = ["(frame #)"]
+            if pf_iq is not None:
+                # 1D vars in per_frame_iq are primary scalars (dims == (frame,))
+                iq_vars = {"I", "saxs_I", "waxs_I"}  # skip I(q) variables
+                label_options += [
+                    v for v in pf_iq.data_vars
+                    if v not in iq_vars and pf_iq[v].ndim == 1
+                ]
+            # Supplement with primary table columns not already listed
+            df = w_primary_table.value
+            if df is not None and not df.empty:
+                existing = set(label_options)
+                label_options += [
+                    c for c in df.columns
+                    if pd.api.types.is_numeric_dtype(df[c]) and c not in existing
+                ]
+            if list(w_proc_iq_label.options) != label_options:
+                w_proc_iq_label.options = label_options
+            w_proc_iq_label.visible = w_proc_iq_mode.visible
 
-            iq = result.merged_iq
-            q = iq["q"].values
-            I = iq["I"].values
-
-            p = bk_figure(
-                title=f"{uid[:8]} — merged I(q)", width=1000, height=400,
-                x_axis_type="log", y_axis_type="log",
-                tools="pan,wheel_zoom,box_zoom,reset,save",
-                active_scroll="wheel_zoom",
-            )
-
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                _add_trace(p, q[mask], I[mask], color="black", width=1.2, legend_label="merged")
-            if "saxs_I" in iq:
-                sI = iq["saxs_I"].values
-                sm = np.isfinite(sI) & (sI > 0)
-                if sm.any():
-                    _add_trace(p, q[sm], sI[sm], color="blue", width=0.8, alpha=0.6, legend_label="SAXS")
-            if "waxs_I" in iq:
-                wI = iq["waxs_I"].values
-                wm = np.isfinite(wI) & (wI > 0)
-                if wm.any():
-                    _add_trace(p, q[wm], wI[wm], color="red", width=0.8, alpha=0.6, legend_label="WAXS")
-            p.xaxis.axis_label = "q (nm⁻¹)"
-            p.yaxis.axis_label = "I(q)"
-            p.legend.click_policy = "hide"
-            w_proc_iq_plot.object = p
+            # I(q) plot — merged or per-frame depending on current toggle
+            _build_proc_iq_plot()
+            _update_frame_slider_label()
 
             timing = result.timing or {}
             timing_str = ", ".join(f"{k}: {v:.1f}s" for k, v in timing.items())
@@ -5061,6 +5321,7 @@ w_detail_tabs = pn.Tabs(
                 (
                     "Results",
                     pn.Column(
+                        pn.Row(w_proc_iq_mode, w_proc_iq_label),
                         w_proc_frame_slider,
                         w_proc_2d_plot,
                         # Cross sections — interactive overlay on the 2D plot above.
