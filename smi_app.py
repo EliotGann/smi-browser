@@ -679,6 +679,29 @@ w_filter_column = pn.Column(sizing_mode="stretch_width")
 _cancel = threading.Event()
 
 # ---------------------------------------------------------------------------
+# Filter state persistence across websocket reconnections
+# ---------------------------------------------------------------------------
+_FILTER_CACHE_KEY = "smi_browser_saved_filters"
+_PAGE_CACHE_KEY = "smi_browser_saved_page"
+
+
+def _save_filter_state():
+    """Persist the current filters + page to pn.state.cache so they survive reconnects."""
+    filters = _collect_unified_filters()
+    pn.state.cache[_FILTER_CACHE_KEY] = filters
+    pn.state.cache[_PAGE_CACHE_KEY] = _state["page"]
+
+
+def _load_saved_filters() -> list[tuple[str, str, str]] | None:
+    """Return saved filters from cache, or None if nothing was saved."""
+    return pn.state.cache.get(_FILTER_CACHE_KEY)
+
+
+def _load_saved_page() -> int:
+    """Return saved page number from cache, defaulting to 0."""
+    return pn.state.cache.get(_PAGE_CACHE_KEY, 0)
+
+# ---------------------------------------------------------------------------
 # Debounced live count — lightweight count query while typing
 # ---------------------------------------------------------------------------
 
@@ -905,8 +928,16 @@ w_table = pn.widgets.Tabulator(
     ],
 )
 
-# Start with one empty filter row
-_add_filter()
+# Restore filter rows from cache (survives websocket reconnects) or start empty
+_saved_filters = _load_saved_filters()
+if _saved_filters:
+    _SEARCH_TYPE_REVERSE = {v: k for k, v in SEARCH_TYPE_MAP.items()}
+    for ftype, key, val in _saved_filters:
+        _add_filter(ftype=_SEARCH_TYPE_REVERSE.get(ftype, "Text in field"), key=key, val=val)
+    _state["unified_filters"] = list(_saved_filters)
+    _state["page"] = _load_saved_page()
+else:
+    _add_filter()
 
 # ---------------------------------------------------------------------------
 # Widgets — Detail panel
@@ -2928,6 +2959,8 @@ def _do_search(page=0):
     # Collapse search and update summary
     w_filter_summary.object = _filter_summary_text()
     search_card.collapsed = True
+    # Persist filter state so it survives websocket reconnects
+    _save_filter_state()
 
 
 def _go_to_page(page):
@@ -2941,6 +2974,7 @@ def _go_to_page(page):
     n_pg = _n_pages()
     w_status.object = f"**{_state['total']} scans** — page {page + 1}/{n_pg}"
     _refresh_pagination()
+    pn.state.cache[_PAGE_CACHE_KEY] = page
 
 
 def _on_reset(_event=None):
@@ -2954,6 +2988,9 @@ def _on_reset(_event=None):
     _reset_detail()
     w_filter_summary.object = _filter_summary_text()
     search_card.collapsed = False  # expand so user can start a new search
+    # Clear saved filter state
+    pn.state.cache.pop(_FILTER_CACHE_KEY, None)
+    pn.state.cache.pop(_PAGE_CACHE_KEY, None)
 
 
 def _reset_detail(preserve_figure=False):
@@ -5180,8 +5217,8 @@ _refresh_collection()
 _load_cycles()
 _refresh_proposals(w_proposal_cycle.value)
 
-# Load the 25 most recent scans in the background so the UI renders
-# immediately.  Uses a cached count to skip the expensive count probe.
+# Load scans in the background so the UI renders immediately.
+# If filters were persisted from a previous session/reconnect, re-apply them.
 def _startup_search():
     try:
         # Fast path: use cached count as count hint
@@ -5189,7 +5226,10 @@ def _startup_search():
 
         cat = _get_cat()
 
-        if count_hint is None:
+        # Use restored filters (from pn.state.cache) if available
+        unified = _state["unified_filters"]
+
+        if count_hint is None and not unified:
             # First run or cache missing — use len(cat) which is faster
             # than the REST probe (10-34s vs 30-40s for REST count).
             try:
@@ -5199,20 +5239,19 @@ def _startup_search():
             except Exception:
                 count_hint = None  # fall through to slow path
 
-        if count_hint:
+        if count_hint and not unified:
             log.info("startup: using count_hint=%d", count_hint)
         offset = _state["page"] * _state["page_size"]
         limit = _state["page_size"]
 
         summaries, total = tb.fetch_page_fast(
-            cat, unified_filters=[], offset=offset, limit=limit,
-            count_hint=count_hint,
+            cat, unified_filters=unified or None, offset=offset, limit=limit,
+            count_hint=count_hint if not unified else None,
         )
         _state["total"] = total
-        _state["unified_filters"] = []
 
-        # Cache the real count for next startup
-        if total > 0:
+        # Cache the real count for next startup (only when unfiltered)
+        if total > 0 and not unified:
             tb.save_cached_count(total)
 
         if not summaries:
