@@ -5053,6 +5053,10 @@ def _refresh_proposals(cycle: str | None = None):
         w_proposal_status.object = "*Log in to see your proposals*"
         return
 
+    # Disable all proposal widgets while loading to prevent race conditions
+    w_proposal_cycle.disabled = True
+    w_proposal_select.disabled = True
+    w_proposal_project.disabled = True
     w_proposal_spinner.value = True
     w_proposal_spinner.visible = True
     w_proposal_status.object = "*Loading proposals…*"
@@ -5073,6 +5077,9 @@ def _refresh_proposals(cycle: str | None = None):
     finally:
         w_proposal_spinner.value = False
         w_proposal_spinner.visible = False
+        w_proposal_cycle.disabled = False
+        w_proposal_select.disabled = False
+        w_proposal_project.disabled = False
 
     global _proposal_cache, _proposal_map
     _proposal_cache = proposals
@@ -5133,6 +5140,10 @@ def _on_proposal_select(*_events):
     if not ds or ds.startswith("("):
         return
 
+    # Disable cycle/project while downstream queries run
+    w_proposal_cycle.disabled = True
+    w_proposal_project.disabled = True
+
     # Reset project dropdown while we load new options
     w_proposal_project.options = ["(all)"]
     w_proposal_project.value = "(all)"
@@ -5155,12 +5166,19 @@ def _on_proposal_select(*_events):
             f"**{info.pi_name}** — {info.title[:80]}"
         )
 
+    # Re-enable cycle now that search is done
+    w_proposal_cycle.disabled = False
+
     # Fetch distinct project_name values within this data_session
+    # (this manages its own spinner/disabled state for project dropdown)
     _populate_project_names(ds)
 
 
 def _populate_project_names(data_session: str):
     """Query tiled for distinct project_name values within a data_session."""
+    w_proposal_project.disabled = True
+    w_proposal_spinner.value = True
+    w_proposal_spinner.visible = True
     try:
         ds_filter = [("exact", "data_session", data_session)]
         vals = tb.distinct_values(
@@ -5174,11 +5192,17 @@ def _populate_project_names(data_session: str):
         log.warning("project_name distinct query failed: %s", exc)
         w_proposal_project.options = ["(all)"]
         w_proposal_project.value = "(all)"
+        w_proposal_spinner.value = False
+        w_proposal_spinner.visible = False
+        w_proposal_project.disabled = False
         return
 
     if vals is None:
         w_proposal_project.options = ["(all)"]
         w_proposal_project.value = "(all)"
+        w_proposal_spinner.value = False
+        w_proposal_spinner.visible = False
+        w_proposal_project.disabled = False
         return
 
     # Build options: "(all)" plus each project name with count
@@ -5189,6 +5213,9 @@ def _populate_project_names(data_session: str):
     if not project_names:
         w_proposal_project.options = ["(all)"]
         w_proposal_project.value = "(all)"
+        w_proposal_spinner.value = False
+        w_proposal_spinner.visible = False
+        w_proposal_project.disabled = False
         return
 
     # Add count info to display
@@ -5200,6 +5227,9 @@ def _populate_project_names(data_session: str):
         opts[label] = name
     w_proposal_project.options = opts
     w_proposal_project.value = "(all)"
+    w_proposal_spinner.value = False
+    w_proposal_spinner.visible = False
+    w_proposal_project.disabled = False
 
 
 def _on_project_select(*_events):
