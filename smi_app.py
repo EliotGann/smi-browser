@@ -3468,6 +3468,9 @@ def _load_primary():
     _detail_cache["primary_info"] = info
     _detail_cache["primary_dataset"] = ds
     _detail_cache["primary_loaded"] = True
+    # Update export frame-label options
+    _refresh_export_labels()
+    _refresh_export_resolved_path()
 
 
 def _load_baseline():
@@ -3629,7 +3632,9 @@ def _load_active_tab(active):
     elif active == 5:
         pass  # Process tab — no auto-load
     elif active == 6:
-        pass  # Export tab — no auto-load
+        _load_primary()
+        _refresh_export_labels()
+        _refresh_export_resolved_path()
 
 
 def _on_detail_tab(event):
@@ -4501,9 +4506,6 @@ def _batch_add_fn(result, summary, params):
         try:
             out_dir = _resolve_export_dir()
             if out_dir:
-                frame_label = w_export_frame_label.value
-                if frame_label == "(frame #)":
-                    frame_label = None
                 export_scan(
                     out_dir=out_dir,
                     uid=result.uid,
@@ -4513,8 +4515,9 @@ def _batch_add_fn(result, summary, params):
                     baseline_df=baseline_df,
                     raw_metadata=raw_metadata,
                     formats=_export_formats(),
-                    subdir_template=w_export_subdir.value or "{uid_short}",
-                    frame_label_col=frame_label,
+                    subdir_template=w_export_subdir.value,
+                    basename_template=w_export_basename.value,
+                    frame_label_col=_get_frame_label_cols() or None,
                 )
         except Exception:
             log.exception("Batch auto-export failed for %s", result.uid[:8])
@@ -4660,19 +4663,39 @@ from smi_browser.export import export_scan, resolve_output_dir
 # --- Widgets ---
 
 w_export_dir = pn.widgets.TextInput(
-    name="Output directory",
-    placeholder="Auto-resolved from proposal, or enter a path",
+    name="Relative path (within proposal directory)",
+    value="projects/{project_name}/analysis",
+    placeholder="projects/{project_name}/analysis",
     width=500,
 )
+w_export_resolved_path = pn.pane.Markdown("", sizing_mode="stretch_width")
 w_export_subdir = pn.widgets.TextInput(
     name="Subdirectory template",
     value="{uid_short}_{sample_name}",
     width=300,
 )
-w_export_frame_label = pn.widgets.Select(
-    name="Frame label column",
-    options=["(frame #)"],
-    value="(frame #)",
+w_export_basename = pn.widgets.TextInput(
+    name="Base filename template",
+    value="",
+    placeholder="e.g. {sample_name}_{scan_id}",
+    width=300,
+)
+w_export_frame_label_1 = pn.widgets.Select(
+    name="Frame label 1",
+    options=["(none)"],
+    value="(none)",
+    width=180,
+)
+w_export_frame_label_2 = pn.widgets.Select(
+    name="Frame label 2",
+    options=["(none)"],
+    value="(none)",
+    width=180,
+)
+w_export_frame_label_3 = pn.widgets.Select(
+    name="Frame label 3",
+    options=["(none)"],
+    value="(none)",
     width=180,
 )
 
@@ -4703,6 +4726,68 @@ w_export_spinner = pn.indicators.LoadingSpinner(
 )
 
 
+def _refresh_export_labels():
+    """Populate the frame-label dropdowns from the current scan's primary scalars."""
+    options = ["(none)"]
+    df = w_primary_table.value
+    if df is not None and not df.empty:
+        import pandas as pd
+        options += [
+            c for c in df.columns
+            if pd.api.types.is_numeric_dtype(df[c])
+        ]
+    for w in (w_export_frame_label_1, w_export_frame_label_2, w_export_frame_label_3):
+        prev = w.value
+        w.options = options
+        if prev in options:
+            w.value = prev
+        else:
+            w.value = "(none)"
+
+
+def _refresh_export_resolved_path():
+    """Show the auto-resolved output path in the Export tab."""
+    ds = w_proposal_select.value
+    proj = w_proposal_project.value
+    rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
+
+    # Try proposal dropdown first
+    if ds and not ds.startswith("("):
+        resolved = resolve_output_dir(ds, proj, relative_path=rel)
+        if resolved:
+            w_export_resolved_path.object = f"*Resolved: `{resolved}`*"
+            return
+
+    # Fallback: use scan metadata
+    uid = _state.get("selected_uid")
+    if uid:
+        try:
+            run = _get_cat()[uid]
+            md = dict(run.metadata)
+            scan_ds = md.get("start", {}).get("data_session")
+            if scan_ds:
+                resolved = resolve_output_dir(scan_ds, proj, relative_path=rel)
+                if resolved:
+                    w_export_resolved_path.object = (
+                        f"*Resolved (from scan): `{resolved}`*"
+                    )
+                    return
+        except Exception:
+            pass
+
+    w_export_resolved_path.object = "*Cannot resolve — select a proposal or scan.*"
+
+
+def _get_frame_label_cols() -> list[str]:
+    """Return the list of selected frame label columns (filtering out '(none)')."""
+    cols = []
+    for w in (w_export_frame_label_1, w_export_frame_label_2, w_export_frame_label_3):
+        v = w.value
+        if v and v != "(none)":
+            cols.append(v)
+    return cols
+
+
 def _export_formats() -> set[str]:
     """Gather selected export format keys from checkboxes."""
     fmts: set[str] = set()
@@ -4726,21 +4811,33 @@ def _export_formats() -> set[str]:
 
 
 def _resolve_export_dir() -> Path | None:
-    """Get export output directory from widget or proposal auto-resolution."""
-    from pathlib import Path as _Path
-    explicit = w_export_dir.value.strip()
-    if explicit:
-        p = _Path(explicit).expanduser()
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    # Auto-resolve from proposal
+    """Get export output directory rooted in the proposal directory."""
     ds = w_proposal_select.value
     proj = w_proposal_project.value
+    rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
+
+    # If proposal dropdown has a valid data session, use it directly
     if ds and not ds.startswith("("):
-        resolved = resolve_output_dir(ds, proj)
+        resolved = resolve_output_dir(ds, proj, relative_path=rel)
         if resolved:
             resolved.mkdir(parents=True, exist_ok=True)
             return resolved
+
+    # Fallback: extract data_session from the currently selected scan's metadata
+    uid = _state.get("selected_uid")
+    if uid:
+        try:
+            run = _get_cat()[uid]
+            md = dict(run.metadata)
+            scan_ds = md.get("start", {}).get("data_session")
+            if scan_ds:
+                resolved = resolve_output_dir(scan_ds, proj, relative_path=rel)
+                if resolved:
+                    resolved.mkdir(parents=True, exist_ok=True)
+                    return resolved
+        except Exception:
+            pass
+
     return None
 
 
@@ -4792,10 +4889,6 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     except Exception:
         pass
 
-    frame_label = w_export_frame_label.value
-    if frame_label == "(frame #)":
-        frame_label = None
-
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -4808,8 +4901,9 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
         baseline_df=baseline_df,
         raw_metadata=raw_md,
         formats=_export_formats(),
-        subdir_template=w_export_subdir.value or "{uid_short}",
-        frame_label_col=frame_label,
+        subdir_template=w_export_subdir.value,
+        basename_template=w_export_basename.value,
+        frame_label_col=_get_frame_label_cols() or None,
     )
 
 
@@ -4860,10 +4954,6 @@ def _on_export_collection(event):
             coll_baseline = _collection.get_baseline_df(coll_uid)
             coll_raw_md = _collection.get_raw_metadata(coll_uid)
 
-            frame_label = w_export_frame_label.value
-            if frame_label == "(frame #)":
-                frame_label = None
-
             try:
                 _, files = export_scan(
                     out_dir=out_dir,
@@ -4874,8 +4964,9 @@ def _on_export_collection(event):
                     baseline_df=coll_baseline,
                     raw_metadata=coll_raw_md,
                     formats=_export_formats(),
-                    subdir_template=w_export_subdir.value or "{uid_short}",
-                    frame_label_col=frame_label,
+                    subdir_template=w_export_subdir.value,
+                    basename_template=w_export_basename.value,
+                    frame_label_col=_get_frame_label_cols() or None,
                 )
                 total_files += len(files)
             except Exception:
@@ -4900,14 +4991,24 @@ w_btn_export_collection.on_click(_on_export_collection)
 export_panel = pn.Column(
     pn.pane.Markdown(
         "**Export processed results** to disk in multiple formats. "
-        "The output directory is auto-resolved from the current proposal, "
-        "or enter a path manually."
+        "Output is always within the proposal directory. "
+        "Use `{project_name}` in the relative path to include the selected project."
     ),
     pn.Row(w_export_dir, sizing_mode="stretch_width"),
-    pn.Row(w_export_subdir, w_export_frame_label),
+    w_export_resolved_path,
+    pn.Row(w_export_subdir, w_export_basename),
     pn.pane.Markdown(
-        "*Subdirectory template placeholders:* "
-        "`{uid}`, `{uid_short}`, `{scan_id}`, `{sample_name}`",
+        "*Subdirectory template:* puts each scan in its own folder. "
+        "Leave blank to put all files in one directory.  \n"
+        "*Base filename template:* prepended to all output filenames "
+        "(e.g. `{sample_name}_{scan_id}` → `myfilm_12345_iq_merged.csv`).  \n"
+        "*Placeholders:* `{uid}`, `{uid_short}`, `{scan_id}`, `{sample_name}`",
+        stylesheets=[":host { font-size: 11px; color: #666; }"],
+    ),
+    pn.Row(w_export_frame_label_1, w_export_frame_label_2, w_export_frame_label_3),
+    pn.pane.Markdown(
+        "*Frame label columns are appended to per-frame filenames. "
+        "If the scan lacks a selected column, it is ignored.*",
         stylesheets=[":host { font-size: 11px; color: #666; }"],
     ),
     pn.layout.Divider(),

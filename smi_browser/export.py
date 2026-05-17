@@ -23,23 +23,31 @@ log = logging.getLogger(__name__)
 def resolve_output_dir(
     data_session: str,
     project_name: str | None,
+    relative_path: str = "projects/{project_name}/analysis",
 ) -> Path | None:
     """Build the output directory for a given proposal + project.
+
+    The directory is always rooted within the proposal's directory.
+    ``relative_path`` is a template that may contain ``{project_name}``.
 
     Returns
     -------
     Path or None
-        ``{proposal_dir}/projects/{project_name}/smi_browser/``
+        ``{proposal_dir}/{relative_path}/`` with placeholders resolved,
         or *None* if the proposal directory cannot be resolved.
     """
     proposal_id = nsls2api._proposal_id_from_data_session(data_session)
     base = nsls2api.fetch_proposal_directory(proposal_id)
     if not base:
         return None
-    root = Path(base) / "projects"
-    if project_name and project_name != "(all)":
-        root = root / project_name
-    root = root / "smi_browser"
+    # Resolve template placeholders
+    proj = project_name if (project_name and project_name != "(all)") else ""
+    rendered = relative_path.format(project_name=proj)
+    # Strip leading/trailing slashes and collapse empty segments
+    parts = [p for p in rendered.split("/") if p]
+    root = Path(base)
+    for part in parts:
+        root = root / part
     return root
 
 
@@ -135,6 +143,7 @@ def _save_linecuts(
     x_label: str,
     y_label: str,
     out_dir: Path,
+    prefix: str = "",
 ) -> list[Path]:
     """Save linecut plots (one per cut kind: h → I vs q, v → I vs chi).
 
@@ -163,7 +172,7 @@ def _save_linecuts(
         ax.set_title("Horizontal linecuts")
         ax.legend(fontsize=8)
         fig.tight_layout()
-        p = out_dir / "linecuts_h.png"
+        p = out_dir / f"{prefix}linecuts_h.png"
         fig.savefig(p, dpi=150)
         plt.close(fig)
         paths.append(p)
@@ -182,7 +191,7 @@ def _save_linecuts(
         ax.set_title("Vertical linecuts")
         ax.legend(fontsize=8)
         fig.tight_layout()
-        p = out_dir / "linecuts_v.png"
+        p = out_dir / f"{prefix}linecuts_v.png"
         fig.savefig(p, dpi=150)
         plt.close(fig)
         paths.append(p)
@@ -401,7 +410,8 @@ def export_scan(
     raw_metadata: dict | None = None,
     formats: set[str] | None = None,
     subdir_template: str = "{uid_short}",
-    frame_label_col: str | None = None,
+    basename_template: str = "",
+    frame_label_col: str | list[str] | None = None,
 ) -> tuple[Path, list[str]]:
     """Export a single scan's data to *out_dir* with configurable outputs.
 
@@ -409,7 +419,7 @@ def export_scan(
     ----------
     out_dir : Path
         Root export directory.  A sub-directory is created per scan using
-        ``subdir_template``.
+        ``subdir_template`` (if non-empty).
     uid : str
         Scan UID.
     result : transmission result object, optional
@@ -427,10 +437,17 @@ def export_scan(
         ``"metadata_txt"``, ``"png_grid"``
         If None, all available formats are exported.
     subdir_template : str
-        Template for the scan sub-directory name.  Available placeholders:
-        ``{uid}``, ``{uid_short}``, ``{scan_id}``, ``{sample_name}``.
-    frame_label_col : str, optional
-        Primary scalar column used for per-frame file naming in CSV exports.
+        Template for the scan sub-directory name.  Leave empty to put files
+        directly in ``out_dir`` (with ``basename_template`` as filename prefix).
+        Available placeholders: ``{uid}``, ``{uid_short}``, ``{scan_id}``,
+        ``{sample_name}``.
+    basename_template : str
+        Template for the filename prefix.  When non-empty, all output files
+        are named ``{basename}_{original_name}``.  Same placeholders as
+        ``subdir_template``.  When subdir is empty this is the primary way
+        to distinguish scans.
+    frame_label_col : str or list[str], optional
+        Primary scalar column(s) appended to per-frame filenames.
 
     Returns
     -------
@@ -458,14 +475,34 @@ def export_scan(
     def _safe(s: str) -> str:
         return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
 
-    subdir_name = subdir_template.format(
-        uid=uid,
-        uid_short=uid_short,
-        scan_id=_safe(scan_id),
-        sample_name=_safe(sample_name),
-    )
-    scan_dir = out_dir / subdir_name
+    if subdir_template:
+        subdir_name = subdir_template.format(
+            uid=uid,
+            uid_short=uid_short,
+            scan_id=_safe(scan_id),
+            sample_name=_safe(sample_name),
+        )
+        scan_dir = out_dir / subdir_name
+    else:
+        scan_dir = out_dir
     scan_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build filename prefix from basename_template
+    prefix = ""
+    if basename_template:
+        prefix = basename_template.format(
+            uid=uid,
+            uid_short=uid_short,
+            scan_id=_safe(scan_id),
+            sample_name=_safe(sample_name),
+        )
+        # Ensure prefix ends with separator
+        if prefix and not prefix.endswith("_"):
+            prefix += "_"
+
+    def _fname(name: str) -> str:
+        """Prepend the basename prefix to a filename."""
+        return f"{prefix}{name}" if prefix else name
 
     files_written: list[str] = []
 
@@ -479,29 +516,29 @@ def export_scan(
 
     # --- HDF5 dataset ---
     if "h5" in formats:
-        h5_path = scan_dir / "result.h5"
+        h5_path = scan_dir / _fname("result.h5")
         _save_dataset_h5(
             result, gi_result, cuts or [], x, y, image,
             x_label, y_label, params or {}, h5_path,
         )
-        files_written.append("result.h5")
+        files_written.append(_fname("result.h5"))
 
     # --- 2D map PNG ---
     if "png_2d" in formats and image is not None and x is not None and y is not None:
-        p = scan_dir / "map_2d.png"
+        p = scan_dir / _fname("map_2d.png")
         _save_2d_map(image, x, y, x_label, y_label, title_2d, p)
-        files_written.append("map_2d.png")
+        files_written.append(_fname("map_2d.png"))
 
     # --- I(q) plot PNG (transmission) ---
     if "png_iq" in formats and result is not None and hasattr(result, "merged_iq"):
-        p = scan_dir / "iq_merged.png"
+        p = scan_dir / _fname("iq_merged.png")
         _save_iq_plot(result, f"{uid_short} — merged I(q)", p)
-        files_written.append("iq_merged.png")
+        files_written.append(_fname("iq_merged.png"))
 
     # --- Linecut PNGs ---
     if "png_linecuts" in formats and cuts and image is not None:
         lc_paths = _save_linecuts(
-            cuts, x, y, image, x_label, y_label, scan_dir,
+            cuts, x, y, image, x_label, y_label, scan_dir, prefix=prefix,
         )
         files_written.extend(p.name for p in lc_paths)
 
@@ -513,33 +550,50 @@ def export_scan(
             iq_df["saxs_I"] = iq["saxs_I"].values
         if "waxs_I" in iq:
             iq_df["waxs_I"] = iq["waxs_I"].values
-        p = scan_dir / "iq_merged.csv"
+        p = scan_dir / _fname("iq_merged.csv")
         iq_df.to_csv(p, index=False)
-        files_written.append("iq_merged.csv")
+        files_written.append(_fname("iq_merged.csv"))
 
         # Per-frame I(q) if available
         pf_iq = getattr(result, "per_frame_iq", None)
         if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
-            pf_dir = scan_dir / "per_frame_iq"
+            pf_dir = scan_dir / _fname("per_frame_iq")
             pf_dir.mkdir(exist_ok=True)
             q_vals = pf_iq["q"].values
             n_frames = pf_iq.sizes["frame"]
+
+            # Normalize frame_label_col to a list
+            label_cols: list[str] = []
+            if isinstance(frame_label_col, str):
+                label_cols = [frame_label_col]
+            elif isinstance(frame_label_col, (list, tuple)):
+                label_cols = list(frame_label_col)
+
             for fi in range(n_frames):
                 frame_I = pf_iq["I"].isel(frame=fi).values
-                # Name frame file using label column if provided
-                if frame_label_col and frame_label_col in pf_iq:
-                    lbl = pf_iq[frame_label_col].isel(frame=fi).values
-                    fname = f"iq_frame_{fi:04d}_{_safe(str(lbl))}.csv"
+                # Build filename from label columns
+                label_parts: list[str] = []
+                for col in label_cols:
+                    if col and col in pf_iq:
+                        lbl = pf_iq[col].isel(frame=fi).values
+                        label_parts.append(f"{_safe(col)}={_safe(str(lbl))}")
+                if label_parts:
+                    fname = f"iq_frame_{fi:04d}_{'_'.join(label_parts)}.csv"
                 else:
                     fname = f"iq_frame_{fi:04d}.csv"
+                # Include merged, saxs, and waxs I(q) columns
                 frame_df = pd.DataFrame({"q": q_vals, "I": frame_I})
+                if "saxs_I" in pf_iq:
+                    frame_df["saxs_I"] = pf_iq["saxs_I"].isel(frame=fi).values
+                if "waxs_I" in pf_iq:
+                    frame_df["waxs_I"] = pf_iq["waxs_I"].isel(frame=fi).values
                 frame_df.to_csv(pf_dir / fname, index=False)
             files_written.append(f"per_frame_iq/ ({n_frames} files)")
 
     # --- CSV: linecut data ---
     if "csv_iq" in formats and cuts and x is not None and y is not None and image is not None:
         from .figures.cuts import compute_cross_section
-        cuts_dir = scan_dir / "linecuts"
+        cuts_dir = scan_dir / _fname("linecuts")
         cuts_dir.mkdir(exist_ok=True)
         for i, cut in enumerate(cuts):
             sec = compute_cross_section(cut, x, y, image, x_label, y_label)
@@ -548,24 +602,24 @@ def export_scan(
             axis, intensity, alabel = sec
             cut_df = pd.DataFrame({alabel: axis, "intensity": intensity})
             cut_df.to_csv(cuts_dir / f"cut_{i:03d}_{cut['kind']}.csv", index=False)
-        files_written.append("linecuts/")
+        files_written.append(_fname("linecuts/"))
 
     # --- CSV: primary scalars ---
     if "csv_scalars" in formats and primary_df is not None and not primary_df.empty:
-        p = scan_dir / "primary_scalars.csv"
+        p = scan_dir / _fname("primary_scalars.csv")
         primary_df.to_csv(p, index=False)
-        files_written.append("primary_scalars.csv")
+        files_written.append(_fname("primary_scalars.csv"))
 
     # --- CSV: baseline scalars ---
     if "csv_baseline" in formats and baseline_df is not None and not baseline_df.empty:
-        p = scan_dir / "baseline_scalars.csv"
+        p = scan_dir / _fname("baseline_scalars.csv")
         baseline_df.to_csv(p, index=False)
-        files_written.append("baseline_scalars.csv")
+        files_written.append(_fname("baseline_scalars.csv"))
 
     # --- Metadata text ---
     if "metadata_txt" in formats and raw_metadata:
         import json
-        p = scan_dir / "metadata.json"
+        p = scan_dir / _fname("metadata.json")
         # Make JSON-serializable
         def _default(o):
             if isinstance(o, (np.integer,)):
@@ -576,7 +630,7 @@ def export_scan(
                 return o.tolist()
             return str(o)
         p.write_text(json.dumps(raw_metadata, indent=2, default=_default))
-        files_written.append("metadata.json")
+        files_written.append(_fname("metadata.json"))
 
     log.info("export_scan: wrote %d items to %s", len(files_written), scan_dir)
     return scan_dir, files_written
