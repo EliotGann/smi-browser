@@ -381,3 +381,202 @@ def export_results(
     log.info("Exported %d files to %s: %s", len(files_written), out_dir,
              ", ".join(files_written))
     return out_dir
+
+
+# ---------------------------------------------------------------------------
+# Granular export helpers (called from the Export tab UI)
+# ---------------------------------------------------------------------------
+
+def export_scan(
+    *,
+    out_dir: Path,
+    uid: str,
+    result=None,
+    gi_result=None,
+    cuts: list[dict] | None = None,
+    proc_2d_cache: dict | None = None,
+    params: dict[str, Any] | None = None,
+    primary_df=None,
+    baseline_df=None,
+    raw_metadata: dict | None = None,
+    formats: set[str] | None = None,
+    subdir_template: str = "{uid_short}",
+    frame_label_col: str | None = None,
+) -> tuple[Path, list[str]]:
+    """Export a single scan's data to *out_dir* with configurable outputs.
+
+    Parameters
+    ----------
+    out_dir : Path
+        Root export directory.  A sub-directory is created per scan using
+        ``subdir_template``.
+    uid : str
+        Scan UID.
+    result : transmission result object, optional
+    gi_result : GI result object, optional
+    cuts : list of cut dicts, optional
+    proc_2d_cache : dict with keys x, y, image, x_label, y_label, optional
+    params : processing params, optional
+    primary_df : DataFrame, optional
+    baseline_df : DataFrame, optional
+    raw_metadata : dict, optional
+    formats : set of format keys, optional
+        Which outputs to produce.  Keys:
+        ``"h5"``, ``"png_2d"``, ``"png_iq"``, ``"png_linecuts"``,
+        ``"csv_iq"``, ``"csv_scalars"``, ``"csv_baseline"``,
+        ``"metadata_txt"``, ``"png_grid"``
+        If None, all available formats are exported.
+    subdir_template : str
+        Template for the scan sub-directory name.  Available placeholders:
+        ``{uid}``, ``{uid_short}``, ``{scan_id}``, ``{sample_name}``.
+    frame_label_col : str, optional
+        Primary scalar column used for per-frame file naming in CSV exports.
+
+    Returns
+    -------
+    (scan_dir, files_written) : tuple[Path, list[str]]
+    """
+    import pandas as pd
+
+    if formats is None:
+        formats = {
+            "h5", "png_2d", "png_iq", "png_linecuts",
+            "csv_iq", "csv_scalars", "csv_baseline", "metadata_txt",
+        }
+
+    # Resolve sub-directory name
+    uid_short = uid[:8]
+    scan_id = ""
+    sample_name = ""
+    if raw_metadata:
+        start = raw_metadata.get("start", {})
+        scan_id = str(start.get("scan_id", ""))
+        sample_name = start.get(
+            "sample_name", start.get("sample", start.get("Sample", ""))
+        )
+    # Sanitize for filesystem
+    def _safe(s: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+
+    subdir_name = subdir_template.format(
+        uid=uid,
+        uid_short=uid_short,
+        scan_id=_safe(scan_id),
+        sample_name=_safe(sample_name),
+    )
+    scan_dir = out_dir / subdir_name
+    scan_dir.mkdir(parents=True, exist_ok=True)
+
+    files_written: list[str] = []
+
+    # Extract 2D map data
+    x = proc_2d_cache.get("x") if proc_2d_cache else None
+    y = proc_2d_cache.get("y") if proc_2d_cache else None
+    image = proc_2d_cache.get("image") if proc_2d_cache else None
+    x_label = proc_2d_cache.get("x_label", "") if proc_2d_cache else ""
+    y_label = proc_2d_cache.get("y_label", "") if proc_2d_cache else ""
+    title_2d = proc_2d_cache.get("title", "") if proc_2d_cache else ""
+
+    # --- HDF5 dataset ---
+    if "h5" in formats:
+        h5_path = scan_dir / "result.h5"
+        _save_dataset_h5(
+            result, gi_result, cuts or [], x, y, image,
+            x_label, y_label, params or {}, h5_path,
+        )
+        files_written.append("result.h5")
+
+    # --- 2D map PNG ---
+    if "png_2d" in formats and image is not None and x is not None and y is not None:
+        p = scan_dir / "map_2d.png"
+        _save_2d_map(image, x, y, x_label, y_label, title_2d, p)
+        files_written.append("map_2d.png")
+
+    # --- I(q) plot PNG (transmission) ---
+    if "png_iq" in formats and result is not None and hasattr(result, "merged_iq"):
+        p = scan_dir / "iq_merged.png"
+        _save_iq_plot(result, f"{uid_short} — merged I(q)", p)
+        files_written.append("iq_merged.png")
+
+    # --- Linecut PNGs ---
+    if "png_linecuts" in formats and cuts and image is not None:
+        lc_paths = _save_linecuts(
+            cuts, x, y, image, x_label, y_label, scan_dir,
+        )
+        files_written.extend(p.name for p in lc_paths)
+
+    # --- CSV: merged I(q) ---
+    if "csv_iq" in formats and result is not None and hasattr(result, "merged_iq"):
+        iq = result.merged_iq
+        iq_df = pd.DataFrame({"q": iq["q"].values, "I": iq["I"].values})
+        if "saxs_I" in iq:
+            iq_df["saxs_I"] = iq["saxs_I"].values
+        if "waxs_I" in iq:
+            iq_df["waxs_I"] = iq["waxs_I"].values
+        p = scan_dir / "iq_merged.csv"
+        iq_df.to_csv(p, index=False)
+        files_written.append("iq_merged.csv")
+
+        # Per-frame I(q) if available
+        pf_iq = getattr(result, "per_frame_iq", None)
+        if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
+            pf_dir = scan_dir / "per_frame_iq"
+            pf_dir.mkdir(exist_ok=True)
+            q_vals = pf_iq["q"].values
+            n_frames = pf_iq.sizes["frame"]
+            for fi in range(n_frames):
+                frame_I = pf_iq["I"].isel(frame=fi).values
+                # Name frame file using label column if provided
+                if frame_label_col and frame_label_col in pf_iq:
+                    lbl = pf_iq[frame_label_col].isel(frame=fi).values
+                    fname = f"iq_frame_{fi:04d}_{_safe(str(lbl))}.csv"
+                else:
+                    fname = f"iq_frame_{fi:04d}.csv"
+                frame_df = pd.DataFrame({"q": q_vals, "I": frame_I})
+                frame_df.to_csv(pf_dir / fname, index=False)
+            files_written.append(f"per_frame_iq/ ({n_frames} files)")
+
+    # --- CSV: linecut data ---
+    if "csv_iq" in formats and cuts and x is not None and y is not None and image is not None:
+        from .figures.cuts import compute_cross_section
+        cuts_dir = scan_dir / "linecuts"
+        cuts_dir.mkdir(exist_ok=True)
+        for i, cut in enumerate(cuts):
+            sec = compute_cross_section(cut, x, y, image, x_label, y_label)
+            if sec is None:
+                continue
+            axis, intensity, alabel = sec
+            cut_df = pd.DataFrame({alabel: axis, "intensity": intensity})
+            cut_df.to_csv(cuts_dir / f"cut_{i:03d}_{cut['kind']}.csv", index=False)
+        files_written.append("linecuts/")
+
+    # --- CSV: primary scalars ---
+    if "csv_scalars" in formats and primary_df is not None and not primary_df.empty:
+        p = scan_dir / "primary_scalars.csv"
+        primary_df.to_csv(p, index=False)
+        files_written.append("primary_scalars.csv")
+
+    # --- CSV: baseline scalars ---
+    if "csv_baseline" in formats and baseline_df is not None and not baseline_df.empty:
+        p = scan_dir / "baseline_scalars.csv"
+        baseline_df.to_csv(p, index=False)
+        files_written.append("baseline_scalars.csv")
+
+    # --- Metadata text ---
+    if "metadata_txt" in formats and raw_metadata:
+        import json
+        p = scan_dir / "metadata.json"
+        # Make JSON-serializable
+        def _default(o):
+            if isinstance(o, (np.integer,)):
+                return int(o)
+            if isinstance(o, (np.floating,)):
+                return float(o)
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            return str(o)
+        p.write_text(json.dumps(raw_metadata, indent=2, default=_default))
+        files_written.append("metadata.json")
+
+    log.info("export_scan: wrote %d items to %s", len(files_written), scan_dir)
+    return scan_dir, files_written

@@ -47,6 +47,9 @@ import tiled_browser as tb
 from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 from smi_browser import nsls2api
+from smi_browser.cache import (
+    ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
+)
 
 log = logging.getLogger(__name__)
 
@@ -371,9 +374,21 @@ def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def _scalar_stream_to_frame(run, stream: str) -> pd.DataFrame:
-    """Read scalar fields from a stream into a DataFrame."""
-    scalar_data = tb.fetch_scalars(run, stream)
+def _scalar_stream_to_frame(run, stream: str, *, uid: str | None = None,
+                            dataset=None) -> pd.DataFrame:
+    """Read scalar fields from a stream into a DataFrame.
+
+    If ``uid`` is provided, the disk cache (``smi_browser.cache.ScanCache``)
+    is consulted first and populated on a miss so subsequent reads — within
+    this session and across restarts — avoid the tiled round-trip.
+    """
+    if uid:
+        scalar_data = get_or_fetch_scalars(
+            uid, stream,
+            lambda: tb.fetch_scalars(run, stream, _dataset=dataset),
+        )
+    else:
+        scalar_data = tb.fetch_scalars(run, stream, _dataset=dataset)
     return _scalars_to_dataframe(scalar_data)
 
 
@@ -683,6 +698,9 @@ _cancel = threading.Event()
 # ---------------------------------------------------------------------------
 _FILTER_CACHE_KEY = "smi_browser_saved_filters"
 _PAGE_CACHE_KEY = "smi_browser_saved_page"
+_CYCLE_CACHE_KEY = "smi_browser_saved_cycle"
+_DATASESSION_CACHE_KEY = "smi_browser_saved_datasession"
+_PROJECT_CACHE_KEY = "smi_browser_saved_project"
 
 
 def _save_filter_state():
@@ -700,6 +718,25 @@ def _load_saved_filters() -> list[tuple[str, str, str]] | None:
 def _load_saved_page() -> int:
     """Return saved page number from cache, defaulting to 0."""
     return pn.state.cache.get(_PAGE_CACHE_KEY, 0)
+
+
+def _save_proposal_state():
+    """Persist cycle/data-session/project selections for auto-reload."""
+    pn.state.cache[_CYCLE_CACHE_KEY] = w_proposal_cycle.value
+    pn.state.cache[_DATASESSION_CACHE_KEY] = w_proposal_select.value
+    pn.state.cache[_PROJECT_CACHE_KEY] = w_proposal_project.value
+
+
+def _load_saved_cycle() -> str | None:
+    return pn.state.cache.get(_CYCLE_CACHE_KEY)
+
+
+def _load_saved_datasession() -> str | None:
+    return pn.state.cache.get(_DATASESSION_CACHE_KEY)
+
+
+def _load_saved_project() -> str | None:
+    return pn.state.cache.get(_PROJECT_CACHE_KEY)
 
 # ---------------------------------------------------------------------------
 # Debounced live count — lightweight count query while typing
@@ -1035,13 +1072,24 @@ _image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
                 "mask_image_shape": None}
 
 
+def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray | None:
+    """Fetch a single image frame, using the disk cache when a uid is known."""
+    uid = _state.get("selected_uid")
+    if uid:
+        return get_or_fetch_image_frame(
+            uid, field, frame_idx,
+            lambda: tb.fetch_all_frames(run, "primary", field),
+        )
+    return tb.fetch_frame(run, "primary", field, frame_idx=frame_idx, _dataset=ds)
+
+
 def _render_image_frame(field, idx):
     """Fetch, orient, and render a single image frame (preserves zoom/pan)."""
     run = _ensure_run()
     if run is None:
         return
     ds = _image_cache.get("dataset")
-    frame = tb.fetch_frame(run, "primary", field, frame_idx=idx, _dataset=ds)
+    frame = _cached_fetch_frame(run, field, idx, ds)
     if frame is not None:
         # Capture raw detector shape *before* orientation so the polygon
         # transform knows the original (rows, cols).
@@ -1305,7 +1353,7 @@ def _build_multiview_grid(frames, field):
 def _load_multiview():
     """Fetch all frames for the current detector and build the grid."""
     run = _ensure_run()
-    if not run:
+    if run is None:
         return
     w_mv_status.object = "*Loading…*"
 
@@ -1380,8 +1428,15 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
     t0 = time.perf_counter()
     ds = _detail_cache.get("primary_dataset")
     frames = []
+    uid = _state.get("selected_uid")
     for i in range(start, end):
-        arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
+        if uid:
+            arr = get_or_fetch_image_frame(
+                uid, field, i,
+                lambda: tb.fetch_all_frames(run, "primary", field),
+            )
+        else:
+            arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
         if arr is None:
             continue
         frames.append(_orient_frame(arr, field))
@@ -3356,7 +3411,7 @@ def _load_primary():
     if _detail_cache["primary_loaded"]:
         return
     run = _ensure_run()
-    if not run:
+    if run is None:
         return
     if "primary" not in tb.stream_names(run):
         w_primary_status.object = "*No primary stream.*"
@@ -3369,7 +3424,14 @@ def _load_primary():
     # Single read: get dataset, extract scalars from it
     info = tb.stream_info_for(run, "primary")
     ds = info.get("dataset")
-    scalar_data = tb.fetch_scalars(run, "primary", _dataset=ds)
+    uid = _state.get("selected_uid")
+    if uid:
+        scalar_data = get_or_fetch_scalars(
+            uid, "primary",
+            lambda: tb.fetch_scalars(run, "primary", _dataset=ds),
+        )
+    else:
+        scalar_data = tb.fetch_scalars(run, "primary", _dataset=ds)
     df = _scalars_to_dataframe(scalar_data)
     dt_ms = (time.perf_counter() - t0) * 1000
     w_primary_table.value = df
@@ -3412,7 +3474,7 @@ def _load_baseline():
     if _detail_cache["baseline_loaded"]:
         return
     run = _ensure_run()
-    if not run:
+    if run is None:
         return
     if "baseline" not in tb.stream_names(run):
         w_baseline_status.object = "*No baseline stream.*"
@@ -3421,7 +3483,14 @@ def _load_baseline():
     t0 = time.perf_counter()
     w_baseline_status.object = "*Loading…*"
     # Single read for baseline (avoids per-field .structure() on 300+ fields)
-    scalar_data = tb.fetch_scalars(run, "baseline")
+    uid = _state.get("selected_uid")
+    if uid:
+        scalar_data = get_or_fetch_scalars(
+            uid, "baseline",
+            lambda: tb.fetch_scalars(run, "baseline"),
+        )
+    else:
+        scalar_data = tb.fetch_scalars(run, "baseline")
     # Transpose into field/before/after rows (baseline typically has 2 readings)
     rows = []
     for key, arr in sorted(scalar_data.items()):
@@ -3445,7 +3514,7 @@ def _load_images():
     if _detail_cache["images_loaded"]:
         return
     run = _ensure_run()
-    if not run:
+    if run is None:
         return
     t0 = time.perf_counter()
     w_image_status.object = "*Loading thumbnail…*"
@@ -3496,7 +3565,7 @@ def _load_images():
         w_image_slider.end = max(0, n_frames - 1)
 
         # Show first frame
-        frame = tb.fetch_frame(run, "primary", field, frame_idx=0, _dataset=ds)
+        frame = _cached_fetch_frame(run, field, 0, ds)
         if frame is not None:
             _image_cache["raw_shape"] = tuple(frame.shape)
             frame = _orient_frame(frame, field)
@@ -3559,6 +3628,8 @@ def _load_active_tab(active):
         _load_multiview()
     elif active == 5:
         pass  # Process tab — no auto-load
+    elif active == 6:
+        pass  # Export tab — no auto-load
 
 
 def _on_detail_tab(event):
@@ -3751,6 +3822,8 @@ def _on_process(event):
             gi_result = reduce_fn(**gi_params)
             dt = time.perf_counter() - t0
 
+            _cache_reduction_result(uid, gi_result, geometry, gi_params)
+
             _proc_result_cache["gi_result"] = gi_result
             _last_result["result"] = gi_result
             _last_result["params"] = gi_params
@@ -3790,6 +3863,8 @@ def _on_process(event):
 
             result = reduce_fn(**params)
             dt = time.perf_counter() - t0
+
+            _cache_reduction_result(uid, result, geometry, params)
 
             _proc_result_cache["result"] = result
             _last_result["result"] = result
@@ -3869,6 +3944,16 @@ def _on_process(event):
         w_proc_status.object = f"**Error:** `{exc}`"
         w_proc_iq_plot.object = None
         w_proc_2d_plot.object = None
+    else:
+        # Auto-export if enabled
+        if w_export_auto.value and uid:
+            try:
+                out = _do_export_single(uid)
+                if out:
+                    scan_dir, files = out
+                    log.info("Auto-exported %d files to %s", len(files), scan_dir)
+            except Exception:
+                log.exception("Auto-export failed for %s", uid[:8])
     finally:
         _processing_guard["active"] = False
         w_btn_process.disabled = False
@@ -4099,6 +4184,10 @@ def _build_proc_params(uid: str) -> tuple:
             gi_params["waxs_beam_col_per_arc_deg"] = w_proc_waxs_col_per_arc.value
         if waxs_kw:
             gi_params["waxs_cal_overrides"] = waxs_kw
+        # Supply pre-cached images if available
+        _cp = cache_path(uid)
+        if _cp.exists():
+            gi_params["image_cache_path"] = str(_cp)
         return reduce_smi_gi, gi_params, geometry
 
     from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
@@ -4113,6 +4202,10 @@ def _build_proc_params(uid: str) -> tuple:
         waxs_mask_path=w_proc_waxs_mask.value or None,
         cache_geometry=w_cache_enabled.value,
     )
+    # Supply pre-cached images if available
+    _cp = cache_path(uid)
+    if _cp.exists():
+        params["image_cache_path"] = str(_cp)
     if w_proc_nq.value != DEFAULT_N_Q:
         params["n_q"] = w_proc_nq.value
     else:
@@ -4205,18 +4298,74 @@ def _build_proc_params(uid: str) -> tuple:
     return reduce_smi_combined, params, geometry
 
 
+def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> None:
+    """Extract arrays from a reduction result and write to the disk cache."""
+    try:
+        cache = ScanCache(uid)
+        arrays: dict[str, np.ndarray] = {}
+
+        if geometry == "grazing":
+            # GI result: frames list (each is a 2D array)
+            frames = getattr(result, "frames", None)
+            if frames is not None and len(frames) > 0:
+                arrays["gi_frames"] = np.asarray(frames)
+        else:
+            # Transmission: merged_qchi and merged_iq are xarray Datasets
+            qchi = getattr(result, "merged_qchi", None)
+            if qchi is not None:
+                intensity = qchi["intensity"].values if "intensity" in qchi else None
+                if intensity is not None:
+                    arrays["qchi_intensity"] = intensity
+                if "q" in qchi.coords:
+                    arrays["qchi_q"] = qchi["q"].values
+                if "chi" in qchi.coords:
+                    arrays["qchi_chi"] = qchi["chi"].values
+
+            iq = getattr(result, "merged_iq", None)
+            if iq is not None:
+                if "q" in iq.coords:
+                    arrays["iq_q"] = iq["q"].values
+                if "I" in iq:
+                    arrays["iq_I"] = iq["I"].values
+
+            # Per-frame I(q) if available
+            pf_iq = getattr(result, "per_frame_iq", None)
+            if pf_iq is not None and "I" in pf_iq:
+                arrays["pf_iq_I"] = pf_iq["I"].values
+                if "q" in pf_iq.coords:
+                    arrays["pf_iq_q"] = pf_iq["q"].values
+
+        # Filter out params that aren't JSON-safe for attr storage
+        safe_params = {
+            k: v for k, v in params.items()
+            if isinstance(v, (str, int, float, bool, type(None), list, tuple))
+        }
+        safe_params["geometry"] = geometry
+
+        if arrays:
+            cache.write_reduction(arrays, safe_params)
+            log.info("cache: wrote reduction for %s (%d arrays)", uid[:8], len(arrays))
+    except Exception:
+        log.exception("cache: failed to write reduction for %s", uid[:8])
+
+
 def _batch_process_fn(uid: str):
     """BatchProcessor.process_fn: run one reduction and return the result."""
     run_fn, params, geometry = _build_proc_params(uid)
     result = run_fn(**params)
+
+    # Persist reduction outputs to the disk cache so subsequent sessions
+    # can reload without re-processing.
+    _cache_reduction_result(uid, result, geometry, params)
+
     # Fetch primary/baseline scalars and raw metadata so the collection
     # can offer label columns and eventual export.
     # Also build the summary from run metadata (no longer pre-fetched at
     # queue time for speed).
     try:
         run = _get_cat()[uid]
-        primary_df = _scalar_stream_to_frame(run, "primary")
-        baseline_df = _scalar_stream_to_frame(run, "baseline")
+        primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
+        baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
         raw_md = dict(run.metadata)
         start_md = raw_md.get("start", {})
         summary = {
@@ -4347,6 +4496,29 @@ def _batch_add_fn(result, summary, params):
         raw_metadata=raw_metadata,
     )
 
+    # Auto-export if enabled
+    if w_export_auto.value and hasattr(result, "uid") and result.uid:
+        try:
+            out_dir = _resolve_export_dir()
+            if out_dir:
+                frame_label = w_export_frame_label.value
+                if frame_label == "(frame #)":
+                    frame_label = None
+                export_scan(
+                    out_dir=out_dir,
+                    uid=result.uid,
+                    result=result,
+                    params=params,
+                    primary_df=primary_df,
+                    baseline_df=baseline_df,
+                    raw_metadata=raw_metadata,
+                    formats=_export_formats(),
+                    subdir_template=w_export_subdir.value or "{uid_short}",
+                    frame_label_col=frame_label,
+                )
+        except Exception:
+            log.exception("Batch auto-export failed for %s", result.uid[:8])
+
 
 def _ensure_batch_processor() -> BatchProcessor:
     bp = _batch_state.get("processor")
@@ -4475,6 +4647,276 @@ batch_panel = pn.Column(
     w_batch_status,
     w_batch_progress,
     w_batch_table,
+    sizing_mode="stretch_width",
+)
+
+
+# ---------------------------------------------------------------------------
+# Export tab — configurable output formats and destinations
+# ---------------------------------------------------------------------------
+
+from smi_browser.export import export_scan, resolve_output_dir
+
+# --- Widgets ---
+
+w_export_dir = pn.widgets.TextInput(
+    name="Output directory",
+    placeholder="Auto-resolved from proposal, or enter a path",
+    width=500,
+)
+w_export_subdir = pn.widgets.TextInput(
+    name="Subdirectory template",
+    value="{uid_short}_{sample_name}",
+    width=300,
+)
+w_export_frame_label = pn.widgets.Select(
+    name="Frame label column",
+    options=["(frame #)"],
+    value="(frame #)",
+    width=180,
+)
+
+# Format checkboxes
+w_export_h5 = pn.widgets.Checkbox(name="HDF5 result", value=True)
+w_export_png_2d = pn.widgets.Checkbox(name="PNG 2D map", value=True)
+w_export_png_iq = pn.widgets.Checkbox(name="PNG I(q)", value=True)
+w_export_png_linecuts = pn.widgets.Checkbox(name="PNG linecuts", value=True)
+w_export_csv_iq = pn.widgets.Checkbox(name="CSV I(q) + per-frame", value=True)
+w_export_csv_scalars = pn.widgets.Checkbox(name="CSV primary scalars", value=True)
+w_export_csv_baseline = pn.widgets.Checkbox(name="CSV baseline", value=True)
+w_export_metadata = pn.widgets.Checkbox(name="Metadata JSON", value=True)
+
+w_export_auto = pn.widgets.Checkbox(
+    name="Auto-export after processing",
+    value=False,
+)
+
+w_btn_export_current = pn.widgets.Button(
+    name="Export current scan", button_type="primary", width=180,
+)
+w_btn_export_collection = pn.widgets.Button(
+    name="Export entire collection", button_type="success", width=180,
+)
+w_export_status = pn.pane.Markdown("", sizing_mode="stretch_width")
+w_export_spinner = pn.indicators.LoadingSpinner(
+    value=False, visible=False, size=20,
+)
+
+
+def _export_formats() -> set[str]:
+    """Gather selected export format keys from checkboxes."""
+    fmts: set[str] = set()
+    if w_export_h5.value:
+        fmts.add("h5")
+    if w_export_png_2d.value:
+        fmts.add("png_2d")
+    if w_export_png_iq.value:
+        fmts.add("png_iq")
+    if w_export_png_linecuts.value:
+        fmts.add("png_linecuts")
+    if w_export_csv_iq.value:
+        fmts.add("csv_iq")
+    if w_export_csv_scalars.value:
+        fmts.add("csv_scalars")
+    if w_export_csv_baseline.value:
+        fmts.add("csv_baseline")
+    if w_export_metadata.value:
+        fmts.add("metadata_txt")
+    return fmts
+
+
+def _resolve_export_dir() -> Path | None:
+    """Get export output directory from widget or proposal auto-resolution."""
+    from pathlib import Path as _Path
+    explicit = w_export_dir.value.strip()
+    if explicit:
+        p = _Path(explicit).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    # Auto-resolve from proposal
+    ds = w_proposal_select.value
+    proj = w_proposal_project.value
+    if ds and not ds.startswith("("):
+        resolved = resolve_output_dir(ds, proj)
+        if resolved:
+            resolved.mkdir(parents=True, exist_ok=True)
+            return resolved
+    return None
+
+
+def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
+    """Export one scan using current settings.  Returns (dir, files) or None."""
+    out_dir = _resolve_export_dir()
+    if out_dir is None:
+        pn.state.notifications.error(
+            "Cannot resolve export directory. Set it manually or select a proposal."
+        )
+        return None
+
+    result = _proc_result_cache.get("result")
+    gi_result = _proc_result_cache.get("gi_result")
+    params = _last_result.get("params") or {}
+
+    # Gather 2D cache
+    proc_2d = None
+    if _proc_2d_cache.get("image") is not None:
+        proc_2d = {
+            "x": _proc_2d_cache.get("x"),
+            "y": _proc_2d_cache.get("y"),
+            "image": _proc_2d_cache.get("image"),
+            "x_label": _proc_2d_cache.get("x_label", ""),
+            "y_label": _proc_2d_cache.get("y_label", ""),
+            "title": _proc_2d_cache.get("title", ""),
+        }
+
+    # Gather cuts
+    cuts = list(_persisted_cuts)
+
+    # Primary/baseline
+    primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
+    baseline_df = None
+    if _detail_cache.get("baseline_loaded"):
+        run = _ensure_run()
+        if run and "baseline" in tb.stream_names(run):
+            try:
+                baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+            except Exception:
+                pass
+
+    # Raw metadata
+    raw_md = None
+    try:
+        run = _ensure_run()
+        if run:
+            raw_md = dict(run.metadata)
+    except Exception:
+        pass
+
+    frame_label = w_export_frame_label.value
+    if frame_label == "(frame #)":
+        frame_label = None
+
+    return export_scan(
+        out_dir=out_dir,
+        uid=uid,
+        result=result,
+        gi_result=gi_result,
+        cuts=cuts,
+        proc_2d_cache=proc_2d,
+        params=params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        raw_metadata=raw_md,
+        formats=_export_formats(),
+        subdir_template=w_export_subdir.value or "{uid_short}",
+        frame_label_col=frame_label,
+    )
+
+
+def _on_export_current(event):
+    uid = _state.get("selected_uid")
+    if not uid:
+        pn.state.notifications.warning("No scan selected.")
+        return
+    w_export_spinner.value = True
+    w_export_spinner.visible = True
+    w_export_status.object = "*Exporting…*"
+    try:
+        out = _do_export_single(uid)
+        if out:
+            scan_dir, files = out
+            w_export_status.object = (
+                f"**Exported** {len(files)} items → `{scan_dir}`\n\n"
+                + "\n".join(f"- {f}" for f in files)
+            )
+    except Exception as exc:
+        log.exception("Export failed")
+        w_export_status.object = f"**Export error:** `{exc}`"
+    finally:
+        w_export_spinner.value = False
+        w_export_spinner.visible = False
+
+
+def _on_export_collection(event):
+    if len(_collection) == 0:
+        pn.state.notifications.warning("Collection is empty.")
+        return
+    out_dir = _resolve_export_dir()
+    if out_dir is None:
+        pn.state.notifications.error(
+            "Cannot resolve export directory. Set it manually or select a proposal."
+        )
+        return
+    w_export_spinner.value = True
+    w_export_spinner.visible = True
+    w_export_status.object = f"*Exporting {len(_collection)} scans…*"
+    total_files = 0
+    errors = 0
+    try:
+        for coll_uid in _collection.uids:
+            coll_result = _collection.get_result(coll_uid)
+            coll_params = _collection._processing.get(coll_uid, {})
+            coll_primary = _collection.get_primary_df(coll_uid)
+            coll_baseline = _collection.get_baseline_df(coll_uid)
+            coll_raw_md = _collection.get_raw_metadata(coll_uid)
+
+            frame_label = w_export_frame_label.value
+            if frame_label == "(frame #)":
+                frame_label = None
+
+            try:
+                _, files = export_scan(
+                    out_dir=out_dir,
+                    uid=coll_uid,
+                    result=coll_result,
+                    params=coll_params,
+                    primary_df=coll_primary,
+                    baseline_df=coll_baseline,
+                    raw_metadata=coll_raw_md,
+                    formats=_export_formats(),
+                    subdir_template=w_export_subdir.value or "{uid_short}",
+                    frame_label_col=frame_label,
+                )
+                total_files += len(files)
+            except Exception:
+                log.exception("Export failed for %s", coll_uid[:8])
+                errors += 1
+
+        status = f"**Exported** {len(_collection)} scans ({total_files} files) → `{out_dir}`"
+        if errors:
+            status += f"\n\n⚠️ {errors} scan(s) had errors."
+        w_export_status.object = status
+    except Exception as exc:
+        log.exception("Collection export failed")
+        w_export_status.object = f"**Export error:** `{exc}`"
+    finally:
+        w_export_spinner.value = False
+        w_export_spinner.visible = False
+
+
+w_btn_export_current.on_click(_on_export_current)
+w_btn_export_collection.on_click(_on_export_collection)
+
+export_panel = pn.Column(
+    pn.pane.Markdown(
+        "**Export processed results** to disk in multiple formats. "
+        "The output directory is auto-resolved from the current proposal, "
+        "or enter a path manually."
+    ),
+    pn.Row(w_export_dir, sizing_mode="stretch_width"),
+    pn.Row(w_export_subdir, w_export_frame_label),
+    pn.pane.Markdown(
+        "*Subdirectory template placeholders:* "
+        "`{uid}`, `{uid_short}`, `{scan_id}`, `{sample_name}`",
+        stylesheets=[":host { font-size: 11px; color: #666; }"],
+    ),
+    pn.layout.Divider(),
+    pn.pane.Markdown("**Output formats:**"),
+    pn.Row(w_export_h5, w_export_png_2d, w_export_png_iq, w_export_png_linecuts),
+    pn.Row(w_export_csv_iq, w_export_csv_scalars, w_export_csv_baseline, w_export_metadata),
+    pn.layout.Divider(),
+    pn.Row(w_btn_export_current, w_btn_export_collection, w_export_auto),
+    pn.Row(w_export_status, w_export_spinner),
     sizing_mode="stretch_width",
 )
 
@@ -5038,7 +5480,11 @@ def _load_cycles():
     # Most recent first; prepend "All cycles" and "commissioning"
     cycle_opts = ["All cycles", "commissioning"] + list(reversed(cycles))
     w_proposal_cycle.options = cycle_opts
-    if current and current in cycle_opts:
+    # Restore saved cycle if available and still valid
+    saved_cycle = _load_saved_cycle()
+    if saved_cycle and saved_cycle in cycle_opts:
+        w_proposal_cycle.value = saved_cycle
+    elif current and current in cycle_opts:
         w_proposal_cycle.value = current
     else:
         w_proposal_cycle.value = cycle_opts[2] if len(cycle_opts) > 2 else cycle_opts[0]
@@ -5106,8 +5552,12 @@ def _refresh_proposals(cycle: str | None = None):
     # Build dropdown options: data_session as value, display_label as text
     opts = {p.display_label: p.data_session for p in proposals}
     w_proposal_select.options = opts
-    # Select the first by default
-    w_proposal_select.value = proposals[0].data_session
+    # Restore saved data session if available and still a valid option
+    saved_ds = _load_saved_datasession()
+    if saved_ds and saved_ds in opts.values():
+        w_proposal_select.value = saved_ds
+    else:
+        w_proposal_select.value = proposals[0].data_session
     w_proposal_status.object = f"*{len(proposals)} proposal{'s' if len(proposals) != 1 else ''}*"
 
 
@@ -5122,6 +5572,13 @@ def _on_cycle_change(*_events):
     w_table.selection = []
     _reset_detail()
 
+    # Set proposal select to a safe loading sentinel BEFORE refreshing
+    # options.  This prevents a BokehJS race where the old value (e.g.
+    # "pass-321164") arrives as a change event after options have been
+    # replaced, causing "not in list" ValueError inside Panel.
+    w_proposal_select.options = ["(loading…)"]
+    w_proposal_select.value = "(loading…)"
+
     if cycle == "All cycles":
         # Clear any data_session filter and search unfiltered
         _filter_rows.clear()
@@ -5132,6 +5589,7 @@ def _on_cycle_change(*_events):
         w_filter_summary.object = _filter_summary_text()
 
     _refresh_proposals(cycle)
+    _save_proposal_state()
 
 
 def _on_proposal_select(*_events):
@@ -5172,6 +5630,7 @@ def _on_proposal_select(*_events):
     # Fetch distinct project_name values within this data_session
     # (this manages its own spinner/disabled state for project dropdown)
     _populate_project_names(ds)
+    _save_proposal_state()
 
 
 def _populate_project_names(data_session: str):
@@ -5226,7 +5685,12 @@ def _populate_project_names(data_session: str):
         label = f"{name} ({cnt})" if cnt else name
         opts[label] = name
     w_proposal_project.options = opts
-    w_proposal_project.value = "(all)"
+    # Restore saved project if available and still a valid option
+    saved_project = _load_saved_project()
+    if saved_project and saved_project in opts.values():
+        w_proposal_project.value = saved_project
+    else:
+        w_proposal_project.value = "(all)"
     w_proposal_spinner.value = False
     w_proposal_spinner.visible = False
     w_proposal_project.disabled = False
@@ -5251,6 +5715,7 @@ def _on_project_select(*_events):
     if project and project != "(all)":
         _add_filter(ftype="Exact", key="project_name", val=project)
     _do_search(0)
+    _save_proposal_state()
 
 
 w_proposal_cycle.param.watch(_on_cycle_change, "value")
@@ -5412,6 +5877,10 @@ w_detail_tabs = pn.Tabs(
                 sizing_mode="stretch_width",
             ),
         ),
+    ),
+    (
+        "Export",
+        export_panel,
     ),
 )
 

@@ -34,6 +34,28 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Global fix: the SMI tiled server returns sorting: [['', 1]] in its catalog
+# metadata. The tiled client bakes that into _sorting_params = {'sort': ''}
+# at Container construction time, and newer tiled servers reject sort='' with
+# 422.  Monkey-patch Container.__init__ to strip the empty sort globally.
+# ---------------------------------------------------------------------------
+
+from tiled.client.container import Container as _Container
+
+_original_container_init = _Container.__init__
+
+
+def _patched_container_init(self, *args, **kwargs):
+    _original_container_init(self, *args, **kwargs)
+    if getattr(self, "_sorting_params", None) == {"sort": ""}:
+        self._sorting_params = {}
+    if getattr(self, "_reversed_sorting_params", None) == {"sort": ""}:
+        self._reversed_sorting_params = {}
+
+
+_Container.__init__ = _patched_container_init
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
