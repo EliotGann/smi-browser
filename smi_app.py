@@ -1003,6 +1003,16 @@ w_primary_y = pn.widgets.MultiChoice(
     name="Y axis (select columns)", options=[], width=400, max_items=6,
 )
 w_primary_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=300)
+w_primary_sort_btn = pn.widgets.Button(
+    name="Sort plot by table", button_type="default", width=140,
+)
+w_primary_fit = pn.widgets.Select(
+    name="Fit", options=["None", "Gaussian", "Knife edge"], value="None", width=120,
+)
+w_primary_fit_btn = pn.widgets.Button(
+    name="Fit", button_type="primary", width=60,
+)
+w_primary_fit_result = pn.pane.Markdown("", sizing_mode="stretch_width")
 
 w_baseline_table = pn.widgets.Tabulator(
     value=pd.DataFrame(columns=["field", "before", "after"]),
@@ -1291,6 +1301,8 @@ def _build_multiview_grid(frames, field):
     for i, disp in enumerate(displays):
         h, w = disp.shape
         kwargs = dict(
+            width=300,
+            height=300,
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
             match_aspect=True,
@@ -3651,15 +3663,21 @@ def _on_detail_tab(event):
             w_mv_spinner.visible = False
 
 
-def _update_primary_plot(*_events):
+def _update_primary_plot(*_events, use_table_order: bool = False):
     """Redraw the primary scatter plot as interactive Bokeh."""
     from bokeh.plotting import figure as bk_figure
 
     df = w_primary_table.value
+    if use_table_order:
+        try:
+            df = w_primary_table.current_view
+        except Exception:
+            pass
     x_col = w_primary_x.value
     y_cols = w_primary_y.value
     if df is None or df.empty or not x_col or not y_cols:
         w_primary_plot.object = None
+        w_primary_fit_result.object = ""
         return
     try:
         colors = ["black", "blue", "red", "green", "orange", "purple"]
@@ -3682,6 +3700,229 @@ def _update_primary_plot(*_events):
     except Exception as exc:
         log.warning("Primary plot failed: %s", exc)
         w_primary_plot.object = None
+
+
+def _on_primary_sort_btn(_event=None):
+    """Re-plot using the current table sort/filter order."""
+    _update_primary_plot(use_table_order=True)
+
+
+w_primary_sort_btn.on_click(_on_primary_sort_btn)
+
+
+def _fit_gaussian(x, y):
+    """Fit a Gaussian to (x, y) data. Returns dict of fit stats or None."""
+    from scipy.optimize import curve_fit
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 4:
+        return None
+
+    # Initial guesses
+    peak_idx = int(np.argmax(y))
+    amp_guess = float(y[peak_idx])
+    mu_guess = float(x[peak_idx])
+    # Estimate sigma from half-max width
+    half_max = amp_guess / 2
+    above = np.where(y >= half_max)[0]
+    if len(above) >= 2:
+        sigma_guess = (x[above[-1]] - x[above[0]]) / 2.355
+    else:
+        sigma_guess = (x[-1] - x[0]) / 6
+    sigma_guess = max(sigma_guess, 1e-12)
+    offset_guess = float(np.percentile(y, 5))
+
+    def gaussian(x, amp, mu, sigma, offset):
+        return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + offset
+
+    try:
+        popt, _ = curve_fit(
+            gaussian, x, y,
+            p0=[amp_guess - offset_guess, mu_guess, sigma_guess, offset_guess],
+            maxfev=5000,
+        )
+        amp, mu, sigma, offset = popt
+        fwhm = abs(sigma) * 2.3548
+        # Center of mass
+        y_shifted = y - y.min()
+        com = float(np.sum(x * y_shifted) / np.sum(y_shifted)) if np.sum(y_shifted) > 0 else mu
+        # Highest point
+        highest_x = float(x[peak_idx])
+        highest_y = float(y[peak_idx])
+        fit_y = gaussian(x, *popt)
+        return {
+            "type": "Gaussian",
+            "center": mu,
+            "fwhm": fwhm,
+            "amplitude": amp + offset,
+            "com": com,
+            "highest_x": highest_x,
+            "highest_y": highest_y,
+            "fit_x": x,
+            "fit_y": fit_y,
+        }
+    except Exception:
+        return None
+
+
+def _fit_knife_edge(x, y):
+    """Fit an error-function (knife edge) to (x, y). Returns dict or None."""
+    from scipy.optimize import curve_fit
+    from scipy.special import erf
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 4:
+        return None
+
+    # Sort by x for consistent fitting
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+
+    # Initial guesses
+    y_min, y_max = float(y.min()), float(y.max())
+    amp_guess = (y_max - y_min) / 2
+    offset_guess = (y_max + y_min) / 2
+    # Edge center: where y crosses midpoint
+    mid = (y_min + y_max) / 2
+    cross_idx = int(np.argmin(np.abs(y - mid)))
+    mu_guess = float(x[cross_idx])
+    sigma_guess = (x[-1] - x[0]) / 10
+    sigma_guess = max(abs(sigma_guess), 1e-12)
+
+    def knife_edge(x, amp, mu, sigma, offset):
+        return amp * erf((x - mu) / (sigma * np.sqrt(2))) + offset
+
+    try:
+        popt, _ = curve_fit(
+            knife_edge, x, y,
+            p0=[amp_guess, mu_guess, sigma_guess, offset_guess],
+            maxfev=5000,
+        )
+        amp, mu, sigma, offset = popt
+        fwhm = abs(sigma) * 2.3548  # width of the derivative Gaussian
+        # Center of mass of derivative (= edge location)
+        dy = np.gradient(y, x)
+        dy_abs = np.abs(dy)
+        com = float(np.sum(x * dy_abs) / np.sum(dy_abs)) if np.sum(dy_abs) > 0 else mu
+        # Highest point of derivative
+        peak_idx = int(np.argmax(dy_abs))
+        highest_x = float(x[peak_idx])
+        highest_y = float(dy[peak_idx])
+        fit_y = knife_edge(x, *popt)
+        return {
+            "type": "Knife edge",
+            "center": mu,
+            "fwhm": fwhm,
+            "amplitude": amp,
+            "com": com,
+            "highest_x": highest_x,
+            "highest_y": highest_y,
+            "fit_x": x,
+            "fit_y": fit_y,
+        }
+    except Exception:
+        return None
+
+
+def _on_primary_fit(_event=None):
+    """Run the selected fit on all plotted Y columns and overlay results."""
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import Legend, LegendItem
+
+    fit_type = w_primary_fit.value
+    if fit_type == "None":
+        w_primary_fit_result.object = ""
+        _update_primary_plot()
+        return
+
+    df = w_primary_table.value
+    try:
+        df = w_primary_table.current_view
+    except Exception:
+        pass
+    x_col = w_primary_x.value
+    y_cols = w_primary_y.value
+    if df is None or df.empty or not x_col or not y_cols:
+        return
+
+    colors = ["black", "blue", "red", "green", "orange", "purple"]
+    x = df[x_col].values.astype(float)
+
+    p = bk_figure(
+        title=f"{x_col} vs {', '.join(y_cols)} — {fit_type} fit", height=280,
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        sizing_mode="stretch_width",
+    )
+
+    results_md = []
+    for i, y_col in enumerate(y_cols):
+        y = df[y_col].values.astype(float)
+        c = colors[i % len(colors)]
+        p.scatter(x, y, color=c, size=4, legend_label=y_col)
+        p.line(x, y, line_color=c, line_width=1, line_alpha=0.4)
+
+        # Perform fit
+        if fit_type == "Gaussian":
+            result = _fit_gaussian(x.copy(), y.copy())
+        else:
+            result = _fit_knife_edge(x.copy(), y.copy())
+
+        if result is not None:
+            from bokeh.models import BoxAnnotation, Span
+
+            # Overlay fit curve
+            p.line(
+                result["fit_x"], result["fit_y"],
+                line_color=c, line_width=2.5, line_dash="dashed",
+                legend_label=f"{y_col} fit",
+            )
+            # Vertical line at fit center
+            center_span = Span(
+                location=result["center"], dimension="height",
+                line_color=c, line_width=1.5, line_dash="solid",
+                line_alpha=0.8,
+            )
+            p.add_layout(center_span)
+            # Vertical line at peak position (dotted, slightly thinner)
+            if abs(result["highest_x"] - result["center"]) > result["fwhm"] * 0.05:
+                peak_span = Span(
+                    location=result["highest_x"], dimension="height",
+                    line_color=c, line_width=1.2, line_dash="dotted",
+                    line_alpha=0.7,
+                )
+                p.add_layout(peak_span)
+            # FWHM shaded band centered on fit center
+            fwhm_lo = result["center"] - result["fwhm"] / 2
+            fwhm_hi = result["center"] + result["fwhm"] / 2
+            fwhm_box = BoxAnnotation(
+                left=fwhm_lo, right=fwhm_hi,
+                fill_color=c, fill_alpha=0.07,
+                line_color=c, line_alpha=0.3, line_width=1, line_dash="dashed",
+            )
+            p.add_layout(fwhm_box)
+            # Build stats string
+            stats = (
+                f"**{y_col}** ({result['type']}): "
+                f"center={result['center']:.5g}, "
+                f"FWHM={result['fwhm']:.5g}, "
+                f"COM={result['com']:.5g}, "
+                f"peak=({result['highest_x']:.5g}, {result['highest_y']:.5g})"
+            )
+            results_md.append(stats)
+        else:
+            results_md.append(f"**{y_col}**: fit failed")
+
+    p.xaxis.axis_label = x_col
+    p.legend.click_policy = "hide"
+    p.legend.label_text_font_size = "8pt"
+    w_primary_plot.object = p
+    w_primary_fit_result.object = "  \n".join(results_md)
+
+
+w_primary_fit_btn.on_click(_on_primary_fit)
 
 
 # --- Linked explore plot (1D primary + cursor synced with image slider) ---
@@ -3780,6 +4021,9 @@ w_explore_y.param.watch(_on_explore_xy, "value")
 
 w_primary_x.param.watch(_update_primary_plot, "value")
 w_primary_y.param.watch(_update_primary_plot, "value")
+w_primary_table.param.watch(
+    lambda *_e: _update_primary_plot(use_table_order=True), "sorters",
+)
 
 
 # Wire search events
@@ -5889,7 +6133,9 @@ w_detail_tabs = pn.Tabs(
             pn.Row(w_primary_status, w_primary_spinner),
             w_primary_table,
             pn.Row(w_primary_x, w_primary_y),
+            pn.Row(w_primary_sort_btn, w_primary_fit, w_primary_fit_btn),
             w_primary_plot,
+            w_primary_fit_result,
         ),
     ),
     (
