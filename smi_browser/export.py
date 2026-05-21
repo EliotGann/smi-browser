@@ -471,6 +471,13 @@ def export_scan(
         sample_name = start.get(
             "sample_name", start.get("sample", start.get("Sample", ""))
         )
+    # Resolve template placeholders in sample_name (e.g. {stage_y}, {target_name})
+    if sample_name and "{" in sample_name:
+        sample_name = resolve_name_template(
+            sample_name, primary_df, baseline_df,
+            frame_idx=None,
+            extra_context={"uid": uid, "uid_short": uid_short, "scan_id": scan_id},
+        )
     # Sanitize for filesystem
     def _safe(s: str) -> str:
         return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
@@ -634,3 +641,568 @@ def export_scan(
 
     log.info("export_scan: wrote %d items to %s", len(files_written), scan_dir)
     return scan_dir, files_written
+
+
+# ---------------------------------------------------------------------------
+# Name template resolution — resolve {field} placeholders from stream data
+# ---------------------------------------------------------------------------
+
+def resolve_name_template(
+    template: str,
+    primary_df: "pd.DataFrame | None" = None,
+    baseline_df: "pd.DataFrame | None" = None,
+    frame_idx: int | None = None,
+    extra_context: dict | None = None,
+    *,
+    max_depth: int = 3,
+    fmt: str = ".6g",
+) -> str:
+    """Resolve ``{field}`` placeholders in a sample name template.
+
+    Placeholders like ``{stage_y}`` or ``{pin_diode_current2_mean_value}``
+    are looked up from the primary stream DataFrame (per-frame) or baseline.
+    Resolution is recursive: if a resolved value is itself a string containing
+    ``{...}`` placeholders, those are resolved too (up to *max_depth* levels).
+
+    Parameters
+    ----------
+    template : str
+        The template string (e.g. ``"y{stage_y}_x{stage_x}_pd{pd_val}"``).
+    primary_df : DataFrame, optional
+        Primary stream data. Columns = fields, rows = frames.
+    baseline_df : DataFrame, optional
+        Baseline stream data.  Falls back here if field not in primary.
+    frame_idx : int, optional
+        Which frame row to use from primary_df.  If None, uses the median
+        for numeric columns or the first value for string columns (single
+        representative value for the whole scan).
+    extra_context : dict, optional
+        Additional key-value pairs to substitute (e.g. uid, scan_id).
+    max_depth : int
+        Maximum recursion depth for nested templates.
+    fmt : str
+        Format spec for numeric values (default: ".6g").
+
+    Returns
+    -------
+    str
+        The resolved string with placeholders filled in.
+    """
+    import re
+    import pandas as pd
+
+    if not template or "{" not in template:
+        return template
+
+    context = dict(extra_context) if extra_context else {}
+
+    def _lookup(field: str) -> str | None:
+        """Look up a field value, returning a string or None."""
+        # Check explicit extra_context first
+        if field in context:
+            return str(context[field])
+
+        # Primary stream
+        if primary_df is not None and field in primary_df.columns:
+            col = primary_df[field]
+            if frame_idx is not None and frame_idx < len(col):
+                val = col.iloc[frame_idx]
+            else:
+                # Representative value
+                if pd.api.types.is_numeric_dtype(col):
+                    val = col.dropna().median() if len(col.dropna()) else None
+                else:
+                    vals = col.dropna()
+                    val = vals.iloc[0] if len(vals) else None
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                return None
+            if isinstance(val, (int, np.integer)):
+                return str(int(val))
+            if isinstance(val, (float, np.floating)):
+                return format(val, fmt)
+            return str(val)
+
+        # Baseline stream
+        if baseline_df is not None and field in baseline_df.columns:
+            col = baseline_df[field]
+            vals = col.dropna()
+            if len(vals) == 0:
+                return None
+            val = vals.iloc[0]
+            if isinstance(val, (int, np.integer)):
+                return str(int(val))
+            if isinstance(val, (float, np.floating)):
+                return format(val, fmt)
+            return str(val)
+
+        return None
+
+    def _resolve(text: str, depth: int) -> str:
+        if depth <= 0 or "{" not in text:
+            return text
+        # Match {field_name} but NOT {{escaped}}
+        def _replace(m):
+            field = m.group(1)
+            val = _lookup(field)
+            if val is None:
+                return m.group(0)  # Leave unresolved
+            # Recurse: the resolved value might itself be a template
+            return _resolve(val, depth - 1)
+
+        return re.sub(r"\{([^{}]+)\}", _replace, text)
+
+    return _resolve(template, max_depth)
+
+
+def resolve_name_template_all_frames(
+    template: str,
+    primary_df: "pd.DataFrame | None" = None,
+    baseline_df: "pd.DataFrame | None" = None,
+    extra_context: dict | None = None,
+    *,
+    max_depth: int = 3,
+    fmt: str = ".6g",
+) -> list[str]:
+    """Resolve a name template for every frame in primary_df.
+
+    Returns a list of resolved strings, one per frame (row in primary_df).
+    If primary_df is None or empty, returns a single-element list with the
+    scan-level resolution.
+    """
+    if primary_df is None or primary_df.empty:
+        return [resolve_name_template(
+            template, primary_df, baseline_df,
+            frame_idx=None, extra_context=extra_context,
+            max_depth=max_depth, fmt=fmt,
+        )]
+
+    n_frames = len(primary_df)
+    return [
+        resolve_name_template(
+            template, primary_df, baseline_df,
+            frame_idx=i, extra_context=extra_context,
+            max_depth=max_depth, fmt=fmt,
+        )
+        for i in range(n_frames)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Name parsing utility — find common/distinct parts across sample names
+# ---------------------------------------------------------------------------
+
+def parse_name_parts(names: list[str]) -> dict:
+    """Analyse a list of sample names to find common and distinct parts.
+
+    Splits each name on common separators (_, -, whitespace) and identifies
+    which tokens are shared across all names vs. which vary.
+
+    Returns
+    -------
+    dict with keys:
+        common_prefix : str — longest common prefix string
+        common_suffix : str — longest common suffix string
+        common_tokens : list[str] — tokens shared by all names
+        distinct_tokens : list[list[str]] — per-name list of tokens that differ
+        distinct_strings : list[str] — per-name joined distinct parts
+        suggested_basename : str — common tokens joined with '_'
+        suggested_labels : list[str] — distinct parts as compact labels
+    """
+    import re
+
+    if not names:
+        return {
+            "common_prefix": "",
+            "common_suffix": "",
+            "common_tokens": [],
+            "distinct_tokens": [],
+            "distinct_strings": [],
+            "suggested_basename": "",
+            "suggested_labels": [],
+        }
+
+    if len(names) == 1:
+        return {
+            "common_prefix": names[0],
+            "common_suffix": "",
+            "common_tokens": [names[0]],
+            "distinct_tokens": [[]],
+            "distinct_strings": [""],
+            "suggested_basename": names[0],
+            "suggested_labels": [""],
+        }
+
+    # Common prefix/suffix (character-level)
+    def _common_prefix(strs):
+        if not strs:
+            return ""
+        s0 = strs[0]
+        for i, ch in enumerate(s0):
+            if any(i >= len(s) or s[i] != ch for s in strs[1:]):
+                return s0[:i]
+        return s0
+
+    prefix = _common_prefix(names)
+    suffix = _common_prefix([n[::-1] for n in names])[::-1]
+
+    # Tokenize by separators (keep separators for reconstruction)
+    def _tokenize(name):
+        return re.split(r'([_\-\s]+)', name)
+
+    token_lists = [_tokenize(n) for n in names]
+
+    # Find common token positions (tokens that are identical across all names)
+    # Use the shortest token list as reference
+    min_len = min(len(tl) for tl in token_lists)
+    common_positions: set[int] = set()
+    for i in range(min_len):
+        vals = {tl[i] for tl in token_lists}
+        if len(vals) == 1:
+            common_positions.add(i)
+
+    common_tokens = []
+    if token_lists:
+        for i in sorted(common_positions):
+            tok = token_lists[0][i]
+            if tok.strip():  # skip separator-only tokens
+                common_tokens.append(tok)
+
+    distinct_tokens = []
+    distinct_strings = []
+    for tl in token_lists:
+        dparts = []
+        for i, tok in enumerate(tl):
+            if i not in common_positions and tok.strip():
+                dparts.append(tok)
+        distinct_tokens.append(dparts)
+        distinct_strings.append("_".join(dparts) if dparts else "")
+
+    suggested_basename = "_".join(common_tokens) if common_tokens else ""
+    suggested_labels = distinct_strings
+
+    return {
+        "common_prefix": prefix,
+        "common_suffix": suffix,
+        "common_tokens": common_tokens,
+        "distinct_tokens": distinct_tokens,
+        "distinct_strings": distinct_strings,
+        "suggested_basename": suggested_basename,
+        "suggested_labels": suggested_labels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Collection export — combine multiple scans into a single output
+# ---------------------------------------------------------------------------
+
+def export_collection(
+    *,
+    out_dir: Path,
+    results: list[tuple[str, Any]],  # list of (uid, CombinedReductionResult)
+    scan_labels: list[str],           # one label per scan (user-chosen)
+    basename: str = "collection",
+    formats: set[str] | None = None,
+    params_list: list[dict] | None = None,
+    metadata_list: list[dict] | None = None,
+) -> tuple[Path, list[str]]:
+    """Export a collection of scans as combined single-file outputs.
+
+    Parameters
+    ----------
+    out_dir : Path
+        Output directory (already resolved).
+    results : list of (uid, result) tuples
+        Each result is a CombinedReductionResult with .merged_iq, .merged_qchi.
+    scan_labels : list[str]
+        One human-readable label per scan (e.g. "T=25°C" or "wa1").
+    basename : str
+        Base filename for all outputs.
+    formats : set[str], optional
+        Which formats to produce. Keys: "h5", "csv_iq", "png_iq", "png_linecuts".
+    params_list : list[dict], optional
+        Processing parameters per scan (saved in HDF5 metadata).
+    metadata_list : list[dict], optional
+        Raw metadata per scan (saved in HDF5).
+
+    Returns
+    -------
+    (out_dir, files_written) : tuple[Path, list[str]]
+    """
+    import pandas as pd
+    import h5py
+
+    if formats is None:
+        formats = {"h5", "csv_iq", "png_iq"}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files_written: list[str] = []
+
+    def _safe(s: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+
+    safe_basename = _safe(basename) if basename else "collection"
+    n_scans = len(results)
+
+    # Collect I(q) data from all scans
+    iq_data: list[dict] = []  # {label, q, I, saxs_I?, waxs_I?}
+    for i, (uid, result) in enumerate(results):
+        if result is None or not hasattr(result, "merged_iq"):
+            continue
+        iq = result.merged_iq
+        entry: dict[str, Any] = {
+            "label": scan_labels[i] if i < len(scan_labels) else uid[:8],
+            "uid": uid,
+            "q": iq["q"].values,
+            "I": iq["I"].values,
+        }
+        if "saxs_I" in iq:
+            entry["saxs_I"] = iq["saxs_I"].values
+        if "waxs_I" in iq:
+            entry["waxs_I"] = iq["waxs_I"].values
+        iq_data.append(entry)
+
+    # --- HDF5: combined dataset ---
+    if "h5" in formats and iq_data:
+        h5_path = out_dir / f"{safe_basename}.h5"
+        with h5py.File(h5_path, "w") as f:
+            # Store shared q axis (from first scan — assumed common)
+            q0 = iq_data[0]["q"]
+            f.create_dataset("q", data=q0)
+            f.attrs["n_scans"] = n_scans
+            f.attrs["basename"] = basename
+
+            # Store scan labels as dataset for easy reading
+            label_strings = [
+                scan_labels[i] if i < len(scan_labels) else f"frame_{i}"
+                for i in range(n_scans)
+            ]
+            f.create_dataset(
+                "scan_labels",
+                data=np.array(label_strings, dtype=h5py.string_dtype()),
+            )
+
+            # --- Per-scan I(q) (groups + stacked matrix) ---
+            iq_grp = f.create_group("iq")
+            for entry in iq_data:
+                label = _safe(entry["label"])
+                sg = iq_grp.create_group(label)
+                sg.create_dataset("I", data=entry["I"])
+                if "saxs_I" in entry:
+                    sg.create_dataset("saxs_I", data=entry["saxs_I"])
+                if "waxs_I" in entry:
+                    sg.create_dataset("waxs_I", data=entry["waxs_I"])
+                sg.attrs["uid"] = entry["uid"]
+                sg.attrs["label"] = entry["label"]
+
+            # Stacked I(q) matrix (n_scans x n_q) for easy array access
+            I_matrix = np.array([e["I"] for e in iq_data])
+            f.create_dataset("I_matrix", data=I_matrix)
+            # Also stack saxs/waxs if available
+            if all("saxs_I" in e for e in iq_data):
+                f.create_dataset(
+                    "saxs_I_matrix",
+                    data=np.array([e["saxs_I"] for e in iq_data]),
+                )
+            if all("waxs_I" in e for e in iq_data):
+                f.create_dataset(
+                    "waxs_I_matrix",
+                    data=np.array([e["waxs_I"] for e in iq_data]),
+                )
+
+            # --- Per-scan 2D q-chi maps (groups + stacked 3D array) ---
+            qchi_grp = f.create_group("qchi")
+            qchi_arrays = []
+            chi_coords = None
+            q_coords = None
+            for i, (uid, result) in enumerate(results):
+                if result is None or not hasattr(result, "merged_qchi"):
+                    continue
+                qchi = result.merged_qchi
+                label = _safe(scan_labels[i] if i < len(scan_labels) else uid[:8])
+                intensity = qchi["intensity"].values
+                # Handle per-frame qchi within a single scan: take frame 0 or mean
+                if intensity.ndim == 3:
+                    # (frame, chi, q) -> average across frames for this scan
+                    intensity = np.nanmean(intensity, axis=0)
+                sg = qchi_grp.create_group(label)
+                sg.create_dataset("intensity", data=intensity)
+                sg.attrs["uid"] = uid
+                sg.attrs["label"] = scan_labels[i] if i < len(scan_labels) else uid[:8]
+                qchi_arrays.append(intensity)
+                # Store coordinates from first valid scan
+                if chi_coords is None and "chi" in qchi.coords:
+                    chi_coords = qchi["chi"].values
+                if q_coords is None and "q" in qchi.coords:
+                    q_coords = qchi["q"].values
+
+            # Store q-chi coordinate axes
+            if chi_coords is not None:
+                qchi_grp.create_dataset("chi", data=chi_coords)
+            if q_coords is not None:
+                qchi_grp.create_dataset("q", data=q_coords)
+
+            # Stacked 3D array (n_scans x n_chi x n_q) if shapes are compatible
+            if qchi_arrays and all(
+                a.shape == qchi_arrays[0].shape for a in qchi_arrays
+            ):
+                f.create_dataset(
+                    "qchi_matrix", data=np.array(qchi_arrays),
+                )
+
+            # --- Per-scan per-frame I(q) (if scans have multi-frame data) ---
+            # Store individual frame I(q) curves within each scan, labeled
+            pf_grp = f.create_group("per_frame_iq")
+            for i, (uid, result) in enumerate(results):
+                if result is None:
+                    continue
+                pf_iq = getattr(result, "per_frame_iq", None)
+                if pf_iq is None or "I" not in pf_iq or "frame" not in pf_iq.dims:
+                    continue
+                scan_label = _safe(
+                    scan_labels[i] if i < len(scan_labels) else uid[:8]
+                )
+                sg = pf_grp.create_group(scan_label)
+                sg.attrs["uid"] = uid
+                sg.attrs["n_frames"] = pf_iq.sizes["frame"]
+                sg.create_dataset("q", data=pf_iq["q"].values)
+                sg.create_dataset("I", data=pf_iq["I"].values)  # (n_frames, n_q)
+                if "saxs_I" in pf_iq:
+                    sg.create_dataset("saxs_I", data=pf_iq["saxs_I"].values)
+                if "waxs_I" in pf_iq:
+                    sg.create_dataset("waxs_I", data=pf_iq["waxs_I"].values)
+                # Store frame-level scalar labels from per_frame_iq
+                for var in pf_iq.data_vars:
+                    if var in ("I", "saxs_I", "waxs_I"):
+                        continue
+                    arr = pf_iq[var]
+                    if arr.dims == ("frame",):
+                        sg.create_dataset(var, data=arr.values)
+
+            # --- Per-scan per-frame 2D q-chi (if multi-frame) ---
+            pf_qchi_grp = f.create_group("per_frame_qchi")
+            for i, (uid, result) in enumerate(results):
+                if result is None or not hasattr(result, "merged_qchi"):
+                    continue
+                qchi = result.merged_qchi
+                if "frame" not in qchi.dims:
+                    continue
+                scan_label = _safe(
+                    scan_labels[i] if i < len(scan_labels) else uid[:8]
+                )
+                intensity = qchi["intensity"].values  # (n_frames, n_chi, n_q)
+                sg = pf_qchi_grp.create_group(scan_label)
+                sg.attrs["uid"] = uid
+                sg.attrs["n_frames"] = qchi.sizes["frame"]
+                sg.create_dataset("intensity", data=intensity)
+                if "q" in qchi.coords:
+                    sg.create_dataset("q", data=qchi["q"].values)
+                if "chi" in qchi.coords:
+                    sg.create_dataset("chi", data=qchi["chi"].values)
+
+            # Parameters
+            if params_list:
+                p_grp = f.create_group("parameters")
+                for i, params in enumerate(params_list):
+                    if params:
+                        label = _safe(
+                            scan_labels[i] if i < len(scan_labels) else f"scan_{i}"
+                        )
+                        sg = p_grp.create_group(label)
+                        for k, v in params.items():
+                            try:
+                                if v is None:
+                                    sg.attrs[k] = "None"
+                                elif isinstance(v, (list, tuple)):
+                                    sg.attrs[k] = list(v)
+                                else:
+                                    sg.attrs[k] = v
+                            except TypeError:
+                                sg.attrs[k] = str(v)
+
+            # Metadata
+            if metadata_list:
+                m_grp = f.create_group("metadata")
+                for i, md in enumerate(metadata_list):
+                    if md:
+                        label = _safe(
+                            scan_labels[i] if i < len(scan_labels) else f"scan_{i}"
+                        )
+                        sg = m_grp.create_group(label)
+                        start = md.get("start", {})
+                        for k, v in start.items():
+                            try:
+                                sg.attrs[k] = v if v is not None else "None"
+                            except TypeError:
+                                sg.attrs[k] = str(v)
+
+        files_written.append(f"{safe_basename}.h5")
+
+    # --- CSV: multi-scan I(q) (q as rows, each scan as a column) ---
+    if "csv_iq" in formats and iq_data:
+        # Use first scan's q as reference
+        q_ref = iq_data[0]["q"]
+        df_dict: dict[str, Any] = {"q": q_ref}
+        for entry in iq_data:
+            label = entry["label"]
+            # Interpolate to common q if needed
+            if len(entry["q"]) == len(q_ref) and np.allclose(
+                entry["q"], q_ref, rtol=1e-6
+            ):
+                df_dict[f"I_{label}"] = entry["I"]
+            else:
+                df_dict[f"I_{label}"] = np.interp(
+                    q_ref, entry["q"], entry["I"],
+                    left=np.nan, right=np.nan,
+                )
+            if "saxs_I" in entry:
+                s_key = f"saxs_I_{label}"
+                if len(entry["q"]) == len(q_ref) and np.allclose(
+                    entry["q"], q_ref, rtol=1e-6
+                ):
+                    df_dict[s_key] = entry["saxs_I"]
+                else:
+                    df_dict[s_key] = np.interp(
+                        q_ref, entry["q"], entry["saxs_I"],
+                        left=np.nan, right=np.nan,
+                    )
+            if "waxs_I" in entry:
+                w_key = f"waxs_I_{label}"
+                if len(entry["q"]) == len(q_ref) and np.allclose(
+                    entry["q"], q_ref, rtol=1e-6
+                ):
+                    df_dict[w_key] = entry["waxs_I"]
+                else:
+                    df_dict[w_key] = np.interp(
+                        q_ref, entry["q"], entry["waxs_I"],
+                        left=np.nan, right=np.nan,
+                    )
+        csv_path = out_dir / f"{safe_basename}_iq.csv"
+        pd.DataFrame(df_dict).to_csv(csv_path, index=False)
+        files_written.append(f"{safe_basename}_iq.csv")
+
+    # --- PNG: multi-scan I(q) overlay ---
+    if "png_iq" in formats and iq_data:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for entry in iq_data:
+            q, I = entry["q"], entry["I"]
+            mask = np.isfinite(I) & (I > 0)
+            if mask.any():
+                ax.plot(q[mask], I[mask], lw=1.2, alpha=0.8, label=entry["label"])
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("q (nm⁻¹)")
+        ax.set_ylabel("I(q)")
+        ax.set_title(f"{basename} — I(q) comparison")
+        ax.legend(fontsize=8, loc="best")
+        fig.tight_layout()
+        png_path = out_dir / f"{safe_basename}_iq.png"
+        fig.savefig(png_path, dpi=150)
+        plt.close(fig)
+        files_written.append(f"{safe_basename}_iq.png")
+
+    log.info("export_collection: wrote %d items to %s", len(files_written), out_dir)
+    return out_dir, files_written

@@ -132,20 +132,20 @@ DEFAULT_N_QZ = 500
 DEFAULT_SOLID_ANGLE = True
 DEFAULT_SAXS_AGBH_RING_ORDER = 5
 DEFAULT_SAXS_Q_MARGIN_FRACTION = 0.01
-DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG = 0.0
+DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG = 0.08
 DEFAULT_BEAMSTOP_MAX_ABS_ARC_DEG = 15.0
 DEFAULT_DYN_SHADOW_BEAM_VISIBLE_DEG = 14.5
 DEFAULT_DYN_SHADOW_CLEAR_EDGE_DEG = 18.0
 DEFAULT_DYN_APER_AGBH_RING_ORDER = 5
 DEFAULT_DYN_APER_Q_MARGIN_FRACTION = 0.01
 DEFAULT_WAXS_ENERGY_KEV = 16.1
-DEFAULT_WAXS_SAMPLE_DIST_MM = 274.0
+DEFAULT_WAXS_SAMPLE_DIST_MM = 273.0
 DEFAULT_WAXS_PIXEL_SIZE_MM = 0.172
 DEFAULT_WAXS_BEAM_CENTER_ROW = 217.0
 DEFAULT_WAXS_BEAM_CENTER_COL = 319.0
 DEFAULT_WAXS_THETA_ZERO_DEG = 0.0
 DEFAULT_WAXS_SAMPLE_OFFSET_X_MM = 0.0
-DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM = 2.0
+DEFAULT_WAXS_SAMPLE_OFFSET_Z_MM = 0.0
 DEFAULT_WAXS_Q_HORIZONTAL_SIGN = -1.0
 DEFAULT_WAXS_Q_VERTICAL_SIGN = -1.0
 DEFAULT_WAXS_ROTATION_K = 3
@@ -4523,6 +4523,26 @@ def _batch_add_fn(result, summary, params):
             log.exception("Batch auto-export failed for %s", result.uid[:8])
 
 
+def _prefetch_image_caches(uids: list[str]) -> None:
+    """Ensure an HDF5 cache file exists for each UID.
+
+    When ``reduce_smi_combined`` receives an ``image_cache_path`` pointing
+    to an existing file, it skips the expensive ``populate_cache`` step
+    (which re-fetches images from Tiled a second time just to write them).
+    Creating the empty file is enough — the reduction still loads images
+    from Tiled once, but avoids the redundant second fetch+write.
+    """
+    import h5py
+
+    for uid in uids:
+        cp = cache_path(uid)
+        if not cp.exists():
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            with h5py.File(cp, "w"):
+                pass  # empty file is sufficient
+            log.debug("batch: created empty cache for %s", uid[:8])
+
+
 def _ensure_batch_processor() -> BatchProcessor:
     bp = _batch_state.get("processor")
     workers = max(1, int(w_batch_max_workers.value or 1))
@@ -4602,6 +4622,10 @@ def _on_batch_queue(event):
         return
 
     _batch_state["summaries"] = {}  # populated lazily during processing
+
+    # Ensure empty cache files exist so reduce_smi_combined skips the
+    # redundant populate_cache (second Tiled fetch) for each scan.
+    _prefetch_image_caches([uid for uid, _label in items])
 
     bp = _ensure_batch_processor()
     n = bp.enqueue(items)
@@ -6007,20 +6031,287 @@ detail_panel = pn.Column(
     min_width=600,
 )
 
+# ---------------------------------------------------------------------------
+# Collection Export — widgets + panel
+# ---------------------------------------------------------------------------
+
+from smi_browser.export import export_collection, parse_name_parts
+
+w_coll_export_label_src = pn.widgets.Select(
+    name="Scan label source",
+    options=["(auto — sample name distinct parts)"],
+    value="(auto — sample name distinct parts)",
+    width=260,
+)
+w_coll_export_basename = pn.widgets.TextInput(
+    name="Output basename",
+    value="",
+    placeholder="(auto from common sample parts)",
+    width=260,
+)
+w_coll_export_name_info = pn.pane.Markdown(
+    "*Add scans to the collection to see name analysis.*",
+    stylesheets=[":host { font-size: 11px; color: #555; }"],
+    sizing_mode="stretch_width",
+)
+w_coll_export_dir = pn.widgets.TextInput(
+    name="Output directory (relative to proposal)",
+    value="projects/{project_name}/analysis",
+    width=400,
+)
+w_coll_export_resolved = pn.pane.Markdown("", sizing_mode="stretch_width")
+
+w_coll_export_h5 = pn.widgets.Checkbox(name="HDF5 combined", value=True)
+w_coll_export_csv = pn.widgets.Checkbox(name="CSV multi-I(q)", value=True)
+w_coll_export_png = pn.widgets.Checkbox(name="PNG I(q) overlay", value=True)
+
+w_btn_coll_export = pn.widgets.Button(
+    name="Export Collection", button_type="success", width=160,
+)
+w_coll_export_status = pn.pane.Markdown("", sizing_mode="stretch_width")
+w_coll_export_spinner = pn.indicators.LoadingSpinner(
+    value=False, size=20, visible=False,
+)
+
+coll_export_panel = pn.Column(
+    pn.pane.Markdown(
+        "**Export entire collection** as combined files — "
+        "all scans merged into single HDF5, CSV, and plots "
+        "with per-scan labels."
+    ),
+    pn.Row(w_coll_export_label_src, w_coll_export_basename),
+    w_coll_export_name_info,
+    pn.layout.Divider(),
+    pn.Row(w_coll_export_dir, sizing_mode="stretch_width"),
+    w_coll_export_resolved,
+    pn.layout.Divider(),
+    pn.pane.Markdown("**Output formats:**"),
+    pn.Row(w_coll_export_h5, w_coll_export_csv, w_coll_export_png),
+    pn.layout.Divider(),
+    pn.Row(w_btn_coll_export, w_coll_export_status, w_coll_export_spinner),
+    sizing_mode="stretch_width",
+)
+
+
+def _refresh_coll_export_labels():
+    """Update label source options and name analysis from collection."""
+    # Build label source options
+    opts = ["(auto — sample name distinct parts)"]
+    # Add start metadata fields that vary
+    varying = _collection.varying_parameters()
+    for key in sorted(varying.keys()):
+        opts.append(f"start:{key}")
+    # Add available label columns (primary + baseline)
+    for col in _collection.available_label_columns():
+        opts.append(col)
+    w_coll_export_label_src.options = opts
+    if w_coll_export_label_src.value not in opts:
+        w_coll_export_label_src.value = opts[0]
+
+    # Name analysis — use resolved sample names (templates filled from streams)
+    names = [
+        _collection.resolved_sample_name(uid)
+        for uid in _collection.uids
+    ]
+    if len(names) >= 2:
+        parts = parse_name_parts(names)
+        info_lines = []
+        if parts["suggested_basename"]:
+            info_lines.append(
+                f"**Common:** `{parts['suggested_basename']}`"
+            )
+        if parts["distinct_strings"]:
+            distinct_preview = ", ".join(
+                f"`{d}`" for d in parts["distinct_strings"][:6]
+            )
+            if len(parts["distinct_strings"]) > 6:
+                distinct_preview += f" … +{len(parts['distinct_strings']) - 6}"
+            info_lines.append(f"**Distinct:** {distinct_preview}")
+        w_coll_export_name_info.object = "  \n".join(info_lines) if info_lines else ""
+        # Auto-fill basename if empty
+        if not w_coll_export_basename.value and parts["suggested_basename"]:
+            w_coll_export_basename.value = parts["suggested_basename"]
+    elif len(names) == 1:
+        w_coll_export_name_info.object = f"*Single scan: `{names[0]}`*"
+    else:
+        w_coll_export_name_info.object = (
+            "*Add scans to the collection to see name analysis.*"
+        )
+
+
+def _resolve_coll_export_dir() -> Path | None:
+    """Resolve the collection export output directory."""
+    rel = w_coll_export_dir.value.strip() or "projects/{project_name}/analysis"
+    proj = w_proposal_project.value
+    # Try proposal dropdown
+    ds = w_proposal_select.value
+    if ds and not ds.startswith("("):
+        return resolve_output_dir(ds, proj, relative_path=rel)
+    # Fallback: use first scan's data_session
+    if _collection.uids:
+        first_uid = _collection.uids[0]
+        md = _collection.get_raw_metadata(first_uid)
+        if md:
+            scan_ds = md.get("start", {}).get("data_session")
+            if scan_ds:
+                return resolve_output_dir(scan_ds, proj, relative_path=rel)
+    return None
+
+
+def _refresh_coll_export_resolved():
+    """Show resolved path in collection export panel."""
+    resolved = _resolve_coll_export_dir()
+    if resolved:
+        w_coll_export_resolved.object = f"*Resolved: `{resolved}`*"
+    else:
+        w_coll_export_resolved.object = (
+            "*Cannot resolve — select a proposal or add scans.*"
+        )
+
+
+def _get_coll_scan_labels() -> list[str]:
+    """Build per-scan labels based on the chosen label source."""
+    src = w_coll_export_label_src.value
+    labels = []
+    if src == "(auto — sample name distinct parts)":
+        # Use distinct parts from resolved name parsing
+        names = [_collection.resolved_sample_name(u) for u in _collection.uids]
+        parts = parse_name_parts(names)
+        for idx, uid in enumerate(_collection.uids):
+            if idx < len(parts["distinct_strings"]) and parts["distinct_strings"][idx]:
+                labels.append(parts["distinct_strings"][idx])
+            else:
+                labels.append(uid[:8])
+    else:
+        for uid in _collection.uids:
+            if src.startswith("start:"):
+                field = src[len("start:"):]
+                md = _collection.get_raw_metadata(uid)
+                if md:
+                    val = md.get("start", {}).get(field, "?")
+                    labels.append(str(val))
+                else:
+                    labels.append(uid[:8])
+            elif src.startswith("baseline:"):
+                labels.append(_collection.get_label_value(uid, src))
+            else:
+                # Primary column
+                labels.append(_collection.get_label_value(uid, src))
+    return labels
+
+
+def _coll_export_formats() -> set[str]:
+    """Gather selected collection export formats."""
+    fmts: set[str] = set()
+    if w_coll_export_h5.value:
+        fmts.add("h5")
+    if w_coll_export_csv.value:
+        fmts.add("csv_iq")
+    if w_coll_export_png.value:
+        fmts.add("png_iq")
+    return fmts
+
+
+def _on_coll_export(event):
+    """Handle the Export Collection button click."""
+    if not _collection.uids:
+        w_coll_export_status.object = "⚠️ *No scans in collection.*"
+        return
+
+    out_dir = _resolve_coll_export_dir()
+    if out_dir is None:
+        w_coll_export_status.object = "⚠️ *Cannot resolve output directory.*"
+        return
+
+    w_coll_export_spinner.value = True
+    w_coll_export_spinner.visible = True
+    w_coll_export_status.object = ""
+
+    try:
+        # Gather results
+        results_list = [
+            (uid, _collection.get_result(uid))
+            for uid in _collection.uids
+        ]
+        scan_labels = _get_coll_scan_labels()
+        basename = (
+            w_coll_export_basename.value.strip()
+            or parse_name_parts([
+                _collection._metadata.get(uid, {}).get("sample_name", "?")
+                for uid in _collection.uids
+            ])["suggested_basename"]
+            or "collection"
+        )
+        params_list = [
+            _collection._processing.get(uid, {})
+            for uid in _collection.uids
+        ]
+        metadata_list = [
+            _collection.get_raw_metadata(uid)
+            for uid in _collection.uids
+        ]
+
+        _, files = export_collection(
+            out_dir=out_dir,
+            results=results_list,
+            scan_labels=scan_labels,
+            basename=basename,
+            formats=_coll_export_formats(),
+            params_list=params_list,
+            metadata_list=metadata_list,
+        )
+        w_coll_export_status.object = (
+            f"✅ Wrote **{len(files)}** files to `{out_dir}`"
+        )
+    except Exception as exc:
+        log.exception("Collection export failed")
+        w_coll_export_status.object = f"❌ *Error: {exc}*"
+    finally:
+        w_coll_export_spinner.value = False
+        w_coll_export_spinner.visible = False
+
+
+w_btn_coll_export.on_click(_on_coll_export)
+
+# Refresh collection export info whenever collection changes
+_orig_coll_refresh = _coll_ns.refresh
+
+
+def _coll_refresh_with_export():
+    """Refresh collection UI + export panel info."""
+    _orig_coll_refresh()
+    _refresh_coll_export_labels()
+    _refresh_coll_export_resolved()
+
+
+_coll_ns.refresh = _coll_refresh_with_export
+
+# ---------------------------------------------------------------------------
+
 collection_card = pn.Card(
-    pn.Row(
-        pn.Column(
-            pn.Row(w_btn_coll_remove, w_coll_label),
-            w_coll_table,
-            sizing_mode="stretch_width",
-            min_width=300,
-            max_width=500,
+    pn.Tabs(
+        (
+            "Compare",
+            pn.Row(
+                pn.Column(
+                    pn.Row(w_btn_coll_remove, w_coll_label),
+                    w_coll_table,
+                    sizing_mode="stretch_width",
+                    min_width=300,
+                    max_width=500,
+                ),
+                pn.Column(
+                    w_coll_compare_plot,
+                    sizing_mode="stretch_width",
+                    min_width=400,
+                    height=500,
+                ),
+                sizing_mode="stretch_width",
+            ),
         ),
-        pn.Column(
-            w_coll_compare_plot,
-            sizing_mode="stretch_width",
-            min_width=400,
-            height=500,
+        (
+            "Export Collection",
+            coll_export_panel,
         ),
         sizing_mode="stretch_width",
     ),

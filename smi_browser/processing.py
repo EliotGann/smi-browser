@@ -28,7 +28,7 @@ def build_proc_params(
     waxs_col_delta: float = 0.0,
     saxs_dist_delta: float = 0.0,
     # WAXS beam col per arc
-    waxs_beam_col_per_arc_deg: float = 0.0,
+    waxs_beam_col_per_arc_deg: float = 0.08,
     # GI grid
     n_qxy: int = 500,
     n_qz: int = 500,
@@ -73,9 +73,9 @@ def build_proc_params(
     default_saxs_row_delta: float = 0.0,
     default_saxs_col_delta: float = 0.0,
     default_waxs_row_delta: float = 0.0,
-    default_waxs_col_delta: float = 0.0,
+    default_waxs_col_delta: float = -4.5,
     default_saxs_dist_delta: float = 0.0,
-    default_waxs_beam_col_per_arc_deg: float = 0.0,
+    default_waxs_beam_col_per_arc_deg: float = 0.08,
     default_beamstop_max_abs_arc_deg: float = 15.0,
     default_saxs_agbh_ring_order: int = 5,
     default_saxs_q_margin_fraction: float = 0.01,

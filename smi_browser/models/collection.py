@@ -131,6 +131,22 @@ class ScanCollection:
                     return f"{vals.median():.6g}"
         return "?"
 
+    def resolved_sample_name(self, uid: str) -> str:
+        """Resolve the sample_name template for a scan using its stream data."""
+        from smi_browser.export import resolve_name_template
+
+        meta = self._metadata.get(uid, {})
+        raw = meta.get("sample_name", "?")
+        if "{" not in raw:
+            return raw
+        return resolve_name_template(
+            raw,
+            primary_df=self._primary_dfs.get(uid),
+            baseline_df=self._baseline_dfs.get(uid),
+            frame_idx=None,
+            extra_context={"uid": uid, "uid_short": uid[:8]},
+        )
+
     def get_primary_df(self, uid: str) -> pd.DataFrame | None:
         return self._primary_dfs.get(uid)
 
@@ -162,7 +178,7 @@ class ScanCollection:
             row = {
                 "color":     self._colors.get(uid, "#888888"),
                 "uid_short": uid[:8],
-                "sample":    meta.get("sample_name", "?"),
+                "sample":    self.resolved_sample_name(uid),
                 "plan":      meta.get("plan_name", "?"),
                 "detectors": detectors,
                 "geometry":  res.geometry,
