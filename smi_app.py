@@ -5500,6 +5500,10 @@ w_btn_live = pn.widgets.Toggle(
     name="🔴 Go Live", value=False,
     button_type="danger", width=140,
 )
+
+w_btn_update = pn.widgets.Button(
+    name="🔄 Update", button_type="light", width=100,
+)
 w_live_banner = pn.pane.Markdown(
     "", visible=False,
     styles={
@@ -5777,6 +5781,88 @@ def _exit_live_mode() -> None:
 w_btn_live.param.watch(_on_live_toggle, "value")
 
 
+def _on_update(_event=None):
+    """Refresh search results and reload the selected scan if it has more data."""
+    # 1) Re-run the current search to pick up new scans
+    try:
+        _do_search(_state["page"])
+    except Exception as exc:
+        log.warning("Update search failed: %s", exc)
+
+    # 2) Check if the currently selected scan has grown (more data points)
+    uid = _state.get("selected_uid")
+    if not uid:
+        return
+
+    try:
+        # Re-fetch the run node from tiled (fresh metadata)
+        run = _get_cat()[uid]
+        stop = run.metadata.get("stop", {})
+        num_events = stop.get("num_events", {})
+        if isinstance(num_events, dict):
+            new_n_steps = num_events.get("primary", 0)
+        else:
+            new_n_steps = int(num_events) if num_events else 0
+
+        # Compare with what we previously had
+        old_summary = _detail_cache.get("summary")
+        old_n_steps = 0
+        if old_summary:
+            try:
+                old_n_steps = int(old_summary.get("n_steps", 0))
+            except (ValueError, TypeError):
+                old_n_steps = 0
+
+        if new_n_steps > old_n_steps:
+            log.info(
+                "Update: scan %s grew from %d to %d steps — reloading",
+                uid[:8], old_n_steps, new_n_steps,
+            )
+            # Invalidate local caches so fresh data is fetched
+            _detail_cache.update(
+                run=run, summary=None,
+                primary_loaded=False, baseline_loaded=False,
+                images_loaded=False,
+                primary_info=None, primary_dataset=None,
+            )
+            # Invalidate the disk cache for scalars so they are re-fetched
+            from smi_browser.cache import ScanCache
+            cache = ScanCache(uid)
+            if cache.exists():
+                import h5py
+                try:
+                    with cache._lock:
+                        with h5py.File(cache.path, "a") as f:
+                            if "primary" in f:
+                                del f["primary"]
+                            if "images" in f:
+                                del f["images"]
+                except Exception:
+                    pass
+
+            # Reload metadata and active tab
+            _load_metadata(uid)
+            active_tab = w_detail_tabs.active
+            _load_active_tab(active_tab)
+
+            try:
+                pn.state.notifications.info(
+                    f"Scan updated: {old_n_steps} → {new_n_steps} points"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                pn.state.notifications.info("Already up to date.")
+            except Exception:
+                pass
+    except Exception as exc:
+        log.warning("Update scan check failed: %s", exc)
+
+
+w_btn_update.on_click(_on_update)
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
@@ -5919,14 +6005,17 @@ def _refresh_proposals(cycle: str | None = None):
         return
 
     # Build dropdown options: data_session as value, display_label as text
-    opts = {p.display_label: p.data_session for p in proposals}
+    # "(All)" at the top means no data_session filter — show recent scans
+    opts = {"(All — no filter)": "(All)"}
+    opts.update({p.display_label: p.data_session for p in proposals})
     w_proposal_select.options = opts
     # Restore saved data session if available and still a valid option
     saved_ds = _load_saved_datasession()
     if saved_ds and saved_ds in opts.values():
         w_proposal_select.value = saved_ds
     else:
-        w_proposal_select.value = proposals[0].data_session
+        # Default to (All) so users see recent scans without filtering
+        w_proposal_select.value = "(All)"
     w_proposal_status.object = f"*{len(proposals)} proposal{'s' if len(proposals) != 1 else ''}*"
 
 
@@ -5964,7 +6053,7 @@ def _on_cycle_change(*_events):
 def _on_proposal_select(*_events):
     """Apply the selected data-session as a search filter and search."""
     ds = w_proposal_select.value
-    if not ds or ds.startswith("("):
+    if not ds or ds.startswith("(") and ds != "(All)":
         return
 
     # Disable cycle/project while downstream queries run
@@ -5981,24 +6070,29 @@ def _on_proposal_select(*_events):
     w_table.selection = []
     _reset_detail()
 
-    # Clear existing filters and set a single exact data_session filter
+    # Clear existing filters
     _filter_rows.clear()
-    _add_filter(ftype="Exact", key="data_session", val=ds)
+    if ds == "(All)":
+        # No data_session filter — show all recent scans
+        _add_filter()
+        w_proposal_status.object = "*Showing all recent scans*"
+    else:
+        # Set a single exact data_session filter
+        _add_filter(ftype="Exact", key="data_session", val=ds)
+        # Show proposal info in the status line
+        info = _proposal_map.get(ds)
+        if info:
+            w_proposal_status.object = (
+                f"**{info.pi_name}** — {info.title[:80]}"
+            )
     _do_search(0)
-
-    # Show proposal info in the status line
-    info = _proposal_map.get(ds)
-    if info:
-        w_proposal_status.object = (
-            f"**{info.pi_name}** — {info.title[:80]}"
-        )
 
     # Re-enable cycle now that search is done
     w_proposal_cycle.disabled = False
 
     # Fetch distinct project_name values within this data_session
-    # (this manages its own spinner/disabled state for project dropdown)
-    _populate_project_names(ds)
+    if ds != "(All)":
+        _populate_project_names(ds)
     _save_proposal_state()
 
 
@@ -6270,8 +6364,83 @@ def _on_toggle_sidebar(event):
 
 w_btn_toggle_sidebar.param.watch(_on_toggle_sidebar, "value")
 
+w_btn_update_scan = pn.widgets.Button(
+    name="🔄", button_type="light", width=32,
+    stylesheets=[":host { font-size: 14px; padding: 0; }"],
+)
+
+
+def _on_update_scan(_event=None):
+    """Re-check the selected scan for new data points and reload if grown."""
+    uid = _state.get("selected_uid")
+    if not uid:
+        return
+    try:
+        run = _get_cat()[uid]
+        stop = run.metadata.get("stop", {})
+        num_events = stop.get("num_events", {})
+        if isinstance(num_events, dict):
+            new_n_steps = num_events.get("primary", 0)
+        else:
+            new_n_steps = int(num_events) if num_events else 0
+
+        old_summary = _detail_cache.get("summary")
+        old_n_steps = 0
+        if old_summary:
+            try:
+                old_n_steps = int(old_summary.get("n_steps", 0))
+            except (ValueError, TypeError):
+                old_n_steps = 0
+
+        if new_n_steps > old_n_steps:
+            log.info("Update scan: %s grew %d → %d", uid[:8], old_n_steps, new_n_steps)
+            _detail_cache.update(
+                run=run, summary=None,
+                primary_loaded=False, baseline_loaded=False,
+                images_loaded=False,
+                primary_info=None, primary_dataset=None,
+            )
+            # Invalidate disk cache for this scan
+            from smi_browser.cache import ScanCache
+            cache = ScanCache(uid)
+            if cache.exists():
+                import h5py
+                try:
+                    with cache._lock:
+                        with h5py.File(cache.path, "a") as f:
+                            if "primary" in f:
+                                del f["primary"]
+                            if "images" in f:
+                                del f["images"]
+                except Exception:
+                    pass
+
+            _load_metadata(uid)
+            active_tab = w_detail_tabs.active
+            _load_active_tab(active_tab)
+            try:
+                pn.state.notifications.info(
+                    f"Scan updated: {old_n_steps} → {new_n_steps} points"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                pn.state.notifications.info("Scan up to date.")
+            except Exception:
+                pass
+    except Exception as exc:
+        log.warning("Update scan failed: %s", exc)
+        try:
+            pn.state.notifications.warning(f"Update failed: {exc}")
+        except Exception:
+            pass
+
+
+w_btn_update_scan.on_click(_on_update_scan)
+
 detail_panel = pn.Column(
-    pn.Row(w_btn_toggle_sidebar, w_detail_title, sizing_mode="stretch_width"),
+    pn.Row(w_btn_toggle_sidebar, w_btn_update_scan, w_detail_title, sizing_mode="stretch_width"),
     w_detail_tabs,
     sizing_mode="stretch_both",
     min_width=600,
@@ -6586,6 +6755,7 @@ dashboard = pn.Column(
         w_login_status,
         w_btn_login,
         w_btn_logout,
+        w_btn_update,
         w_btn_live,
         sizing_mode="stretch_width",
     ),
