@@ -503,11 +503,24 @@ def _thumbnail_figure(arr, title):
         vlo = max(float(np.percentile(finite, 1)), 1e-3)
         vhi = float(np.percentile(finite, 99.5))
         vhi = max(vhi, vlo + 1.0)
-        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=vhi)
     else:
-        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
-        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
-        mapper = LinearColorMapper(palette="Greys256", low=lo, high=hi)
+        vlo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
+        vhi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
+    palette = w_cs_cmap.value or "Turbo256"
+    use_log = bool(w_cs_log.value)
+    # If locked and we have a previous mapper, reuse its low/high
+    prev_mapper = _image_cache.get("mapper")
+    if w_cs_lock.value and prev_mapper is not None:
+        try:
+            vlo = float(prev_mapper.low)
+            vhi = float(prev_mapper.high)
+        except Exception:
+            pass
+    if use_log:
+        mapper = LogColorMapper(palette=palette, low=max(vlo, 1e-9),
+                                high=max(vhi, vlo * 1.0001))
+    else:
+        mapper = LinearColorMapper(palette=palette, low=vlo, high=vhi)
 
     pw = 600
     ph = 600
@@ -595,6 +608,30 @@ def _thumbnail_figure(arr, title):
     )
     dyn_renderer.visible = False
 
+    # ----- Line-draw overlay (alignment tool) -----------------------------
+    # A separate MultiLine renderer + PolyDrawTool with num_objects unbounded.
+    # Each "line" is a polyline; we treat the first and last vertex of each
+    # polyline as the line endpoints for stats / profile computation.
+    line_source = ColumnDataSource(data=dict(xs=[], ys=[]))
+    line_renderer = p.multi_line(
+        xs="xs", ys="ys", source=line_source,
+        line_color="#ff00aa", line_width=max(1.5, float(w_align_width.value)),
+        line_alpha=0.9,
+    )
+    line_draw_tool = PolyDrawTool(renderers=[line_renderer], num_objects=20)
+    p.add_tools(line_draw_tool)
+    line_renderer.visible = bool(w_align_enable.value)
+
+    # Watch the line source for changes (server-side callback)
+    try:
+        line_source.on_change("data", lambda attr, old, new: _update_line_analysis())
+    except Exception as exc:
+        log.warning("could not attach line_source change callback: %s", exc)
+
+    _image_cache["line_source"] = line_source
+    _image_cache["line_renderer"] = line_renderer
+    _image_cache["line_draw_tool"] = line_draw_tool
+
     # Stash on image cache so the Explore controls can read/write it
     _image_cache["mask_source"] = mask_source
     _image_cache["new_mask_source"] = new_mask_source
@@ -629,6 +666,16 @@ def _update_image_in_place(arr, title):
         _image_cache["mapper"] = mapper
         _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
+        # Sync color-scale widgets to the initial mapper range
+        try:
+            _cs_sync_widgets_to_range(float(mapper.low), float(mapper.high))
+        except Exception:
+            pass
+        # Build initial histogram
+        try:
+            _build_histogram(arr)
+        except Exception:
+            pass
         # Auto-load the default mask if Show-mask is enabled (handles the
         # initial render and detector switches).  Defer to the next tick
         # so Bokeh has finished syncing the freshly-attached figure before
@@ -663,23 +710,25 @@ def _update_image_in_place(arr, title):
         fig.y_range.end = h
         _image_cache["fig_image_shape"] = (h, w)
 
-    # Update color mapper range
-    finite = arr[np.isfinite(arr) & (arr > 0)]
-    if finite.size:
-        vlo = max(float(np.percentile(finite, 1)), 1e-3)
-        vhi = float(np.percentile(finite, 99.5))
-        vhi = max(vhi, vlo + 1.0)
-        mapper.low = vlo
-        mapper.high = vhi
-    else:
-        lo = float(np.nanmin(arr)) if np.any(np.isfinite(arr)) else 0
-        hi = float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else 1
-        mapper.low = lo
-        mapper.high = hi
+    # Update color mapper range (respect lock toggle)
+    if not w_cs_lock.value:
+        vlo, vhi = _cs_finite_range(arr)
+        _cs_apply_to_mapper(vlo, vhi)
+        _cs_sync_widgets_to_range(vlo, vhi)
 
     # Update image data (keeps zoom/pan state)
     source.data = dict(image=[display], x=[0], y=[0], dw=[w], dh=[h])
     fig.title.text = title
+
+    # Rebuild histogram + refresh any line profile from new frame data
+    try:
+        _build_histogram(arr)
+    except Exception as exc:
+        log.warning("histogram refresh failed: %s", exc)
+    try:
+        _update_line_analysis()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1075,11 +1124,450 @@ w_btn_mask_use = pn.widgets.Button(
 )
 w_mask_status = pn.pane.Markdown("", width=600)
 
+# ---------------------------------------------------------------------------
+# Plotting tools — Color scale controls (Explore tab)
+# ---------------------------------------------------------------------------
+CS_PALETTES = [
+    "Turbo256", "Viridis256", "Plasma256", "Inferno256",
+    "Magma256", "Cividis256", "Greys256",
+]
+w_cs_cmap = pn.widgets.Select(
+    name="Colormap", value="Turbo256", options=CS_PALETTES, width=130,
+)
+w_cs_log = pn.widgets.Checkbox(name="Log scale", value=True, width=100)
+w_cs_lock = pn.widgets.Checkbox(
+    name="Lock range across frames", value=False, width=200,
+)
+w_cs_range = pn.widgets.RangeSlider(
+    name="Intensity range", start=0.0, end=1.0, value=(0.0, 1.0),
+    step=0.01, sizing_mode="stretch_width", format="0.000",
+)
+w_cs_min = pn.widgets.FloatInput(name="Min", value=0.0, width=110)
+w_cs_max = pn.widgets.FloatInput(name="Max", value=1.0, width=110)
+w_cs_status = pn.pane.Markdown("", sizing_mode="stretch_width")
+w_cs_hist = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=120)
+
+# ---------------------------------------------------------------------------
+# Plotting tools — Alignment / line-profile controls (Explore tab)
+# ---------------------------------------------------------------------------
+w_align_enable = pn.widgets.Checkbox(
+    name="Enable line draw", value=False, width=140,
+)
+w_align_width = pn.widgets.IntInput(
+    name="Width (px)", value=1, start=1, end=100, step=1, width=80,
+)
+w_btn_align_clear = pn.widgets.Button(
+    name="✕ Clear lines", button_type="light", width=110,
+)
+w_align_stats = pn.pane.Markdown(
+    "*Toggle 'Enable line draw' then click two points on the image to draw a line.*",
+    sizing_mode="stretch_width",
+)
+w_align_profile = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=180)
+
 _image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
                 "figure": None, "source": None, "mapper": None,
                 "mask_source": None, "mask_renderer": None,
                 "draw_tool": None, "edit_tool": None,
-                "mask_image_shape": None}
+                "mask_image_shape": None,
+                # Color-scale state
+                "cs_suspend": False,
+                # Alignment / line tools
+                "line_source": None, "line_renderer": None, "line_draw_tool": None}
+
+
+# ----- Color scale helpers -----
+
+def _cs_finite_range(arr: np.ndarray) -> tuple[float, float]:
+    """Return (lo, hi) percentile bounds from finite positive values."""
+    finite = arr[np.isfinite(arr) & (arr > 0)]
+    if not finite.size:
+        return 1e-3, 1.0
+    lo = max(float(np.percentile(finite, 1)), 1e-6)
+    hi = float(np.percentile(finite, 99.5))
+    if hi <= lo:
+        hi = lo * 10
+    return lo, hi
+
+
+def _cs_sync_widgets_to_range(lo: float, hi: float) -> None:
+    """Update min/max/range widgets to reflect new bounds without firing callbacks."""
+    use_log = bool(w_cs_log.value)
+    if use_log:
+        slider_lo = float(np.log10(max(lo, 1e-12)))
+        slider_hi = float(np.log10(max(hi, lo * 1.0001)))
+        pad_lo, pad_hi = slider_lo - 0.5, slider_hi + 0.5
+    else:
+        pad_lo, pad_hi = lo - abs(lo) * 0.5 - 1e-6, hi + abs(hi) * 0.5 + 1e-6
+        slider_lo, slider_hi = lo, hi
+    _image_cache["cs_suspend"] = True
+    try:
+        w_cs_range.start = pad_lo
+        w_cs_range.end = pad_hi
+        w_cs_range.value = (slider_lo, slider_hi)
+        w_cs_min.value = float(lo)
+        w_cs_max.value = float(hi)
+    finally:
+        _image_cache["cs_suspend"] = False
+
+
+def _cs_apply_to_mapper(lo: float, hi: float) -> None:
+    """Apply (lo, hi) to the active color mapper, clamping for log."""
+    mapper = _image_cache.get("mapper")
+    if mapper is None:
+        return
+    if w_cs_log.value:
+        lo = max(lo, 1e-9)
+        hi = max(hi, lo * 1.0001)
+    elif hi <= lo:
+        hi = lo + abs(lo) * 0.01 + 1e-9
+    try:
+        mapper.low = lo
+        mapper.high = hi
+    except Exception as exc:
+        log.warning("color-scale mapper update failed: %s", exc)
+
+
+def _build_histogram(arr: np.ndarray) -> None:
+    """Build/refresh the histogram pane from the current frame data."""
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import Span, ColumnDataSource
+
+    if arr is None or arr.size == 0:
+        w_cs_hist.object = None
+        return
+    use_log = bool(w_cs_log.value)
+    flat = arr[np.isfinite(arr)]
+    if use_log:
+        flat = flat[flat > 0]
+    if flat.size == 0:
+        w_cs_hist.object = None
+        return
+
+    # Sample for performance on large detectors
+    if flat.size > 200000:
+        idx = np.random.choice(flat.size, 200000, replace=False)
+        flat = flat[idx]
+
+    if use_log:
+        # Log-spaced bins in intensity space, displayed in log10
+        lo_val = float(np.min(flat))
+        hi_val = float(np.max(flat))
+        edges_lin = np.logspace(np.log10(lo_val), np.log10(hi_val), 80)
+        hist, edges_lin = np.histogram(flat, bins=edges_lin)
+        # Convert edges to log10 for display
+        edges = np.log10(edges_lin)
+        x_axis_label = "log10(intensity)"
+    else:
+        data = flat
+        edges = np.linspace(float(np.min(data)), float(np.max(data)), 80)
+        hist, edges = np.histogram(data, bins=edges)
+        x_axis_label = "intensity"
+
+    # Use log-scaled counts for the y-axis (avoids single dominant bin)
+    hist_display = np.where(hist > 0, hist, 0.1).astype(float)
+
+    src = ColumnDataSource(data=dict(
+        left=edges[:-1], right=edges[1:],
+        top=hist_display, bottom=np.full_like(hist_display, 0.1),
+    ))
+    p = bk_figure(
+        height=120, sizing_mode="stretch_width",
+        tools="", toolbar_location=None,
+        x_axis_label=x_axis_label, y_axis_label="count",
+        y_axis_type="log",
+    )
+    p.quad(left="left", right="right", top="top", bottom="bottom",
+           source=src, fill_color="#5b9bd5", line_color="white", alpha=0.85)
+    p.yaxis.minor_tick_line_color = None
+    p.xaxis.minor_tick_line_color = None
+
+    # Add lo/hi Spans (in slider's coordinate system)
+    lo_val, hi_val = w_cs_range.value
+    lo_span = Span(location=float(lo_val), dimension="height",
+                   line_color="red", line_width=2, line_dash="solid")
+    hi_span = Span(location=float(hi_val), dimension="height",
+                   line_color="red", line_width=2, line_dash="solid")
+    p.add_layout(lo_span)
+    p.add_layout(hi_span)
+
+    _image_cache["hist_lo_span"] = lo_span
+    _image_cache["hist_hi_span"] = hi_span
+    w_cs_hist.object = p
+
+
+def _update_hist_spans() -> None:
+    """Move the histogram low/high markers to current slider values."""
+    lo_span = _image_cache.get("hist_lo_span")
+    hi_span = _image_cache.get("hist_hi_span")
+    lo, hi = w_cs_range.value
+    if lo_span is not None:
+        lo_span.location = float(lo)
+    if hi_span is not None:
+        hi_span.location = float(hi)
+
+
+# ----- Color scale callbacks -----
+
+def _on_cs_cmap(event):
+    mapper = _image_cache.get("mapper")
+    if mapper is None:
+        return
+    try:
+        mapper.palette = event.new
+    except Exception as exc:
+        log.warning("colormap change failed: %s", exc)
+
+
+def _on_cs_log(_event=None):
+    """Toggling log requires rebuilding the mapper (Log vs Linear class)."""
+    # Force a figure rebuild on next render
+    _image_cache["figure"] = None
+    _image_cache["source"] = None
+    _image_cache["mapper"] = None
+    _image_cache["fig_image_shape"] = None
+    field = _image_cache.get("field")
+    idx = w_image_slider.value
+    if field is not None:
+        _render_image_frame(field, idx)
+
+
+def _on_cs_range(event):
+    if _image_cache.get("cs_suspend"):
+        return
+    lo, hi = event.new
+    if w_cs_log.value:
+        lo_v, hi_v = 10 ** float(lo), 10 ** float(hi)
+    else:
+        lo_v, hi_v = float(lo), float(hi)
+    _image_cache["cs_suspend"] = True
+    try:
+        w_cs_min.value = lo_v
+        w_cs_max.value = hi_v
+    finally:
+        _image_cache["cs_suspend"] = False
+    _cs_apply_to_mapper(lo_v, hi_v)
+    _update_hist_spans()
+
+
+def _on_cs_minmax(_event=None):
+    if _image_cache.get("cs_suspend"):
+        return
+    lo_v = float(w_cs_min.value)
+    hi_v = float(w_cs_max.value)
+    if hi_v <= lo_v:
+        return
+    if w_cs_log.value:
+        slider_lo = float(np.log10(max(lo_v, 1e-12)))
+        slider_hi = float(np.log10(max(hi_v, lo_v * 1.0001)))
+    else:
+        slider_lo, slider_hi = lo_v, hi_v
+    _image_cache["cs_suspend"] = True
+    try:
+        # Expand slider bounds if needed
+        if slider_lo < w_cs_range.start:
+            w_cs_range.start = slider_lo - 0.5
+        if slider_hi > w_cs_range.end:
+            w_cs_range.end = slider_hi + 0.5
+        w_cs_range.value = (slider_lo, slider_hi)
+    finally:
+        _image_cache["cs_suspend"] = False
+    _cs_apply_to_mapper(lo_v, hi_v)
+    _update_hist_spans()
+
+
+w_cs_cmap.param.watch(_on_cs_cmap, "value")
+w_cs_log.param.watch(_on_cs_log, "value")
+w_cs_range.param.watch(_on_cs_range, "value")
+w_cs_min.param.watch(_on_cs_minmax, "value")
+w_cs_max.param.watch(_on_cs_minmax, "value")
+
+
+# ----- Line / alignment helpers -----
+
+def _line_profile(arr: np.ndarray, x0: float, y0: float, x1: float, y1: float,
+                  n: int = 200, width: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Sample a 1D profile along the line from (x0,y0) to (x1,y1).
+
+    Parameters
+    ----------
+    width : int
+        Number of pixels to average perpendicular to the line direction.
+        If > 1, multiple parallel lines are sampled and the mean taken.
+
+    Returns (distance_px, intensity).  Uses bilinear interpolation.
+    """
+    h, w = arr.shape
+    n = max(2, int(n))
+    width = max(1, int(width))
+
+    dx_line = x1 - x0
+    dy_line = y1 - y0
+    length = np.hypot(dx_line, dy_line)
+    if length < 1e-6:
+        return np.zeros(n), np.zeros(n)
+
+    # Unit perpendicular vector
+    perp_x = -dy_line / length
+    perp_y = dx_line / length
+
+    # Offsets centered on 0 for the width band
+    offsets = np.linspace(-(width - 1) / 2.0, (width - 1) / 2.0, width)
+
+    # Sample along the line for each offset, then average
+    all_vals = []
+    for off in offsets:
+        xs = np.linspace(x0 + off * perp_x, x1 + off * perp_x, n)
+        ys = np.linspace(y0 + off * perp_y, y1 + off * perp_y, n)
+        # Clamp to bounds (leave margin for bilinear)
+        xs_c = np.clip(xs, 0, w - 2.001)
+        ys_c = np.clip(ys, 0, h - 2.001)
+        xi = xs_c.astype(int)
+        yi = ys_c.astype(int)
+        fx = xs_c - xi
+        fy = ys_c - yi
+        # Bilinear sample
+        a = arr[yi, xi]
+        b = arr[yi, np.minimum(xi + 1, w - 1)]
+        c = arr[np.minimum(yi + 1, h - 1), xi]
+        d = arr[np.minimum(yi + 1, h - 1), np.minimum(xi + 1, w - 1)]
+        vals = (
+            a * (1 - fx) * (1 - fy)
+            + b * fx * (1 - fy)
+            + c * (1 - fx) * fy
+            + d * fx * fy
+        )
+        all_vals.append(vals)
+
+    avg_vals = np.nanmean(all_vals, axis=0)
+    # Distance along the center line
+    center_xs = np.linspace(x0, x1, n)
+    center_ys = np.linspace(y0, y1, n)
+    dist = np.sqrt((center_xs - x0) ** 2 + (center_ys - y0) ** 2)
+    return dist, avg_vals
+
+
+def _line_stats_text(xs: list, ys: list) -> tuple[str, list]:
+    """Format stats markdown for all drawn lines; return (md, line_list).
+
+    Each line is represented as (x0, y0, x1, y1) using the first and last
+    vertex of its xs/ys polyline.
+    """
+    lines = []
+    rows = []
+    for i, (xx, yy) in enumerate(zip(xs, ys)):
+        if not xx or len(xx) < 2:
+            continue
+        x0, y0 = float(xx[0]), float(yy[0])
+        x1, y1 = float(xx[-1]), float(yy[-1])
+        dx, dy = x1 - x0, y1 - y0
+        length = float(np.hypot(dx, dy))
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        lines.append((x0, y0, x1, y1))
+        rows.append(
+            f"**Line {i + 1}** — "
+            f"start=({x0:.1f}, {y0:.1f}), end=({x1:.1f}, {y1:.1f}), "
+            f"length={length:.2f} px, angle={angle:.2f}°"
+        )
+    if not rows:
+        return ("*Toggle 'Enable line draw' then click two points on the image "
+                "to add a line. Hold shift+drag to add more. "
+                "Click a line + Backspace to delete.*"), lines
+    return "  \n".join(rows), lines
+
+
+def _update_line_analysis(*_events) -> None:
+    """Recompute line stats and profile plot from the line CDS."""
+    from bokeh.plotting import figure as bk_figure
+
+    line_src = _image_cache.get("line_source")
+    if line_src is None:
+        return
+    xs_list = list(line_src.data.get("xs", []))
+    ys_list = list(line_src.data.get("ys", []))
+    md, lines = _line_stats_text(xs_list, ys_list)
+    w_align_stats.object = md
+
+    # Update line renderer width to match the width widget
+    line_renderer = _image_cache.get("line_renderer")
+    line_width_px = max(1, int(w_align_width.value))
+    if line_renderer is not None:
+        try:
+            line_renderer.glyph.line_width = max(1.5, float(line_width_px))
+        except Exception:
+            pass
+
+    if not lines:
+        w_align_profile.object = None
+        return
+
+    # Get current displayed image array
+    src = _image_cache.get("source")
+    if src is None:
+        return
+    image_list = src.data.get("image")
+    if not image_list:
+        return
+    arr = np.asarray(image_list[0])
+
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+               "#9467bd", "#8c564b", "#17becf"]
+    fig_kwargs = dict(
+        height=180, sizing_mode="stretch_width",
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        x_axis_label="distance (px)", y_axis_label="intensity",
+    )
+    if w_cs_log.value:
+        fig_kwargs["y_axis_type"] = "log"
+    p = bk_figure(**fig_kwargs)
+    for i, (x0, y0, x1, y1) in enumerate(lines):
+        try:
+            dist, vals = _line_profile(arr, x0, y0, x1, y1, width=line_width_px)
+        except Exception as exc:
+            log.warning("line profile failed: %s", exc)
+            continue
+        c = palette[i % len(palette)]
+        lbl = f"Line {i + 1}"
+        if line_width_px > 1:
+            lbl += f" (w={line_width_px})"
+        p.line(dist, vals, line_color=c, line_width=1.5,
+               legend_label=lbl)
+    if lines:
+        p.legend.click_policy = "hide"
+        p.legend.label_text_font_size = "8pt"
+    w_align_profile.object = p
+
+
+def _on_align_enable(event):
+    """Show or hide the line-draw renderer + tool."""
+    renderer = _image_cache.get("line_renderer")
+    tool = _image_cache.get("line_draw_tool")
+    if renderer is None or tool is None:
+        return
+    on = bool(event.new)
+    renderer.visible = on
+    # Toggle active tool
+    fig = _image_cache.get("figure")
+    if fig is not None:
+        try:
+            fig.toolbar.active_tap = tool if on else None
+            fig.toolbar.active_drag = tool if on else None
+        except Exception:
+            pass
+
+
+def _on_align_clear(_event=None):
+    line_src = _image_cache.get("line_source")
+    if line_src is None:
+        return
+    line_src.data = dict(xs=[], ys=[])
+    _update_line_analysis()
+
+
+w_align_enable.param.watch(_on_align_enable, "value")
+w_btn_align_clear.on_click(_on_align_clear)
+w_align_width.param.watch(lambda *_: _update_line_analysis(), "value")
 
 
 def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray | None:
@@ -6244,13 +6732,32 @@ w_detail_tabs = pn.Tabs(
             pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
             # Line plot stays compact at the top; auto-hidden when empty.
             w_explore_plot_container,
-            # Mask overlay controls — open by default so users see the
-            # default mask is loaded; collapse if they don't want it.
+            # Plotting tools card — color scale, mask overlay, alignment.
             pn.Card(
-                pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit, w_btn_mask_reload),
-                pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
-                w_mask_status,
-                title="Mask overlay",
+                pn.Card(
+                    pn.Row(w_cs_cmap, w_cs_log, w_cs_lock),
+                    w_cs_range,
+                    pn.Row(w_cs_min, w_cs_max),
+                    w_cs_hist,
+                    title="🎨 Color scale",
+                    collapsed=False, sizing_mode="stretch_width",
+                ),
+                pn.Card(
+                    pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit,
+                           w_btn_mask_reload),
+                    pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
+                    w_mask_status,
+                    title="🛡 Mask overlay",
+                    collapsed=True, sizing_mode="stretch_width",
+                ),
+                pn.Card(
+                    pn.Row(w_align_enable, w_align_width, w_btn_align_clear),
+                    w_align_stats,
+                    w_align_profile,
+                    title="📐 Alignment / line profile",
+                    collapsed=True, sizing_mode="stretch_width",
+                ),
+                title="🛠 Plotting tools",
                 collapsed=False, sizing_mode="stretch_width",
             ),
             # Image takes the full remaining width / height below
