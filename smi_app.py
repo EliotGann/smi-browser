@@ -745,6 +745,8 @@ _cancel = threading.Event()
 # ---------------------------------------------------------------------------
 # Filter state persistence across websocket reconnections
 # ---------------------------------------------------------------------------
+_initializing = True  # Suppress search triggers during initial startup
+
 _FILTER_CACHE_KEY = "smi_browser_saved_filters"
 _PAGE_CACHE_KEY = "smi_browser_saved_page"
 _CYCLE_CACHE_KEY = "smi_browser_saved_cycle"
@@ -1014,16 +1016,10 @@ w_table = pn.widgets.Tabulator(
     ],
 )
 
-# Restore filter rows from cache (survives websocket reconnects) or start empty
-_saved_filters = _load_saved_filters()
-if _saved_filters:
-    _SEARCH_TYPE_REVERSE = {v: k for k, v in SEARCH_TYPE_MAP.items()}
-    for ftype, key, val in _saved_filters:
-        _add_filter(ftype=_SEARCH_TYPE_REVERSE.get(ftype, "Text in field"), key=key, val=val)
-    _state["unified_filters"] = list(_saved_filters)
-    _state["page"] = _load_saved_page()
-else:
-    _add_filter()
+# Start with a fresh empty filter row — initial view is always unfiltered.
+# Saved filters are available in pn.state.cache and applied when the user
+# explicitly selects a proposal or adds filters.
+_add_filter()
 
 # ---------------------------------------------------------------------------
 # Widgets — Detail panel
@@ -3041,12 +3037,12 @@ def _source_data_to_cuts(data: dict) -> list[dict]:
     return cuts
 
 
-def _compute_cross_section(cut: dict):
-    """Return ``(axis, intensity, axis_label)`` for one cut, or ``None``."""
-    cache = _proc_2d_cache
-    x = cache["x"]
-    y = cache["y"]
-    img = cache["image"]
+def _compute_cross_section_from_arrays(cut: dict, x, y, img):
+    """Compute a 1-D cross-section from explicit arrays.
+
+    Returns ``(axis, intensity, axis_label_key)`` or ``None``.
+    ``axis_label_key`` is 'x' for h-cuts and 'y' for v-cuts.
+    """
     if x is None or y is None or img is None:
         return None
     c = float(cut["center"])
@@ -3055,19 +3051,72 @@ def _compute_cross_section(cut: dict):
     if cut["kind"] == "h":
         mask = (y >= c - half) & (y <= c + half)
         if not np.any(mask):
-            # Fall back to nearest single row
             idx = int(np.argmin(np.abs(y - c)))
             section = img[idx, :].astype(float)
         else:
             section = np.nanmean(img[mask, :], axis=0)
-        return x, section, cache["x_label"]
+        return x, section, "x"
     mask = (x >= c - half) & (x <= c + half)
     if not np.any(mask):
         idx = int(np.argmin(np.abs(x - c)))
         section = img[:, idx].astype(float)
     else:
         section = np.nanmean(img[:, mask], axis=1)
-    return y, section, cache["y_label"]
+    return y, section, "y"
+
+
+def _compute_cross_section(cut: dict):
+    """Return ``(axis, intensity, axis_label)`` for one cut, or ``None``."""
+    cache = _proc_2d_cache
+    x = cache["x"]
+    y = cache["y"]
+    img = cache["image"]
+    out = _compute_cross_section_from_arrays(cut, x, y, img)
+    if out is None:
+        return None
+    axis, section, key = out
+    return axis, section, cache[f"{key}_label"]
+
+
+def _get_all_frame_images():
+    """Return a list of (x, y, image) tuples for each frame, or empty list.
+
+    Uses the cached processing result to retrieve all per-frame 2D arrays.
+    """
+    gi = _proc_result_cache.get("gi_result")
+    trans = _proc_result_cache.get("result")
+    if gi is not None:
+        qxy = np.asarray(gi.qxy_grid)
+        qz = np.asarray(gi.qz_grid)
+        frames = []
+        for f in gi.frames:
+            img = np.where(np.isfinite(f), f, np.nan).astype(np.float64)
+            # GI images are (n_qxy, n_qz), need (n_qz, n_qxy) for cuts
+            if img.shape == (len(qxy), len(qz)):
+                img = img.T
+            frames.append((qxy, qz, img))
+        return frames
+    if trans is not None:
+        qchi = getattr(trans, "merged_qchi", None)
+        if qchi is not None and "frame" in qchi.dims:
+            q = qchi["q"].values if "q" in qchi.coords else np.arange(qchi["intensity"].shape[-1])
+            chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(qchi["intensity"].shape[-2] if qchi["intensity"].ndim > 2 else qchi["intensity"].shape[0])
+            n_frames = qchi.sizes["frame"]
+            frames = []
+            for i in range(n_frames):
+                img_raw = qchi["intensity"].isel(frame=i).values
+                # Ensure (n_chi, n_q)
+                if img_raw.shape == (len(q), len(chi)):
+                    img_raw = img_raw.T
+                img = np.where(np.isfinite(img_raw), img_raw, np.nan).astype(np.float64)
+                frames.append((q, chi, img))
+            return frames
+        # Fallback: use q_chi_frames from saxs/waxs result
+        pf = _get_per_frame_qchi(trans)
+        if pf is not None:
+            q, chi, frames_3d = pf
+            return [(q, chi, frames_3d[i]) for i in range(frames_3d.shape[0])]
+    return []
 
 
 def _format_cut_label(i: int, cut: dict) -> str:
@@ -3098,7 +3147,11 @@ def _add_trace(fig, x, y, *, color, width=1.2, alpha=1.0, legend_label=None, siz
 
 
 def _render_cuts_plot():
-    """Redraw cross-section plots: separate axes for h and v cuts."""
+    """Redraw cross-section plots: separate axes for h and v cuts.
+
+    In per-frame mode, overlays all frames for each cut with color-coded
+    labels (like the per-frame I(q) plot).
+    """
     from bokeh.plotting import figure as bk_figure
     from bokeh.layouts import column as bk_column
 
@@ -3114,65 +3167,122 @@ def _render_cuts_plot():
     x_type = "log" if x_log else "linear"
     y_type = "log" if y_log else "linear"
 
+    # Determine if we should show per-frame overlaid cuts
+    per_frame_mode = (w_proc_iq_mode.value == "per-frame")
+    all_frames = []
+    frame_labels = []
+    if per_frame_mode:
+        all_frames = _get_all_frame_images()
+        if len(all_frames) > 1:
+            frame_labels = _get_frame_labels()
+        else:
+            per_frame_mode = False  # Only 1 frame, fall back to single
+
     plots = []
 
     if h_cuts:
-        p_h = bk_figure(
-            title="Horizontal cuts \u2014 I(q)", height=300,
-            sizing_mode="stretch_width",
-            x_axis_type=x_type, y_axis_type=y_type,
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            active_scroll="wheel_zoom",
-        )
-        plotted = False
-        for i, cut in h_cuts:
-            out = _compute_cross_section(cut)
-            if out is None:
-                continue
-            axis, section, axis_label = out
-            finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
-            if not np.any(finite):
-                continue
-            alpha = max(0.4, 1.0 - 0.15 * i)
-            _add_trace(p_h, axis[finite], section[finite],
-                       color=_CUT_FILL["h"], width=1.4, alpha=alpha,
-                       legend_label=_format_cut_label(i, cut))
-            plotted = True
-        if plotted:
-            p_h.xaxis.axis_label = _proc_2d_cache["x_label"]
-            p_h.yaxis.axis_label = "I"
-            p_h.legend.click_policy = "hide"
-            p_h.legend.label_text_font_size = "9pt"
-            plots.append(p_h)
+        for cut_idx, cut in h_cuts:
+            p_h = bk_figure(
+                title=f"Horizontal cut #{cut_idx + 1} \u2014 I(q)",
+                height=300,
+                sizing_mode="stretch_width",
+                x_axis_type=x_type, y_axis_type=y_type,
+                tools="pan,wheel_zoom,box_zoom,reset,save",
+                active_scroll="wheel_zoom",
+            )
+            plotted = False
+            if per_frame_mode:
+                # Overlay all frames for this cut
+                from bokeh.palettes import Category10, Turbo256
+                n_frames = len(all_frames)
+                if n_frames <= 10:
+                    colors = Category10[max(3, n_frames)][:n_frames]
+                else:
+                    step = max(1, len(Turbo256) // n_frames)
+                    colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
+                for fi, (fx, fy, fimg) in enumerate(all_frames):
+                    out = _compute_cross_section_from_arrays(cut, fx, fy, fimg)
+                    if out is None:
+                        continue
+                    axis, section, _key = out
+                    finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+                    if not np.any(finite):
+                        continue
+                    lbl = frame_labels[fi] if fi < len(frame_labels) else f"frame {fi}"
+                    _add_trace(p_h, axis[finite], section[finite],
+                               color=colors[fi], width=1.0, alpha=0.8,
+                               legend_label=lbl)
+                    plotted = True
+            else:
+                # Single-frame (current cache image)
+                out = _compute_cross_section(cut)
+                if out is not None:
+                    axis, section, axis_label = out
+                    finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+                    if np.any(finite):
+                        _add_trace(p_h, axis[finite], section[finite],
+                                   color=_CUT_FILL["h"], width=1.4, alpha=0.9,
+                                   legend_label=_format_cut_label(cut_idx, cut))
+                        plotted = True
+            if plotted:
+                p_h.xaxis.axis_label = _proc_2d_cache["x_label"]
+                p_h.yaxis.axis_label = "I"
+                p_h.legend.click_policy = "hide"
+                p_h.legend.label_text_font_size = "8pt"
+                if per_frame_mode and len(all_frames) > 20:
+                    p_h.legend.visible = False
+                plots.append(p_h)
 
     if v_cuts:
-        p_v = bk_figure(
-            title="Vertical cuts \u2014 I(\u03c7)", height=300,
-            sizing_mode="stretch_width",
-            x_axis_type=x_type, y_axis_type=y_type,
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            active_scroll="wheel_zoom",
-        )
-        plotted = False
-        for i, cut in v_cuts:
-            out = _compute_cross_section(cut)
-            if out is None:
-                continue
-            axis, section, axis_label = out
-            finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
-            if not np.any(finite):
-                continue
-            alpha = max(0.4, 1.0 - 0.15 * i)
-            _add_trace(p_v, axis[finite], section[finite],
-                       color=_CUT_FILL["v"], width=1.4, alpha=alpha,
-                       legend_label=_format_cut_label(i, cut))
-            plotted = True
-        if plotted:
-            p_v.xaxis.axis_label = _proc_2d_cache["y_label"]
-            p_v.yaxis.axis_label = "I"
-            p_v.legend.click_policy = "hide"
-            p_v.legend.label_text_font_size = "9pt"
-            plots.append(p_v)
+        for cut_idx, cut in v_cuts:
+            p_v = bk_figure(
+                title=f"Vertical cut #{cut_idx + 1} \u2014 I(\u03c7)",
+                height=300,
+                sizing_mode="stretch_width",
+                x_axis_type=x_type, y_axis_type=y_type,
+                tools="pan,wheel_zoom,box_zoom,reset,save",
+                active_scroll="wheel_zoom",
+            )
+            plotted = False
+            if per_frame_mode:
+                from bokeh.palettes import Category10, Turbo256
+                n_frames = len(all_frames)
+                if n_frames <= 10:
+                    colors = Category10[max(3, n_frames)][:n_frames]
+                else:
+                    step = max(1, len(Turbo256) // n_frames)
+                    colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
+                for fi, (fx, fy, fimg) in enumerate(all_frames):
+                    out = _compute_cross_section_from_arrays(cut, fx, fy, fimg)
+                    if out is None:
+                        continue
+                    axis, section, _key = out
+                    finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+                    if not np.any(finite):
+                        continue
+                    lbl = frame_labels[fi] if fi < len(frame_labels) else f"frame {fi}"
+                    _add_trace(p_v, axis[finite], section[finite],
+                               color=colors[fi], width=1.0, alpha=0.8,
+                               legend_label=lbl)
+                    plotted = True
+            else:
+                out = _compute_cross_section(cut)
+                if out is not None:
+                    axis, section, axis_label = out
+                    finite = np.isfinite(section) & ((section > 0) if y_log else np.ones_like(section, dtype=bool))
+                    if np.any(finite):
+                        _add_trace(p_v, axis[finite], section[finite],
+                                   color=_CUT_FILL["v"], width=1.4, alpha=0.9,
+                                   legend_label=_format_cut_label(cut_idx, cut))
+                        plotted = True
+            if plotted:
+                p_v.xaxis.axis_label = _proc_2d_cache["y_label"]
+                p_v.yaxis.axis_label = "I"
+                p_v.legend.click_policy = "hide"
+                p_v.legend.label_text_font_size = "8pt"
+                if per_frame_mode and len(all_frames) > 20:
+                    p_v.legend.visible = False
+                plots.append(p_v)
 
     if not plots:
         w_proc_cuts_plot.object = None
@@ -3346,20 +3456,143 @@ w_coll_compare_plot = _coll_ns.compare_plot
 # Helpers — 2D result plotting
 # ---------------------------------------------------------------------------
 
+# Cache for per-frame q-chi regridding (expensive scipy interpolation)
+_per_frame_qchi_cache: dict[str, Any] = {"uid": None, "data": None}
+
+
+def _get_per_frame_qchi(result):
+    """Extract per-frame q-chi data from result.saxs/waxs['q_chi_frames'].
+
+    Returns (q, chi, frames_3d) where frames_3d has shape (n_frames, n_chi, n_q),
+    or None if no per-frame data is available.  Results are cached by UID.
+    """
+    uid = getattr(result, "uid", None)
+    if uid and _per_frame_qchi_cache["uid"] == uid and _per_frame_qchi_cache["data"] is not None:
+        return _per_frame_qchi_cache["data"]
+    saxs = getattr(result, "saxs", None)
+    waxs = getattr(result, "waxs", None)
+    saxs_frames = saxs.get("q_chi_frames") if saxs else None
+    waxs_frames = waxs.get("q_chi_frames") if waxs else None
+
+    if saxs_frames is None and waxs_frames is None:
+        return None
+
+    # Use the merged_qchi grid for q/chi (same grid used during processing)
+    qchi = result.merged_qchi
+    if qchi is None:
+        return None
+    q_grid = qchi["q"].values if "q" in qchi.coords else None
+    chi_grid = qchi["chi"].values if "chi" in qchi.coords else None
+    if q_grid is None or chi_grid is None:
+        return None
+
+    n_q = len(q_grid)
+    n_chi = len(chi_grid)
+
+    # Determine number of frames
+    if saxs_frames is not None and waxs_frames is not None:
+        n_frames = max(saxs_frames.sizes.get("frame", 1),
+                       waxs_frames.sizes.get("frame", 1))
+    elif saxs_frames is not None:
+        n_frames = saxs_frames.sizes.get("frame", 1)
+    else:
+        n_frames = waxs_frames.sizes.get("frame", 1)
+
+    if n_frames <= 1:
+        return None
+
+    from scipy.interpolate import RegularGridInterpolator
+
+    def _regrid_frame(src_q, src_chi, data):
+        """Regrid a single frame (q, chi) -> (n_q, n_chi) on the merged grid."""
+        finite_data = np.where(np.isfinite(data), data, 0.0)
+        interp = RegularGridInterpolator(
+            (src_q, src_chi), finite_data,
+            method="nearest", bounds_error=False, fill_value=np.nan,
+        )
+        tq, tc = np.meshgrid(q_grid, chi_grid, indexing="ij")
+        return interp((tq, tc))
+
+    frames_3d = np.full((n_frames, n_chi, n_q), np.nan, dtype=np.float64)
+
+    for fi in range(n_frames):
+        s_I = None
+        s_N = None
+        w_I = None
+        w_N = None
+
+        if saxs_frames is not None and fi < saxs_frames.sizes.get("frame", 0):
+            sq = np.asarray(saxs_frames["q"].values, dtype=float)
+            schi = np.asarray(saxs_frames["chi"].values, dtype=float)
+            s_I_raw = saxs_frames["intensity"].isel(frame=fi).values.astype(float)
+            s_N_raw = saxs_frames["counts"].isel(frame=fi).values.astype(float)
+            s_I = _regrid_frame(sq, schi, s_I_raw)
+            s_N = _regrid_frame(sq, schi, np.where(np.isfinite(s_N_raw), s_N_raw, 0.0))
+
+        if waxs_frames is not None and fi < waxs_frames.sizes.get("frame", 0):
+            wq = np.asarray(waxs_frames["q"].values, dtype=float)
+            wchi = np.asarray(waxs_frames["chi"].values, dtype=float)
+            w_I_raw = waxs_frames["intensity"].isel(frame=fi).values.astype(float)
+            w_N_raw = waxs_frames["counts"].isel(frame=fi).values.astype(float)
+            w_I = _regrid_frame(wq, wchi, w_I_raw)
+            w_N = _regrid_frame(wq, wchi, np.where(np.isfinite(w_N_raw), w_N_raw, 0.0))
+
+        # Count-weighted merge (same logic as merge_q_chi_weighted)
+        if s_I is not None and w_I is not None:
+            total_N = s_N + w_N
+            with np.errstate(divide="ignore", invalid="ignore"):
+                merged = np.where(
+                    total_N > 0,
+                    (np.nan_to_num(s_I, nan=0.0) * s_N
+                     + np.nan_to_num(w_I, nan=0.0) * w_N) / total_N,
+                    np.nan,
+                )
+        elif s_I is not None:
+            merged = s_I
+        elif w_I is not None:
+            merged = w_I
+        else:
+            continue
+
+        # merged is (n_q, n_chi) — transpose to (n_chi, n_q)
+        frames_3d[fi] = merged.T
+
+    out = (q_grid, chi_grid, frames_3d)
+    if uid:
+        _per_frame_qchi_cache["uid"] = uid
+        _per_frame_qchi_cache["data"] = out
+    return out
+
+
 def _plot_2d_transmission(result, frame_idx=None):
     """Plot q-vs-chi as an interactive Bokeh figure."""
     from bokeh.plotting import figure as bk_figure
     from bokeh.models import LogColorMapper, LinearColorMapper, ColorBar
 
     qchi = result.merged_qchi
-    if frame_idx is not None and "frame" in qchi.dims:
-        img = qchi["intensity"].isel(frame=frame_idx).values
-        title = f"q vs χ — frame {frame_idx}"
+
+    # Per-frame display: try merged_qchi frame dim first, then saxs/waxs q_chi_frames
+    if frame_idx is not None:
+        if "frame" in qchi.dims:
+            img = qchi["intensity"].isel(frame=frame_idx).values
+            q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
+            chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
+        else:
+            pf = _get_per_frame_qchi(result)
+            if pf is not None:
+                q, chi, frames_3d = pf
+                img = frames_3d[frame_idx]  # already (n_chi, n_q)
+            else:
+                img = qchi["intensity"].values
+                q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
+                chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
+                frame_idx = None  # fallback to merged
+        title = f"q vs χ — frame {frame_idx}" if frame_idx is not None else "q vs χ (merged)"
     else:
         img = qchi["intensity"].values
+        q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
+        chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
         title = "q vs χ (merged)"
-    q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
-    chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
 
     # Ensure img has shape (n_chi, n_q) so Bokeh renders chi on y, q on x.
     if img.shape == (len(q), len(chi)):
@@ -3652,11 +3885,17 @@ def _on_proc_iq_mode_change(event):
             idx = w_proc_frame_slider.value
             w_proc_2d_plot.object = _plot_2d_gi(gi, frame_idx=idx)
         elif result is not None:
+            # Detect per-frame 2D: merged_qchi with frame dim, or q_chi_frames
             qchi = getattr(result, "merged_qchi", None)
-            if qchi is not None and "frame" in qchi.dims:
+            has_qchi_frames = qchi is not None and "frame" in qchi.dims
+            if has_qchi_frames:
                 n_fr = qchi.sizes["frame"]
+            else:
+                pf = _get_per_frame_qchi(result)
+                n_fr = pf[2].shape[0] if pf is not None else 0
+            if n_fr > 1:
                 w_proc_frame_slider.end = max(0, n_fr - 1)
-                w_proc_frame_slider.visible = n_fr > 1
+                w_proc_frame_slider.visible = True
                 idx = w_proc_frame_slider.value
                 w_proc_2d_plot.object = _plot_2d_transmission(result, frame_idx=idx)
             else:
@@ -3671,12 +3910,14 @@ def _on_proc_iq_mode_change(event):
 
     _build_proc_iq_plot()
     _update_frame_slider_label()
+    _render_cuts_plot()
 
 
 def _on_proc_iq_label_change(event):
     """Redraw I(q) when the frame label column changes (only in per-frame mode)."""
     if w_proc_iq_mode.value == "per-frame":
         _build_proc_iq_plot()
+        _render_cuts_plot()
     # Also update frame slider label on the 2D plot
     _update_frame_slider_label()
 
@@ -4541,6 +4782,7 @@ def _on_process(event):
     w_proc_spinner.visible = True
     w_btn_process.disabled = True
     _proc_result_cache.update(result=None, gi_result=None)
+    _per_frame_qchi_cache.update(uid=None, data=None)
     _processing_guard["active"] = True
 
     try:
@@ -4619,6 +4861,15 @@ def _on_process(event):
                 has_qchi_frames = "frame" in qchi.dims
                 if has_qchi_frames:
                     n_fr = qchi.sizes["frame"]
+                else:
+                    # Check for per-frame data in saxs/waxs q_chi_frames
+                    pf_qchi = _get_per_frame_qchi(result)
+                    if pf_qchi is not None:
+                        n_fr = pf_qchi[2].shape[0]
+                        has_qchi_frames = True  # we have per-frame 2D data
+                    else:
+                        n_fr = 0
+                if has_qchi_frames and n_fr > 1:
                     w_proc_frame_slider.end = max(0, n_fr - 1)
                     w_proc_frame_slider.value = 0
                 # Show per-frame controls if frames exist in either source
@@ -4626,8 +4877,8 @@ def _on_process(event):
                 if not w_proc_iq_mode.visible:
                     w_proc_iq_mode.value = "merged"
                 # Display 2D map respecting the current mode toggle
-                if w_proc_iq_mode.value == "per-frame" and has_qchi_frames:
-                    w_proc_frame_slider.visible = n_fr > 1
+                if w_proc_iq_mode.value == "per-frame" and has_qchi_frames and n_fr > 1:
+                    w_proc_frame_slider.visible = True
                     w_proc_2d_plot.object = _plot_2d_transmission(
                         result, frame_idx=w_proc_frame_slider.value)
                 else:
@@ -5572,6 +5823,17 @@ def _resolve_export_dir() -> Path | None:
     proj = w_proposal_project.value
     rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
 
+    # If project is "(all)", try to get the actual project name from scan metadata
+    if not proj or proj == "(all)":
+        uid = _state.get("selected_uid")
+        if uid:
+            try:
+                run = _get_cat()[uid]
+                md = dict(run.metadata)
+                proj = md.get("start", {}).get("project_name") or proj
+            except Exception:
+                pass
+
     # If proposal dropdown has a valid data session, use it directly
     if ds and not ds.startswith("("):
         resolved = resolve_output_dir(ds, proj, relative_path=rel)
@@ -5645,6 +5907,42 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     except Exception:
         pass
 
+    # Raw detector images
+    raw_images = None
+    if "h5" in _export_formats():
+        raw_images = {}
+        image_fields = _image_cache.get("fields") or []
+        run = _ensure_run()
+        if run and image_fields:
+            for field in image_fields:
+                try:
+                    from smi_browser.cache import cache_path as _cache_path
+                    import h5py as _h5
+                    cp = _cache_path(uid)
+                    if cp.exists():
+                        with _h5.File(cp, "r") as cf:
+                            if f"images/{field}" in cf:
+                                raw_images[field] = cf[f"images/{field}"][:]
+                                continue
+                    # Fallback: fetch from tiled
+                    raw_images[field] = tb.fetch_all_frames(run, "primary", field)
+                except Exception:
+                    log.debug("Could not fetch raw images for field %s", field)
+
+    # Frame labels from primary scalars
+    frame_labels = None
+    label_cols = _get_frame_label_cols()
+    if label_cols and primary_df is not None and not primary_df.empty:
+        parts = []
+        for col in label_cols:
+            if col in primary_df.columns:
+                parts.append(primary_df[col].astype(str))
+        if parts:
+            import pandas as pd
+            frame_labels = pd.concat(parts, axis=1).apply(
+                lambda row: " | ".join(row), axis=1,
+            ).tolist()
+
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -5656,6 +5954,8 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
         primary_df=primary_df,
         baseline_df=baseline_df,
         raw_metadata=raw_md,
+        raw_images=raw_images if raw_images else None,
+        frame_labels=frame_labels,
         formats=_export_formats(),
         subdir_template=w_export_subdir.value,
         basename_template=w_export_basename.value,
@@ -5797,6 +6097,7 @@ _live: dict[str, Any] = {
     "active": False,
     "saved": {},  # widget -> {param_name: prev_value}
     "doc": None,  # captured Bokeh document for cross-thread dispatch
+    "frame_seq": 0,  # debounce counter for frame-extended events
 }
 
 # ---------------------------------------------------------------------------
@@ -6017,6 +6318,9 @@ def _dispatch_to_doc(fn):
     thread returns ``None``.  We therefore capture the document once on
     the UI thread when live mode starts (see ``_enter_live_mode``) and
     use that captured reference here.
+
+    If the captured document has been destroyed (e.g. WebSocket reconnect),
+    we fall back to scheduling via the Tornado IOLoop directly.
     """
     doc = _live.get("doc")
     if doc is None:
@@ -6026,8 +6330,19 @@ def _dispatch_to_doc(fn):
         except Exception:
             log.exception("live: inline dispatch failed")
         return
+    # Check if doc is still alive (destroyed docs lose _change_callbacks).
     try:
+        if not hasattr(doc.callbacks, '_change_callbacks'):
+            raise AttributeError("document destroyed")
         doc.add_next_tick_callback(fn)
+    except (AttributeError, RuntimeError):
+        # Document was destroyed (session ended / WebSocket reconnect).
+        # Fall back to the Tornado IOLoop which survives across sessions.
+        from tornado.ioloop import IOLoop
+        try:
+            IOLoop.current().add_callback(fn)
+        except Exception:
+            log.debug("live: IOLoop fallback dispatch also failed")
     except Exception:
         log.exception("live: add_next_tick_callback failed")
 
@@ -6072,7 +6387,10 @@ def _live_set_lockout(on: bool) -> None:
                     wgt.disabled = True
         # Lock the table (no row selection mid-stream).
         _live_save(w_table, "selectable")
-        w_table.selectable = False
+        try:
+            w_table.selectable = False
+        except TypeError:
+            pass  # Panel Tabulator._update_selectable signature mismatch
         # Snapshot current tab + force Explore.
         _live_save(w_detail_tabs, "active")
         w_detail_tabs.active = EXPLORE_TAB_INDEX
@@ -6185,12 +6503,19 @@ def _live_on_frame_extended(uid: str, field: str, n_total: int) -> None:
     _image_cache["dataset"] = None
     if n_total <= 0:
         return
+    # Debounce: bump the sequence counter so that if multiple frame events
+    # arrive rapidly, only the latest one actually triggers a re-render.
+    _live["frame_seq"] = _live.get("frame_seq", 0) + 1
+    my_seq = _live["frame_seq"]
     # Extend slider range; auto-advance to the latest frame iff this field
     # is the one currently displayed.
     new_end = max(0, n_total - 1)
     if w_image_slider.end != new_end:
         w_image_slider.end = new_end
     if field == _image_cache.get("field"):
+        # Skip render if a newer frame event has already been dispatched.
+        if _live.get("frame_seq", 0) != my_seq:
+            return
         # Setting .value triggers _on_image_slider → re-renders + cursor sync.
         if w_image_slider.value != new_end:
             w_image_slider.value = new_end
@@ -6200,6 +6525,12 @@ def _live_on_frame_extended(uid: str, field: str, n_total: int) -> None:
                 _render_image_frame(field, new_end)
             except Exception:
                 log.exception("live: frame re-render failed")
+    # If the Grid tab is currently active, refresh the multiview grid too.
+    if w_detail_tabs.active == 4:
+        try:
+            _fetch_and_build_multiview(field)
+        except Exception:
+            log.exception("live: multiview grid refresh failed")
 
 
 def _live_on_error(stage: str, exc: Exception) -> None:
@@ -6497,13 +6828,16 @@ def _refresh_proposals(cycle: str | None = None):
     opts = {"(All — no filter)": "(All)"}
     opts.update({p.display_label: p.data_session for p in proposals})
     w_proposal_select.options = opts
-    # Restore saved data session if available and still a valid option
-    saved_ds = _load_saved_datasession()
-    if saved_ds and saved_ds in opts.values():
-        w_proposal_select.value = saved_ds
-    else:
-        # Default to (All) so users see recent scans without filtering
+    # During init, always default to (All) so initial view is unfiltered.
+    # After init, restore saved data session if available.
+    if _initializing:
         w_proposal_select.value = "(All)"
+    else:
+        saved_ds = _load_saved_datasession()
+        if saved_ds and saved_ds in opts.values():
+            w_proposal_select.value = saved_ds
+        else:
+            w_proposal_select.value = "(All)"
     w_proposal_status.object = f"*{len(proposals)} proposal{'s' if len(proposals) != 1 else ''}*"
 
 
@@ -6511,6 +6845,11 @@ def _on_cycle_change(*_events):
     """Re-fetch proposals when the cycle selection changes."""
     cycle = w_proposal_cycle.value
     if cycle in ("(loading…)", "(unavailable)"):
+        return
+
+    # During init, just populate dropdowns without triggering search
+    if _initializing:
+        _refresh_proposals(cycle)
         return
 
     # Reset detail pane and clear table to avoid stale state
@@ -6540,6 +6879,8 @@ def _on_cycle_change(*_events):
 
 def _on_proposal_select(*_events):
     """Apply the selected data-session as a search filter and search."""
+    if _initializing:
+        return
     ds = w_proposal_select.value
     if not ds or ds.startswith("(") and ds != "(All)":
         return
@@ -6649,6 +6990,8 @@ def _populate_project_names(data_session: str):
 
 def _on_project_select(*_events):
     """Apply project_name filter on top of the data-session filter."""
+    if _initializing:
+        return
     project = w_proposal_project.value
     ds = w_proposal_select.value
     if not ds or ds.startswith("("):
@@ -7181,6 +7524,12 @@ def _on_coll_export(event):
             formats=_coll_export_formats(),
             params_list=params_list,
             metadata_list=metadata_list,
+            primary_dfs=[
+                _collection.get_primary_df(uid) for uid in _collection.uids
+            ],
+            baseline_dfs=[
+                _collection.get_baseline_df(uid) for uid in _collection.uids
+            ],
         )
         w_coll_export_status.object = (
             f"✅ Wrote **{len(files)}** files to `{out_dir}`"
@@ -7283,6 +7632,7 @@ dashboard = pn.Column(
 
 dashboard.servable(title="SMI Browser")
 
+
 _refresh_login_status()
 _refresh_pagination()
 _reset_detail()
@@ -7301,8 +7651,8 @@ def _startup_search():
 
         cat = _get_cat()
 
-        # Use restored filters (from pn.state.cache) if available
-        unified = _state["unified_filters"]
+        # Always start unfiltered — show most recent scans
+        unified = []
 
         if count_hint is None and not unified:
             # First run or cache missing — use len(cat) which is faster
@@ -7360,6 +7710,8 @@ def _startup_search():
     finally:
         w_search_spinner.value = False
         w_search_spinner.visible = False
+
+_initializing = False  # Allow dropdown callbacks to trigger searches now
 
 _startup_thread = threading.Thread(target=_startup_search, daemon=True)
 _startup_thread.start()

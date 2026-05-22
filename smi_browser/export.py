@@ -214,21 +214,105 @@ def _save_dataset_h5(
     y_label: str,
     params: dict[str, Any],
     path: Path,
+    primary_df=None,
+    baseline_df=None,
+    raw_metadata: dict | None = None,
+    raw_images: dict[str, np.ndarray] | None = None,
+    frame_labels: list[str] | None = None,
 ) -> None:
-    """Save the full processing result and cuts to an HDF5 file.
+    """Save the full scan data and processing results to an HDF5 file.
 
-    Uses xarray's h5netcdf engine for the main datasets and h5py for
-    additional groups (cuts, metadata).
+    Handles three cases:
+      1. Unprocessed: primary, baseline, metadata, raw images
+      2. Processed transmission: all of the above + merged/per-frame I(q),
+         merged/per-frame q-chi, line cuts with per-frame labeling, parameters
+      3. Processed GI: all of the above + summed/per-frame qxy-qz,
+         line cuts, parameters
     """
     import h5py
-    import xarray as xr
+    import pandas as pd
     from .figures.cuts import compute_cross_section
 
     with h5py.File(path, "w") as f:
+        # --- Raw detector images ---
+        if raw_images:
+            img_grp = f.create_group("raw_images")
+            for field_name, stack in raw_images.items():
+                if stack is not None:
+                    img_grp.create_dataset(
+                        field_name, data=stack, compression="gzip",
+                        compression_opts=4,
+                    )
+
+        # --- Primary stream scalars ---
+        if primary_df is not None and not primary_df.empty:
+            p_grp = f.create_group("primary")
+            for col in primary_df.columns:
+                arr = primary_df[col].values
+                try:
+                    if pd.api.types.is_numeric_dtype(primary_df[col]):
+                        p_grp.create_dataset(col, data=arr.astype(np.float64))
+                    else:
+                        p_grp.create_dataset(
+                            col, data=np.array(arr, dtype=h5py.string_dtype()),
+                        )
+                except (TypeError, ValueError):
+                    p_grp.create_dataset(
+                        col,
+                        data=np.array([str(v) for v in arr], dtype=h5py.string_dtype()),
+                    )
+
+        # --- Baseline stream scalars ---
+        if baseline_df is not None and not baseline_df.empty:
+            b_grp = f.create_group("baseline")
+            for col in baseline_df.columns:
+                arr = baseline_df[col].values
+                try:
+                    if pd.api.types.is_numeric_dtype(baseline_df[col]):
+                        b_grp.create_dataset(col, data=arr.astype(np.float64))
+                    else:
+                        b_grp.create_dataset(
+                            col, data=np.array(arr, dtype=h5py.string_dtype()),
+                        )
+                except (TypeError, ValueError):
+                    b_grp.create_dataset(
+                        col,
+                        data=np.array([str(v) for v in arr], dtype=h5py.string_dtype()),
+                    )
+
+        # --- Raw metadata (start/stop documents) ---
+        if raw_metadata:
+            md_grp = f.create_group("metadata")
+            for section_key in ("start", "stop"):
+                section = raw_metadata.get(section_key)
+                if not section or not isinstance(section, dict):
+                    continue
+                sg = md_grp.create_group(section_key)
+                for k, v in section.items():
+                    try:
+                        if v is None:
+                            sg.attrs[k] = "None"
+                        elif isinstance(v, (list, tuple)):
+                            try:
+                                sg.attrs[k] = list(v)
+                            except TypeError:
+                                sg.attrs[k] = str(v)
+                        elif isinstance(v, dict):
+                            sg.attrs[k] = str(v)
+                        else:
+                            sg.attrs[k] = v
+                    except (TypeError, ValueError):
+                        sg.attrs[k] = str(v)
+
+        # ===== PROCESSING RESULTS (only if processed) =====
+
         # --- Transmission result ---
         if result is not None:
             grp = f.create_group("transmission")
-            # merged I(q)
+            grp.attrs["geometry"] = result.geometry or ""
+            grp.attrs["uid"] = result.uid or ""
+
+            # Merged I(q)
             iq = result.merged_iq
             iq_grp = grp.create_group("merged_iq")
             for var in iq.data_vars:
@@ -236,19 +320,79 @@ def _save_dataset_h5(
             if "q" in iq.coords:
                 iq_grp.create_dataset("q", data=iq["q"].values)
 
-            # merged q-chi
+            # Per-frame I(q)
+            pf_iq = getattr(result, "per_frame_iq", None)
+            if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
+                pf_iq_grp = grp.create_group("per_frame_iq")
+                pf_iq_grp.attrs["n_frames"] = pf_iq.sizes["frame"]
+                pf_iq_grp.create_dataset("q", data=pf_iq["q"].values)
+                pf_iq_grp.create_dataset("I", data=pf_iq["I"].values)
+                if "saxs_I" in pf_iq:
+                    pf_iq_grp.create_dataset("saxs_I", data=pf_iq["saxs_I"].values)
+                if "waxs_I" in pf_iq:
+                    pf_iq_grp.create_dataset("waxs_I", data=pf_iq["waxs_I"].values)
+                # Frame-level scalar labels
+                for var in pf_iq.data_vars:
+                    if var in ("I", "saxs_I", "waxs_I"):
+                        continue
+                    arr = pf_iq[var]
+                    if arr.dims == ("frame",):
+                        pf_iq_grp.create_dataset(var, data=arr.values)
+                # Store frame label strings if provided
+                if frame_labels:
+                    pf_iq_grp.create_dataset(
+                        "frame_labels",
+                        data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                    )
+
+            # Merged q-chi
             qchi = result.merged_qchi
             qchi_grp = grp.create_group("merged_qchi")
-            qchi_grp.create_dataset(
-                "intensity", data=qchi["intensity"].values,
-            )
+            qchi_grp.create_dataset("intensity", data=qchi["intensity"].values)
             if "q" in qchi.coords:
                 qchi_grp.create_dataset("q", data=qchi["q"].values)
             if "chi" in qchi.coords:
                 qchi_grp.create_dataset("chi", data=qchi["chi"].values)
 
-            grp.attrs["geometry"] = result.geometry or ""
-            grp.attrs["uid"] = result.uid or ""
+            # Per-frame q-chi (from saxs/waxs q_chi_frames)
+            saxs = getattr(result, "saxs", None)
+            waxs = getattr(result, "waxs", None)
+            saxs_qchi_frames = saxs.get("q_chi_frames") if saxs else None
+            waxs_qchi_frames = waxs.get("q_chi_frames") if waxs else None
+            if saxs_qchi_frames is not None or waxs_qchi_frames is not None:
+                pf_qchi_grp = grp.create_group("per_frame_qchi")
+                # Use the merged grid coords
+                if "q" in qchi.coords:
+                    pf_qchi_grp.create_dataset("q", data=qchi["q"].values)
+                if "chi" in qchi.coords:
+                    pf_qchi_grp.create_dataset("chi", data=qchi["chi"].values)
+                if saxs_qchi_frames is not None:
+                    sg = pf_qchi_grp.create_group("saxs")
+                    sg.attrs["n_frames"] = saxs_qchi_frames.sizes.get("frame", 1)
+                    sg.create_dataset(
+                        "intensity", data=saxs_qchi_frames["intensity"].values,
+                        compression="gzip", compression_opts=4,
+                    )
+                    if "q" in saxs_qchi_frames.coords:
+                        sg.create_dataset("q", data=saxs_qchi_frames["q"].values)
+                    if "chi" in saxs_qchi_frames.coords:
+                        sg.create_dataset("chi", data=saxs_qchi_frames["chi"].values)
+                if waxs_qchi_frames is not None:
+                    wg = pf_qchi_grp.create_group("waxs")
+                    wg.attrs["n_frames"] = waxs_qchi_frames.sizes.get("frame", 1)
+                    wg.create_dataset(
+                        "intensity", data=waxs_qchi_frames["intensity"].values,
+                        compression="gzip", compression_opts=4,
+                    )
+                    if "q" in waxs_qchi_frames.coords:
+                        wg.create_dataset("q", data=waxs_qchi_frames["q"].values)
+                    if "chi" in waxs_qchi_frames.coords:
+                        wg.create_dataset("chi", data=waxs_qchi_frames["chi"].values)
+                if frame_labels:
+                    pf_qchi_grp.create_dataset(
+                        "frame_labels",
+                        data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                    )
 
         # --- GI result ---
         if gi_result is not None:
@@ -266,8 +410,13 @@ def _save_dataset_h5(
                     data=np.array(gi_result.alpha_i_deg, dtype=np.float64),
                 )
             grp.attrs["alpha_i_source"] = gi_result.alpha_i_source or ""
+            if frame_labels:
+                grp.create_dataset(
+                    "frame_labels",
+                    data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                )
 
-        # --- Cross-section cuts ---
+        # --- Cross-section cuts (from the current 2D display) ---
         if cuts and x is not None and y is not None and image is not None:
             cuts_grp = f.create_group("cuts")
             for i, cut in enumerate(cuts):
@@ -285,18 +434,19 @@ def _save_dataset_h5(
                 cg.create_dataset("axis", data=axis)
                 cg.create_dataset("intensity", data=intensity)
 
-        # --- Processing parameters ---
-        params_grp = f.create_group("parameters")
-        for k, v in (params or {}).items():
-            try:
-                if isinstance(v, (list, tuple)):
-                    params_grp.attrs[k] = list(v)
-                elif v is None:
-                    params_grp.attrs[k] = "None"
-                else:
-                    params_grp.attrs[k] = v
-            except TypeError:
-                params_grp.attrs[k] = str(v)
+        # --- Processing parameters (only if processing was done) ---
+        if params and (result is not None or gi_result is not None):
+            params_grp = f.create_group("parameters")
+            for k, v in params.items():
+                try:
+                    if isinstance(v, (list, tuple)):
+                        params_grp.attrs[k] = list(v)
+                    elif v is None:
+                        params_grp.attrs[k] = "None"
+                    else:
+                        params_grp.attrs[k] = v
+                except TypeError:
+                    params_grp.attrs[k] = str(v)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +558,8 @@ def export_scan(
     primary_df=None,
     baseline_df=None,
     raw_metadata: dict | None = None,
+    raw_images: dict[str, np.ndarray] | None = None,
+    frame_labels: list[str] | None = None,
     formats: set[str] | None = None,
     subdir_template: str = "{uid_short}",
     basename_template: str = "",
@@ -527,6 +679,10 @@ def export_scan(
         _save_dataset_h5(
             result, gi_result, cuts or [], x, y, image,
             x_label, y_label, params or {}, h5_path,
+            primary_df=primary_df, baseline_df=baseline_df,
+            raw_metadata=raw_metadata,
+            raw_images=raw_images,
+            frame_labels=frame_labels,
         )
         files_written.append(_fname("result.h5"))
 
@@ -904,6 +1060,8 @@ def export_collection(
     formats: set[str] | None = None,
     params_list: list[dict] | None = None,
     metadata_list: list[dict] | None = None,
+    primary_dfs: list | None = None,
+    baseline_dfs: list | None = None,
 ) -> tuple[Path, list[str]]:
     """Export a collection of scans as combined single-file outputs.
 
@@ -1134,6 +1292,62 @@ def export_collection(
                                 sg.attrs[k] = v if v is not None else "None"
                             except TypeError:
                                 sg.attrs[k] = str(v)
+
+            # Primary stream scalars (per-scan)
+            if primary_dfs:
+                pri_grp = f.create_group("primary")
+                for i, pdf in enumerate(primary_dfs):
+                    if pdf is None or pdf.empty:
+                        continue
+                    label = _safe(
+                        scan_labels[i] if i < len(scan_labels) else f"scan_{i}"
+                    )
+                    sg = pri_grp.create_group(label)
+                    for col in pdf.columns:
+                        arr = pdf[col].values
+                        try:
+                            if pd.api.types.is_numeric_dtype(pdf[col]):
+                                sg.create_dataset(col, data=arr.astype(np.float64))
+                            else:
+                                sg.create_dataset(
+                                    col,
+                                    data=np.array(arr, dtype=h5py.string_dtype()),
+                                )
+                        except (TypeError, ValueError):
+                            sg.create_dataset(
+                                col,
+                                data=np.array(
+                                    [str(v) for v in arr], dtype=h5py.string_dtype()
+                                ),
+                            )
+
+            # Baseline stream scalars (per-scan)
+            if baseline_dfs:
+                bas_grp = f.create_group("baseline")
+                for i, bdf in enumerate(baseline_dfs):
+                    if bdf is None or bdf.empty:
+                        continue
+                    label = _safe(
+                        scan_labels[i] if i < len(scan_labels) else f"scan_{i}"
+                    )
+                    sg = bas_grp.create_group(label)
+                    for col in bdf.columns:
+                        arr = bdf[col].values
+                        try:
+                            if pd.api.types.is_numeric_dtype(bdf[col]):
+                                sg.create_dataset(col, data=arr.astype(np.float64))
+                            else:
+                                sg.create_dataset(
+                                    col,
+                                    data=np.array(arr, dtype=h5py.string_dtype()),
+                                )
+                        except (TypeError, ValueError):
+                            sg.create_dataset(
+                                col,
+                                data=np.array(
+                                    [str(v) for v in arr], dtype=h5py.string_dtype()
+                                ),
+                            )
 
         files_written.append(f"{safe_basename}.h5")
 

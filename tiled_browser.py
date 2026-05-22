@@ -292,6 +292,10 @@ def fetch_page_fast(
     # Fetch from end (newest-first)
     real_offset = max(0, total_estimate - offset - limit)
     real_limit = min(limit, total_estimate - offset)
+    log.warning(
+        "DEBUG fetch_page_fast: total_estimate=%d, offset=%d, limit=%d → real_offset=%d, real_limit=%d, filters=%r, count_hint=%r",
+        total_estimate, offset, limit, real_offset, real_limit, unified_filters, count_hint,
+    )
 
     params = {
         "page[offset]": str(real_offset),
@@ -309,6 +313,10 @@ def fetch_page_fast(
     else:
         total = resp_json.get("meta", {}).get("count", total_estimate)
     items = resp_json.get("data", [])
+    log.warning(
+        "DEBUG fetch_page_fast: server returned %d items, meta.count=%s, using total=%d (estimate was %d)",
+        len(items), resp_json.get("meta", {}).get("count", "N/A"), total, total_estimate,
+    )
 
     # If hint was off (got 0 items), correct with real total
     if not items and total > 0 and total != total_estimate:
