@@ -392,6 +392,15 @@ def _scalar_stream_to_frame(run, stream: str, *, uid: str | None = None,
     return _scalars_to_dataframe(scalar_data)
 
 
+def _config_to_dataframe(run) -> pd.DataFrame:
+    """Build a single-row DataFrame from the primary stream configuration."""
+    config_data = tb.fetch_primary_config(run)
+    if not config_data:
+        return pd.DataFrame()
+    # Build single-row DataFrame: each config field is a column
+    return pd.DataFrame([config_data])
+
+
 def _detector_for_field(field: str) -> str | None:
     """Classify a detector field name as ``'saxs'`` / ``'waxs'`` / ``None``."""
     return smid.classify_detector_field(field)
@@ -1060,10 +1069,13 @@ w_primary_fit_btn = pn.widgets.Button(
 w_primary_fit_result = pn.pane.Markdown("", sizing_mode="stretch_width")
 
 w_baseline_table = pn.widgets.Tabulator(
-    value=pd.DataFrame(columns=["field", "before", "after"]),
+    value=pd.DataFrame(columns=["source", "field", "before", "after"]),
     show_index=False, sizing_mode="stretch_both",
     configuration={"layout": "fitColumns", "rowHeight": 22},
-    header_filters={"field": {"type": "input", "func": "like", "placeholder": "filter…"}},
+    header_filters={
+        "field": {"type": "input", "func": "like", "placeholder": "filter…"},
+        "source": {"type": "input", "func": "like", "placeholder": "filter…"},
+    },
 )
 w_baseline_status = pn.pane.Markdown("*Click tab to load.*")
 
@@ -4039,7 +4051,7 @@ def _reset_detail(preserve_figure=False):
     w_primary_status.object = "*Click tab to load.*"
     # Don't clear x/y options/values — they persist across scans
     w_primary_plot.object = None
-    w_baseline_table.value = pd.DataFrame(columns=["field", "before", "after"])
+    w_baseline_table.value = pd.DataFrame(columns=["source", "field", "before", "after"])
     w_baseline_status.object = "*Click tab to load.*"
     if not preserve_figure:
         # Full reset — destroy the Bokeh figure and all overlays
@@ -4220,37 +4232,64 @@ def _load_baseline():
     run = _ensure_run()
     if run is None:
         return
-    if "baseline" not in tb.stream_names(run):
-        w_baseline_status.object = "*No baseline stream.*"
-        _detail_cache["baseline_loaded"] = True
-        return
     t0 = time.perf_counter()
     w_baseline_status.object = "*Loading…*"
-    # Single read for baseline (avoids per-field .structure() on 300+ fields)
-    uid = _state.get("selected_uid")
-    if uid:
-        scalar_data = get_or_fetch_scalars(
-            uid, "baseline",
-            lambda: tb.fetch_scalars(run, "baseline"),
-        )
-    else:
-        scalar_data = tb.fetch_scalars(run, "baseline")
-    # Transpose into field/before/after rows (baseline typically has 2 readings)
+
     rows = []
-    for key, arr in sorted(scalar_data.items()):
-        arr = np.asarray(arr).flatten()
-        if arr.size >= 2:
-            rows.append({"field": key, "before": str(arr[0]), "after": str(arr[-1])})
-        elif arr.size == 1:
-            rows.append({"field": key, "before": str(arr[0]), "after": ""})
-        else:
-            rows.append({"field": key, "before": str(arr.tolist()), "after": ""})
-    df = pd.DataFrame(rows, columns=["field", "before", "after"])
+
+    try:
+        # --- Baseline stream scalars ---
+        has_baseline = "baseline" in tb.stream_names(run)
+        if has_baseline:
+            uid = _state.get("selected_uid")
+            if uid:
+                scalar_data = get_or_fetch_scalars(
+                    uid, "baseline",
+                    lambda: tb.fetch_scalars(run, "baseline"),
+                )
+            else:
+                scalar_data = tb.fetch_scalars(run, "baseline")
+            for key, arr in sorted(scalar_data.items()):
+                arr = np.asarray(arr).flatten()
+                if arr.size >= 2:
+                    rows.append({"source": "baseline", "field": key,
+                                 "before": str(arr[0]), "after": str(arr[-1])})
+                elif arr.size == 1:
+                    rows.append({"source": "baseline", "field": key,
+                                 "before": str(arr[0]), "after": ""})
+                else:
+                    rows.append({"source": "baseline", "field": key,
+                                 "before": str(arr.tolist()), "after": ""})
+
+        # --- Primary stream configuration data ---
+        try:
+            config_data = tb.fetch_primary_config(run)
+            for key, val in sorted(config_data.items()):
+                rows.append({"source": "config", "field": key,
+                             "before": str(val), "after": ""})
+        except Exception as exc:
+            log.warning("Config fetch failed: %s", exc)
+
+    except Exception as exc:
+        log.exception("Baseline/config load failed")
+        w_baseline_status.object = f"**Error:** `{exc}`"
+        _detail_cache["baseline_loaded"] = True
+        return
+
+    df = pd.DataFrame(rows, columns=["source", "field", "before", "after"])
     dt_ms = (time.perf_counter() - t0) * 1000
     w_baseline_table.value = df
-    w_baseline_status.object = (
-        f"**{len(df)} fields** ({dt_ms:.0f} ms)"
-    )
+    n_baseline = sum(1 for r in rows if r["source"] == "baseline")
+    n_config = sum(1 for r in rows if r["source"] == "config")
+    parts = []
+    if n_baseline:
+        parts.append(f"{n_baseline} baseline")
+    if n_config:
+        parts.append(f"{n_config} config")
+    if parts:
+        w_baseline_status.object = f"**{' + '.join(parts)} fields** ({dt_ms:.0f} ms)"
+    else:
+        w_baseline_status.object = "*No baseline or config data.*"
     _detail_cache["baseline_loaded"] = True
 
 
@@ -4955,23 +4994,30 @@ def _on_add_to_collection(event):
         return
     summary = _detail_cache.get("summary") or {}
     params = _last_result.get("params") or {}
-    # Bundle primary/baseline/raw metadata with the processed scan
+    # Bundle primary/baseline/config/raw metadata with the processed scan
     primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
     # Fetch baseline as raw scalar DataFrame (the UI table is transposed
     # into field/before/after rows, which isn't suitable for numeric lookups).
     baseline_df = None
+    config_df = None
+    run = _ensure_run()
     if _detail_cache.get("baseline_loaded"):
-        run = _ensure_run()
         if run and "baseline" in tb.stream_names(run):
             try:
                 baseline_df = _scalar_stream_to_frame(run, "baseline")
             except Exception:
                 pass
+    if run:
+        try:
+            config_df = _config_to_dataframe(run)
+        except Exception:
+            pass
     raw_metadata = w_meta_json.object if w_meta_json.object else None
     _collection.add(
         result, summary, params,
         primary_df=primary_df,
         baseline_df=baseline_df,
+        config_df=config_df,
         raw_metadata=raw_metadata,
     )
     _refresh_collection()
@@ -5354,6 +5400,7 @@ def _batch_process_fn(uid: str):
         run = _get_cat()[uid]
         primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
         baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+        config_df = _config_to_dataframe(run)
         raw_md = dict(run.metadata)
         start_md = raw_md.get("start", {})
         summary = {
@@ -5368,11 +5415,13 @@ def _batch_process_fn(uid: str):
     except Exception:
         primary_df = None
         baseline_df = None
+        config_df = None
         raw_md = None
         summary = _batch_state.get("summaries", {}).get(uid, {})
     # Pack extra data into params (BatchProcessor passes it through).
     params["_primary_df"] = primary_df
     params["_baseline_df"] = baseline_df
+    params["_config_df"] = config_df
     params["_raw_metadata"] = raw_md
     return result, summary, params
 
@@ -5476,11 +5525,13 @@ def _batch_add_fn(result, summary, params):
     # already reflects the new collection size.
     primary_df = params.pop("_primary_df", None)
     baseline_df = params.pop("_baseline_df", None)
+    config_df = params.pop("_config_df", None)
     raw_metadata = params.pop("_raw_metadata", None)
     _collection.add(
         result, summary, params,
         primary_df=primary_df,
         baseline_df=baseline_df,
+        config_df=config_df,
         raw_metadata=raw_metadata,
     )
 
@@ -5496,6 +5547,7 @@ def _batch_add_fn(result, summary, params):
                     params=params,
                     primary_df=primary_df,
                     baseline_df=baseline_df,
+                    config_df=config_df,
                     raw_metadata=raw_metadata,
                     formats=_export_formats(),
                     subdir_template=w_export_subdir.value,
@@ -5887,14 +5939,20 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     # Gather cuts
     cuts = list(_persisted_cuts)
 
-    # Primary/baseline
+    # Primary/baseline/config
     primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
     baseline_df = None
+    config_df = None
     if _detail_cache.get("baseline_loaded"):
         run = _ensure_run()
         if run and "baseline" in tb.stream_names(run):
             try:
                 baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+            except Exception:
+                pass
+        if run:
+            try:
+                config_df = _config_to_dataframe(run)
             except Exception:
                 pass
 
@@ -5953,6 +6011,7 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
         params=params,
         primary_df=primary_df,
         baseline_df=baseline_df,
+        config_df=config_df,
         raw_metadata=raw_md,
         raw_images=raw_images if raw_images else None,
         frame_labels=frame_labels,
@@ -6008,6 +6067,7 @@ def _on_export_collection(event):
             coll_params = _collection._processing.get(coll_uid, {})
             coll_primary = _collection.get_primary_df(coll_uid)
             coll_baseline = _collection.get_baseline_df(coll_uid)
+            coll_config = _collection.get_config_df(coll_uid)
             coll_raw_md = _collection.get_raw_metadata(coll_uid)
 
             try:
@@ -6018,6 +6078,7 @@ def _on_export_collection(event):
                     params=coll_params,
                     primary_df=coll_primary,
                     baseline_df=coll_baseline,
+                    config_df=coll_config,
                     raw_metadata=coll_raw_md,
                     formats=_export_formats(),
                     subdir_template=w_export_subdir.value,
@@ -6074,6 +6135,424 @@ export_panel = pn.Column(
     pn.layout.Divider(),
     pn.Row(w_btn_export_current, w_btn_export_collection, w_export_auto),
     pn.Row(w_export_status, w_export_spinner),
+    sizing_mode="stretch_width",
+)
+
+
+# ---------------------------------------------------------------------------
+# Batch export — fetch many scans and run export_scan() without processing
+# ---------------------------------------------------------------------------
+#
+# Mirrors the Process › Batch tab, but each job opens a scan, fetches the
+# primary/baseline scalars + raw metadata (and optionally raw detector
+# images), then calls export_scan() with the destination/format options
+# configured in the Export tab above.  No reduction is performed, so the
+# resulting files exclude processing-derived outputs (PNG 2D map, I(q),
+# linecuts, CSV I(q), HDF5 reduction groups) — only metadata, scalar CSVs,
+# baseline CSVs, and (if HDF5 is enabled) raw detector frames are written.
+
+w_bxp_status = pn.pane.Markdown(
+    "*Idle — queue scans from the current search results to export them in "
+    "the background (no processing).*",
+    margin=(0, 5),
+)
+w_bxp_progress = pn.indicators.Progress(
+    name="Batch export progress", value=0, max=1, width=400, visible=False,
+)
+w_bxp_table = pn.widgets.Tabulator(
+    pd.DataFrame(columns=["uid_short", "label", "state", "duration_s", "error"]),
+    height=320, layout="fit_data_stretch", show_index=False, disabled=True,
+    sizing_mode="stretch_width",
+)
+w_bxp_max_workers = pn.widgets.IntInput(
+    name="Workers", value=2, start=1, end=16, width=90,
+)
+w_bxp_skip_existing = pn.widgets.Checkbox(
+    name="Skip uids whose export folder already exists", value=True,
+)
+w_bxp_max_jobs = pn.widgets.IntInput(
+    name="Max jobs", value=PAGE_SIZE, start=1, end=BatchProcessor.MAX_QUEUE,
+    width=110,
+)
+w_btn_bxp_queue = pn.widgets.Button(
+    name="Queue scans", button_type="primary",
+)
+w_btn_bxp_cancel = pn.widgets.Button(
+    name="Cancel", button_type="warning", disabled=True,
+)
+w_btn_bxp_clear = pn.widgets.Button(
+    name="Clear log", button_type="light", disabled=True,
+)
+
+_bxp_state: dict[str, Any] = {"doc": None, "processor": None}
+
+
+def _bxp_resolve_subdir(uid: str, raw_metadata: dict | None) -> Path | None:
+    """Compute the would-be scan_dir for a uid using current Export settings."""
+    out_dir = _resolve_export_dir()
+    if out_dir is None:
+        return None
+    uid_short = uid[:8]
+    scan_id = ""
+    sample_name = ""
+    if raw_metadata:
+        start = raw_metadata.get("start", {})
+        scan_id = str(start.get("scan_id", ""))
+        sample_name = start.get(
+            "sample_name", start.get("sample", start.get("Sample", ""))
+        )
+
+    def _safe(s: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+
+    tmpl = w_export_subdir.value or ""
+    if not tmpl:
+        return out_dir
+    try:
+        return out_dir / tmpl.format(
+            uid=uid, uid_short=uid_short,
+            scan_id=_safe(scan_id), sample_name=_safe(sample_name),
+        )
+    except Exception:
+        return out_dir / uid_short
+
+
+def _bxp_process_fn(uid: str):
+    """BatchProcessor.process_fn for export-only batches."""
+    out_dir = _resolve_export_dir()
+    if out_dir is None:
+        raise RuntimeError(
+            "Cannot resolve export directory. Configure it in the Export tab "
+            "(or select a proposal)."
+        )
+
+    run = _get_cat()[uid]
+    try:
+        primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
+    except Exception:
+        primary_df = None
+    try:
+        baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+    except Exception:
+        baseline_df = None
+    try:
+        config_df = _config_to_dataframe(run)
+    except Exception:
+        config_df = None
+    try:
+        raw_md = dict(run.metadata)
+    except Exception:
+        raw_md = None
+
+    formats = _export_formats()
+
+    # Optionally fetch raw detector images for HDF5 output.
+    raw_images: dict | None = None
+    if "h5" in formats:
+        raw_images = {}
+        try:
+            info = tb.stream_info_for(run, "primary")
+            image_fields = list(info.get("images", []) or [])
+        except Exception:
+            image_fields = []
+        for field in image_fields:
+            try:
+                from smi_browser.cache import cache_path as _cache_path
+                import h5py as _h5
+                cp = _cache_path(uid)
+                if cp.exists():
+                    with _h5.File(cp, "r") as cf:
+                        if f"images/{field}" in cf:
+                            raw_images[field] = cf[f"images/{field}"][:]
+                            continue
+                raw_images[field] = tb.fetch_all_frames(run, "primary", field)
+            except Exception:
+                log.debug("batch export: failed raw image fetch for %s/%s",
+                          uid[:8], field)
+        if not raw_images:
+            raw_images = None
+
+    # Frame labels from primary scalars.
+    frame_labels = None
+    label_cols = _get_frame_label_cols()
+    if label_cols and primary_df is not None and not primary_df.empty:
+        parts = []
+        for col in label_cols:
+            if col in primary_df.columns:
+                parts.append(primary_df[col].astype(str))
+        if parts:
+            frame_labels = pd.concat(parts, axis=1).apply(
+                lambda row: " | ".join(row), axis=1,
+            ).tolist()
+
+    scan_dir, files = export_scan(
+        out_dir=out_dir,
+        uid=uid,
+        result=None,
+        gi_result=None,
+        cuts=None,
+        proc_2d_cache=None,
+        params=None,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        config_df=config_df,
+        raw_metadata=raw_md,
+        raw_images=raw_images,
+        frame_labels=frame_labels,
+        formats=formats,
+        subdir_template=w_export_subdir.value,
+        basename_template=w_export_basename.value,
+        frame_label_col=label_cols or None,
+    )
+
+    # Return a triple compatible with BatchProcessor; add_fn is a no-op.
+    summary = {"uid": uid, "scan_dir": str(scan_dir), "n_files": len(files)}
+    return None, summary, {"scan_dir": str(scan_dir), "n_files": len(files)}
+
+
+def _bxp_skip(uid: str) -> bool:
+    if not w_bxp_skip_existing.value:
+        return False
+    try:
+        scan_dir = _bxp_resolve_subdir(uid, raw_metadata=None)
+    except Exception:
+        return False
+    if scan_dir is None or not scan_dir.exists():
+        return False
+    try:
+        return any(scan_dir.iterdir())
+    except Exception:
+        return False
+
+
+def _bxp_add_fn(result, summary, params):
+    # No collection involvement — export already happened in process_fn.
+    return
+
+
+def _bxp_dispatch(snap: dict) -> None:
+    """status_cb: marshal UI updates onto the Bokeh document thread."""
+
+    def _apply():
+        try:
+            states = snap["states"]
+            total = snap["total"]
+            done = (
+                states["done"] + states["error"]
+                + states["skipped"] + states["cancelled"]
+            )
+            running = snap["running"]
+
+            w_bxp_progress.max = max(total, 1)
+            w_bxp_progress.value = done
+            w_bxp_progress.visible = total > 0
+
+            label = "running" if running else (
+                "cancelling" if snap["cancel_requested"] else "idle"
+            )
+            w_bxp_status.object = (
+                f"**Batch export {label}** — {done}/{total} processed "
+                f"(done={states['done']}, error={states['error']}, "
+                f"skipped={states['skipped']}, cancelled={states['cancelled']}, "
+                f"queued={states['queued']}, running={states['running']})"
+            )
+
+            rows = []
+            for j in snap["jobs"]:
+                dur = j.get("duration_s")
+                rows.append({
+                    "uid_short": (j["uid"] or "")[:8],
+                    "label": j.get("label", ""),
+                    "state": j["state"],
+                    "duration_s": f"{dur:.1f}" if dur else "",
+                    "error": j.get("error", ""),
+                })
+            new_df = pd.DataFrame(
+                rows,
+                columns=["uid_short", "label", "state", "duration_s", "error"],
+            )
+            old_df = w_bxp_table.value
+            if (
+                old_df is not None
+                and len(old_df) == len(new_df)
+                and list(old_df.columns) == list(new_df.columns)
+            ):
+                patches = {}
+                for col in new_df.columns:
+                    for idx in range(len(new_df)):
+                        ov = old_df.iat[idx, old_df.columns.get_loc(col)]
+                        nv = new_df.iat[idx, new_df.columns.get_loc(col)]
+                        if ov != nv:
+                            patches.setdefault(col, []).append((idx, nv))
+                if patches:
+                    w_bxp_table.patch(patches)
+            else:
+                w_bxp_table.value = new_df
+
+            def _color_bxp_rows(row):
+                css = _BATCH_ROW_COLORS.get(row["state"], "")
+                return [css] * len(row)
+            w_bxp_table.style.apply(_color_bxp_rows, axis=1)
+
+            w_btn_bxp_queue.disabled = running
+            w_btn_bxp_cancel.disabled = not running
+            w_btn_bxp_clear.disabled = running or total == 0
+        except Exception:
+            log.exception("batch export: UI render failed")
+
+    doc = _bxp_state.get("doc")
+    if doc is None:
+        _apply()
+        return
+    try:
+        doc.add_next_tick_callback(_apply)
+    except Exception:
+        log.exception("batch export: add_next_tick_callback failed")
+
+
+def _ensure_bxp_processor() -> BatchProcessor:
+    bp = _bxp_state.get("processor")
+    workers = max(1, int(w_bxp_max_workers.value or 1))
+    if bp is None or bp._max_workers != workers or not bp.is_running:
+        if bp is not None and bp.is_running:
+            return bp
+        bp = BatchProcessor(
+            process_fn=_bxp_process_fn,
+            add_fn=_bxp_add_fn,
+            status_cb=_bxp_dispatch,
+            skip_fn=_bxp_skip,
+            max_workers=workers,
+        )
+        _bxp_state["processor"] = bp
+    return bp
+
+
+def _on_bxp_queue(event):
+    total = _state.get("total", 0)
+    if total == 0:
+        pn.state.notifications.warning("No search results to queue.")
+        return
+    if _resolve_export_dir() is None:
+        pn.state.notifications.error(
+            "Cannot resolve export directory. Set it in the Export tab "
+            "or select a proposal."
+        )
+        return
+    try:
+        _bxp_state["doc"] = pn.state.curdoc
+    except Exception:
+        _bxp_state["doc"] = None
+
+    max_jobs = max(1, int(w_bxp_max_jobs.value or 25))
+    skip_existing = w_bxp_skip_existing.value
+
+    items: list[tuple[str, str]] = []
+    unified = _state.get("unified_filters", [])
+    page_size = _state.get("page_size", PAGE_SIZE)
+
+    df = w_table.value
+    if df is not None and len(df) > 0 and "uid" in df.columns:
+        for uid in df["uid"].tolist():
+            if not uid:
+                continue
+            if skip_existing:
+                scan_dir = _bxp_resolve_subdir(uid, raw_metadata=None)
+                if scan_dir is not None and scan_dir.exists():
+                    try:
+                        if any(scan_dir.iterdir()):
+                            continue
+                    except Exception:
+                        pass
+            items.append((uid, ""))
+            if len(items) >= max_jobs:
+                break
+
+    offset = page_size
+    while len(items) < max_jobs and offset < total:
+        page_summaries, _ = tb.fetch_page_fast(
+            _get_cat(), unified_filters=unified or None,
+            offset=offset, limit=page_size,
+        )
+        if not page_summaries:
+            break
+        for s in page_summaries:
+            uid = s.get("uid", "")
+            if not uid:
+                continue
+            if skip_existing:
+                scan_dir = _bxp_resolve_subdir(uid, raw_metadata=None)
+                if scan_dir is not None and scan_dir.exists():
+                    try:
+                        if any(scan_dir.iterdir()):
+                            continue
+                    except Exception:
+                        pass
+            items.append((uid, ""))
+            if len(items) >= max_jobs:
+                break
+        offset += page_size
+
+    if not items:
+        pn.state.notifications.info("Nothing to queue (all already exported).")
+        return
+
+    bp = _ensure_bxp_processor()
+    n = bp.enqueue(items)
+    if n == 0:
+        pn.state.notifications.info("Nothing to queue (all already tracked).")
+        return
+    bp.start()
+    pn.state.notifications.success(
+        f"Queued {n} scan{'s' if n != 1 else ''} for batch export."
+    )
+
+
+def _on_bxp_cancel(event):
+    bp = _bxp_state.get("processor")
+    if bp is None:
+        return
+    bp.cancel()
+    pn.state.notifications.info(
+        "Cancellation requested; the running job will finish."
+    )
+
+
+def _on_bxp_clear(event):
+    bp = _bxp_state.get("processor")
+    if bp is None:
+        return
+    bp.clear_terminal()
+
+
+w_btn_bxp_queue.on_click(_on_bxp_queue)
+w_btn_bxp_cancel.on_click(_on_bxp_cancel)
+w_btn_bxp_clear.on_click(_on_bxp_clear)
+
+
+batch_export_panel = pn.Column(
+    pn.pane.Markdown(
+        "**Batch export scans from the current search results — no "
+        "processing.**  Each job opens the scan, fetches primary/baseline "
+        "scalars + raw metadata (and raw detector frames, if HDF5 is on), "
+        "then writes them with `export_scan()` using the destination and "
+        "format options configured in the *Export* sub-tab.  Processing-"
+        "derived outputs (2D map PNG, I(q), linecuts, reduction HDF5 "
+        "groups) are skipped since no reduction is performed."
+    ),
+    pn.Row(w_btn_bxp_queue, w_btn_bxp_cancel, w_btn_bxp_clear),
+    pn.Row(w_bxp_max_jobs, w_bxp_max_workers, w_bxp_skip_existing),
+    w_bxp_status,
+    w_bxp_progress,
+    w_bxp_table,
+    sizing_mode="stretch_width",
+)
+
+
+# Combine the per-scan / collection export panel with the batch panel
+# in a sub-tab strip, mirroring the Process tab layout.
+export_tabs = pn.Tabs(
+    ("Export", export_panel),
+    ("Batch", batch_export_panel),
     sizing_mode="stretch_width",
 )
 
@@ -7064,7 +7543,7 @@ w_detail_tabs = pn.Tabs(
         ),
     ),
     (
-        "Baseline",
+        "Baseline / Config",
         pn.Column(w_baseline_status, w_baseline_table, sizing_mode="stretch_both"),
     ),
     (
@@ -7195,7 +7674,7 @@ w_detail_tabs = pn.Tabs(
     ),
     (
         "Export",
-        export_panel,
+        export_tabs,
     ),
 )
 

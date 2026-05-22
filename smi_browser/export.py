@@ -216,6 +216,7 @@ def _save_dataset_h5(
     path: Path,
     primary_df=None,
     baseline_df=None,
+    config_df=None,
     raw_metadata: dict | None = None,
     raw_images: dict[str, np.ndarray] | None = None,
     frame_labels: list[str] | None = None,
@@ -276,6 +277,24 @@ def _save_dataset_h5(
                         )
                 except (TypeError, ValueError):
                     b_grp.create_dataset(
+                        col,
+                        data=np.array([str(v) for v in arr], dtype=h5py.string_dtype()),
+                    )
+
+        # --- Primary stream configuration data ---
+        if config_df is not None and not config_df.empty:
+            c_grp = f.create_group("config")
+            for col in config_df.columns:
+                arr = config_df[col].values
+                try:
+                    if pd.api.types.is_numeric_dtype(config_df[col]):
+                        c_grp.create_dataset(col, data=arr.astype(np.float64))
+                    else:
+                        c_grp.create_dataset(
+                            col, data=np.array(arr, dtype=h5py.string_dtype()),
+                        )
+                except (TypeError, ValueError):
+                    c_grp.create_dataset(
                         col,
                         data=np.array([str(v) for v in arr], dtype=h5py.string_dtype()),
                     )
@@ -557,6 +576,7 @@ def export_scan(
     params: dict[str, Any] | None = None,
     primary_df=None,
     baseline_df=None,
+    config_df=None,
     raw_metadata: dict | None = None,
     raw_images: dict[str, np.ndarray] | None = None,
     frame_labels: list[str] | None = None,
@@ -581,6 +601,8 @@ def export_scan(
     params : processing params, optional
     primary_df : DataFrame, optional
     baseline_df : DataFrame, optional
+    config_df : DataFrame, optional
+        Primary stream configuration data (detector settings, motor offsets).
     raw_metadata : dict, optional
     formats : set of format keys, optional
         Which outputs to produce.  Keys:
@@ -680,6 +702,7 @@ def export_scan(
             result, gi_result, cuts or [], x, y, image,
             x_label, y_label, params or {}, h5_path,
             primary_df=primary_df, baseline_df=baseline_df,
+            config_df=config_df,
             raw_metadata=raw_metadata,
             raw_images=raw_images,
             frame_labels=frame_labels,
@@ -778,6 +801,12 @@ def export_scan(
         p = scan_dir / _fname("baseline_scalars.csv")
         baseline_df.to_csv(p, index=False)
         files_written.append(_fname("baseline_scalars.csv"))
+
+    # --- CSV: primary config ---
+    if "csv_baseline" in formats and config_df is not None and not config_df.empty:
+        p = scan_dir / _fname("config_scalars.csv")
+        config_df.to_csv(p, index=False)
+        files_written.append(_fname("config_scalars.csv"))
 
     # --- Metadata text ---
     if "metadata_txt" in formats and raw_metadata:

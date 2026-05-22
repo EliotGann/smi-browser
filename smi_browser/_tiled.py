@@ -970,6 +970,47 @@ def fetch_scalars(
 
 
 # ---------------------------------------------------------------------------
+# Primary stream configuration data
+# ---------------------------------------------------------------------------
+
+def fetch_primary_config(run) -> dict[str, Any]:
+    """
+    Extract configuration data from the primary stream metadata.
+
+    In Bluesky/tiled, ``run["primary"].metadata["configuration"]`` stores
+    per-device configuration snapshots: motor offsets, detector settings, etc.
+    This function flattens the nested structure into a simple
+    ``{field_name: value}`` dict.
+
+    Returns an empty dict if no configuration is available.
+    """
+    try:
+        primary_md = run["primary"].metadata
+    except Exception:
+        return {}
+
+    # metadata may be a DictView or similar — coerce to dict
+    try:
+        if not isinstance(primary_md, dict):
+            primary_md = dict(primary_md)
+    except Exception:
+        return {}
+
+    config = primary_md.get("configuration")
+    if not config or not isinstance(config, dict):
+        return {}
+
+    result: dict[str, Any] = {}
+    for _device_name, device_block in config.items():
+        if not isinstance(device_block, dict):
+            continue
+        data = device_block.get("data")
+        if isinstance(data, dict):
+            result.update(data)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Convenience: quick metadata-only table for a list of UIDs
 # ---------------------------------------------------------------------------
 

@@ -39,6 +39,7 @@ class ScanCollection:
         self._color_idx = 0
         self._primary_dfs: dict[str, pd.DataFrame] = {}   # uid -> primary scalars
         self._baseline_dfs: dict[str, pd.DataFrame] = {}  # uid -> baseline scalars
+        self._config_dfs: dict[str, pd.DataFrame] = {}    # uid -> primary config
         self._raw_metadata: dict[str, dict] = {}          # uid -> full tiled metadata
 
     @property
@@ -54,6 +55,7 @@ class ScanCollection:
     def add(self, result, metadata: dict, params: dict | None = None,
              primary_df: pd.DataFrame | None = None,
              baseline_df: pd.DataFrame | None = None,
+             config_df: pd.DataFrame | None = None,
              raw_metadata: dict | None = None):
         """Add a processed scan to the collection.
 
@@ -63,6 +65,8 @@ class ScanCollection:
             Primary stream scalar data (for label columns / export).
         baseline_df : DataFrame, optional
             Baseline stream scalar data (for label columns / export).
+        config_df : DataFrame, optional
+            Primary stream configuration data (detector settings, motor offsets).
         raw_metadata : dict, optional
             Full tiled metadata dict (for export).
         """
@@ -74,6 +78,8 @@ class ScanCollection:
             self._primary_dfs[result.uid] = primary_df
         if baseline_df is not None:
             self._baseline_dfs[result.uid] = baseline_df
+        if config_df is not None:
+            self._config_dfs[result.uid] = config_df
         if raw_metadata is not None:
             self._raw_metadata[result.uid] = raw_metadata
         if result.uid not in self._colors:
@@ -89,6 +95,7 @@ class ScanCollection:
         self._colors.pop(uid, None)
         self._primary_dfs.pop(uid, None)
         self._baseline_dfs.pop(uid, None)
+        self._config_dfs.pop(uid, None)
         self._raw_metadata.pop(uid, None)
 
     def get_color(self, uid: str) -> str:
@@ -152,6 +159,9 @@ class ScanCollection:
 
     def get_baseline_df(self, uid: str) -> pd.DataFrame | None:
         return self._baseline_dfs.get(uid)
+
+    def get_config_df(self, uid: str) -> pd.DataFrame | None:
+        return self._config_dfs.get(uid)
 
     def get_raw_metadata(self, uid: str) -> dict | None:
         return self._raw_metadata.get(uid)
