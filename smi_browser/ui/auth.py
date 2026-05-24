@@ -103,6 +103,11 @@ login_form = pn.Column(
     pn.pane.Markdown("**Tiled login**"),
     login_user,
     login_pass,
+    pn.pane.Alert(
+        "Check for Duo confirmation after signing in.",
+        alert_type="warning",
+        margin=(0, 0, 8, 0),
+    ),
     pn.Row(login_submit),
     login_msg,
     visible=False,
@@ -173,6 +178,9 @@ def wire(app: AppState, tiled_uri: str) -> None:
 
     btn_login.on_click(_toggle_login_form)
     login_submit.on_click(_on_login_submit)
+    # PasswordInput has no Enter-key event in Panel 1.8; value commits on Enter,
+    # so mirror that commit to the Sign in button click handler.
+    login_pass.jscallback(args={"submit": login_submit}, value="submit.clicks += 1")
     btn_logout.on_click(_on_logout)
 
     # Initial check

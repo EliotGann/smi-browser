@@ -53,7 +53,7 @@ _TERMINAL = {"done", "error", "skipped", "cancelled"}
 class BatchProcessor:
     """Bounded thread-pool queue runner for per-scan processing."""
 
-    MAX_QUEUE = 200  # safety cap on total job count
+    MAX_QUEUE = 2000  # safety cap on total job count
 
     def __init__(
         self,

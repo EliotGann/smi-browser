@@ -6,6 +6,7 @@ containing the full xarray dataset plus any cross-section cuts.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,9 @@ from . import nsls2api
 
 log = logging.getLogger(__name__)
 
+# Matplotlib rendering is not thread-safe; serialize all plot creation/saving.
+_MPL_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Directory resolution
@@ -23,6 +27,7 @@ log = logging.getLogger(__name__)
 def resolve_output_dir(
     data_session: str,
     project_name: str | None,
+    cycle: str | None = None,
     relative_path: str = "projects/{project_name}/analysis",
 ) -> Path | None:
     """Build the output directory for a given proposal + project.
@@ -37,7 +42,7 @@ def resolve_output_dir(
         or *None* if the proposal directory cannot be resolved.
     """
     proposal_id = nsls2api._proposal_id_from_data_session(data_session)
-    base = nsls2api.fetch_proposal_directory(proposal_id)
+    base = nsls2api.fetch_proposal_directory_for_cycle(proposal_id, cycle)
     if not base:
         return None
     # Resolve template placeholders
@@ -69,31 +74,35 @@ def _save_2d_map(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    finite = image[np.isfinite(image) & (image > 0)]
-    if finite.size:
-        vmin = max(float(np.percentile(finite, 2)), 1e-6)
-        vmax = float(np.percentile(finite, 99.5))
-        norm = LogNorm(vmin=vmin, vmax=max(vmax, vmin * 2))
-    else:
-        norm = None
-    extent = [float(x.min()), float(x.max()), float(y.min()), float(y.max())]
-    ax.imshow(
-        np.where(np.isfinite(image), image, 0),
-        origin="lower",
-        aspect="auto",
-        extent=extent,
-        norm=norm,
-        cmap="turbo",
-    )
-    ax.set_xlabel(x_label)
-    ax.set_ylabel(y_label)
-    ax.set_title(title)
-    fig.colorbar(ax.images[0], ax=ax, label="Intensity")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    fig = None
+    with _MPL_LOCK:
+        try:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            finite = image[np.isfinite(image) & (image > 0)]
+            if finite.size:
+                vmin = max(float(np.percentile(finite, 2)), 1e-6)
+                vmax = float(np.percentile(finite, 99.5))
+                norm = LogNorm(vmin=vmin, vmax=max(vmax, vmin * 2))
+            else:
+                norm = None
+            extent = [float(x.min()), float(x.max()), float(y.min()), float(y.max())]
+            ax.imshow(
+                np.where(np.isfinite(image), image, 0),
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                norm=norm,
+                cmap="turbo",
+            )
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.set_title(title)
+            fig.colorbar(ax.images[0], ax=ax, label="Intensity")
+            fig.tight_layout()
+            fig.savefig(path, dpi=150)
+        finally:
+            if fig is not None:
+                plt.close(fig)
 
 
 def _save_iq_plot(
@@ -101,38 +110,82 @@ def _save_iq_plot(
     title: str,
     path: Path,
 ) -> None:
-    """Save merged I(q) as a log-log PNG (transmission only)."""
+    """Save I(q) as a log-log PNG using marker style (no connecting lines)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    fig = None
+    with _MPL_LOCK:
+        try:
+            iq = result.merged_iq
+            q = iq["q"].values
+            I = iq["I"].values
+            det_mode = _iq_detector_mode(iq)
 
-    iq = result.merged_iq
-    q = iq["q"].values
-    I = iq["I"].values
+            fig, ax = plt.subplots(figsize=(8, 5))
+            series: list[tuple[str, np.ndarray, str]] = []
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    mask = np.isfinite(I) & (I > 0)
-    if mask.any():
-        ax.plot(q[mask], I[mask], "k-", lw=1.2, label="merged")
+            mask = np.isfinite(I) & (I > 0)
+            if det_mode not in {"saxs_only", "waxs_only"} and mask.any():
+                series.append(("merged", I, "black"))
+            if "saxs_I" in iq:
+                sI = iq["saxs_I"].values
+                sm = np.isfinite(sI) & (sI > 0)
+                if sm.any():
+                    series.append(("SAXS", sI, "blue"))
+            if "waxs_I" in iq:
+                wI = iq["waxs_I"].values
+                wm = np.isfinite(wI) & (wI > 0)
+                if wm.any():
+                    series.append(("WAXS", wI, "red"))
+
+            # Match UI default style: markers only (no lines).
+            single_series = len(series) == 1
+            for label, y, color in series:
+                m = np.isfinite(y) & (y > 0)
+                if not m.any():
+                    continue
+                ax.scatter(
+                    q[m],
+                    y[m],
+                    s=10,
+                    color=("black" if single_series else color),
+                    alpha=0.9,
+                    label=label,
+                )
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("q (nm⁻¹)")
+            ax.set_ylabel("I(q)")
+            ax.set_title(title)
+            if series:
+                ax.legend()
+            fig.tight_layout()
+            fig.savefig(path, dpi=150)
+        finally:
+            if fig is not None:
+                plt.close(fig)
+
+
+def _iq_detector_mode(iq) -> str:
+    """Classify I(q) availability as both/saxs_only/waxs_only/none."""
+    has_saxs = False
+    has_waxs = False
+    if iq is None:
+        return "none"
     if "saxs_I" in iq:
-        sI = iq["saxs_I"].values
-        sm = np.isfinite(sI) & (sI > 0)
-        if sm.any():
-            ax.plot(q[sm], sI[sm], "b-", lw=0.8, alpha=0.6, label="SAXS")
+        s = iq["saxs_I"].values
+        has_saxs = bool(np.isfinite(s).any() and (s > 0).any())
     if "waxs_I" in iq:
-        wI = iq["waxs_I"].values
-        wm = np.isfinite(wI) & (wI > 0)
-        if wm.any():
-            ax.plot(q[wm], wI[wm], "r-", lw=0.8, alpha=0.6, label="WAXS")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("q (nm⁻¹)")
-    ax.set_ylabel("I(q)")
-    ax.set_title(title)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+        w = iq["waxs_I"].values
+        has_waxs = bool(np.isfinite(w).any() and (w > 0).any())
+    if has_saxs and has_waxs:
+        return "both"
+    if has_saxs:
+        return "saxs_only"
+    if has_waxs:
+        return "waxs_only"
+    return "none"
 
 
 def _save_linecuts(
@@ -159,42 +212,52 @@ def _save_linecuts(
     paths: list[Path] = []
 
     if h_cuts:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for i, cut in enumerate(h_cuts):
-            sec = compute_cross_section(cut, x, y, image, x_label, y_label)
-            if sec is None:
-                continue
-            axis, intensity, alabel = sec
-            label = f"h-cut {i}: {y_label}={cut['center']:.3g} ± {cut['width']/2:.3g}"
-            ax.plot(axis, intensity, lw=1.2, alpha=0.8, label=label)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("Intensity")
-        ax.set_title("Horizontal linecuts")
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        p = out_dir / f"{prefix}linecuts_h.png"
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        paths.append(p)
+        fig = None
+        with _MPL_LOCK:
+            try:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                for i, cut in enumerate(h_cuts):
+                    sec = compute_cross_section(cut, x, y, image, x_label, y_label)
+                    if sec is None:
+                        continue
+                    axis, intensity, alabel = sec
+                    label = f"h-cut {i}: {y_label}={cut['center']:.3g} ± {cut['width']/2:.3g}"
+                    ax.plot(axis, intensity, lw=1.2, alpha=0.8, label=label)
+                ax.set_xlabel(x_label)
+                ax.set_ylabel("Intensity")
+                ax.set_title("Horizontal linecuts")
+                ax.legend(fontsize=8)
+                fig.tight_layout()
+                p = out_dir / f"{prefix}linecuts_h.png"
+                fig.savefig(p, dpi=150)
+                paths.append(p)
+            finally:
+                if fig is not None:
+                    plt.close(fig)
 
     if v_cuts:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for i, cut in enumerate(v_cuts):
-            sec = compute_cross_section(cut, x, y, image, x_label, y_label)
-            if sec is None:
-                continue
-            axis, intensity, alabel = sec
-            label = f"v-cut {i}: {x_label}={cut['center']:.3g} ± {cut['width']/2:.3g}"
-            ax.plot(axis, intensity, lw=1.2, alpha=0.8, label=label)
-        ax.set_xlabel(y_label)
-        ax.set_ylabel("Intensity")
-        ax.set_title("Vertical linecuts")
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        p = out_dir / f"{prefix}linecuts_v.png"
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        paths.append(p)
+        fig = None
+        with _MPL_LOCK:
+            try:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                for i, cut in enumerate(v_cuts):
+                    sec = compute_cross_section(cut, x, y, image, x_label, y_label)
+                    if sec is None:
+                        continue
+                    axis, intensity, alabel = sec
+                    label = f"v-cut {i}: {x_label}={cut['center']:.3g} ± {cut['width']/2:.3g}"
+                    ax.plot(axis, intensity, lw=1.2, alpha=0.8, label=label)
+                ax.set_xlabel(y_label)
+                ax.set_ylabel("Intensity")
+                ax.set_title("Vertical linecuts")
+                ax.legend(fontsize=8)
+                fig.tight_layout()
+                p = out_dir / f"{prefix}linecuts_v.png"
+                fig.savefig(p, dpi=150)
+                paths.append(p)
+            finally:
+                if fig is not None:
+                    plt.close(fig)
 
     return paths
 
@@ -731,18 +794,29 @@ def export_scan(
     # --- CSV: merged I(q) ---
     if "csv_iq" in formats and result is not None and hasattr(result, "merged_iq"):
         iq = result.merged_iq
-        iq_df = pd.DataFrame({"q": iq["q"].values, "I": iq["I"].values})
-        if "saxs_I" in iq:
-            iq_df["saxs_I"] = iq["saxs_I"].values
-        if "waxs_I" in iq:
-            iq_df["waxs_I"] = iq["waxs_I"].values
+        det_mode = _iq_detector_mode(iq)
+        if det_mode == "saxs_only" and "saxs_I" in iq:
+            iq_df = pd.DataFrame({"q": iq["q"].values, "saxs_I": iq["saxs_I"].values})
+        elif det_mode == "waxs_only" and "waxs_I" in iq:
+            iq_df = pd.DataFrame({"q": iq["q"].values, "waxs_I": iq["waxs_I"].values})
+        else:
+            iq_df = pd.DataFrame({"q": iq["q"].values, "I": iq["I"].values})
+            if "saxs_I" in iq:
+                iq_df["saxs_I"] = iq["saxs_I"].values
+            if "waxs_I" in iq:
+                iq_df["waxs_I"] = iq["waxs_I"].values
         p = scan_dir / _fname("iq_merged.csv")
         iq_df.to_csv(p, index=False)
         files_written.append(_fname("iq_merged.csv"))
 
         # Per-frame I(q) if available
         pf_iq = getattr(result, "per_frame_iq", None)
-        if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
+        if (
+            pf_iq is not None
+            and "I" in pf_iq
+            and "frame" in pf_iq.dims
+            and pf_iq.sizes.get("frame", 0) > 1
+        ):
             pf_dir = scan_dir / _fname("per_frame_iq")
             pf_dir.mkdir(exist_ok=True)
             q_vals = pf_iq["q"].values
@@ -756,7 +830,13 @@ def export_scan(
                 label_cols = list(frame_label_col)
 
             for fi in range(n_frames):
-                frame_I = pf_iq["I"].isel(frame=fi).values
+                if det_mode == "saxs_only" and "saxs_I" in pf_iq:
+                    y_key = "saxs_I"
+                elif det_mode == "waxs_only" and "waxs_I" in pf_iq:
+                    y_key = "waxs_I"
+                else:
+                    y_key = "I"
+                frame_I = pf_iq[y_key].isel(frame=fi).values
                 # Build filename from label columns
                 label_parts: list[str] = []
                 for col in label_cols:
@@ -767,12 +847,16 @@ def export_scan(
                     fname = f"iq_frame_{fi:04d}_{'_'.join(label_parts)}.csv"
                 else:
                     fname = f"iq_frame_{fi:04d}.csv"
-                # Include merged, saxs, and waxs I(q) columns
-                frame_df = pd.DataFrame({"q": q_vals, "I": frame_I})
-                if "saxs_I" in pf_iq:
-                    frame_df["saxs_I"] = pf_iq["saxs_I"].isel(frame=fi).values
-                if "waxs_I" in pf_iq:
-                    frame_df["waxs_I"] = pf_iq["waxs_I"].isel(frame=fi).values
+                if y_key == "saxs_I":
+                    frame_df = pd.DataFrame({"q": q_vals, "saxs_I": frame_I})
+                elif y_key == "waxs_I":
+                    frame_df = pd.DataFrame({"q": q_vals, "waxs_I": frame_I})
+                else:
+                    frame_df = pd.DataFrame({"q": q_vals, "I": frame_I})
+                    if "saxs_I" in pf_iq:
+                        frame_df["saxs_I"] = pf_iq["saxs_I"].isel(frame=fi).values
+                    if "waxs_I" in pf_iq:
+                        frame_df["waxs_I"] = pf_iq["waxs_I"].isel(frame=fi).values
                 frame_df.to_csv(pf_dir / fname, index=False)
             files_written.append(f"per_frame_iq/ ({n_frames} files)")
 
@@ -1429,23 +1513,28 @@ def export_collection(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for entry in iq_data:
-            q, I = entry["q"], entry["I"]
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
-                ax.plot(q[mask], I[mask], lw=1.2, alpha=0.8, label=entry["label"])
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("q (nm⁻¹)")
-        ax.set_ylabel("I(q)")
-        ax.set_title(f"{basename} — I(q) comparison")
-        ax.legend(fontsize=8, loc="best")
-        fig.tight_layout()
-        png_path = out_dir / f"{safe_basename}_iq.png"
-        fig.savefig(png_path, dpi=150)
-        plt.close(fig)
-        files_written.append(f"{safe_basename}_iq.png")
+        fig = None
+        with _MPL_LOCK:
+            try:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                for entry in iq_data:
+                    q, I = entry["q"], entry["I"]
+                    mask = np.isfinite(I) & (I > 0)
+                    if mask.any():
+                        ax.plot(q[mask], I[mask], lw=1.2, alpha=0.8, label=entry["label"])
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                ax.set_xlabel("q (nm⁻¹)")
+                ax.set_ylabel("I(q)")
+                ax.set_title(f"{basename} — I(q) comparison")
+                ax.legend(fontsize=8, loc="best")
+                fig.tight_layout()
+                png_path = out_dir / f"{safe_basename}_iq.png"
+                fig.savefig(png_path, dpi=150)
+                files_written.append(f"{safe_basename}_iq.png")
+            finally:
+                if fig is not None:
+                    plt.close(fig)
 
     log.info("export_collection: wrote %d items to %s", len(files_written), out_dir)
     return out_dir, files_written

@@ -29,6 +29,7 @@ downstream analysis.
 from __future__ import annotations
 
 import datetime
+import gc
 import logging
 import threading
 import time
@@ -296,6 +297,36 @@ SEARCH_TYPES = ["Anywhere", "Text in field", "Contains", "Exact"]
 SEARCH_TYPE_MAP = {"Anywhere": "anywhere", "Text in field": "like", "Contains": "contains", "Exact": "exact"}
 
 
+def _selected_cycle_value() -> str | None:
+    """Return selected cycle, or None when cycle filtering is disabled."""
+    cycle_widget = globals().get("w_proposal_cycle")
+    if cycle_widget is None:
+        return None
+    cycle = str(cycle_widget.value or "").strip()
+    if not cycle or cycle in {"All cycles", "(loading…)", "(unavailable)"}:
+        return None
+    return cycle
+
+
+def _with_cycle_filter(
+    unified_filters: list[tuple[str, str, str]] | None,
+) -> list[tuple[str, str, str]]:
+    """Append an implicit exact cycle filter unless one is already present."""
+    filters = list(unified_filters or [])
+    cycle = _selected_cycle_value()
+    if not cycle:
+        return filters
+
+    for ftype, key, _value in filters:
+        if ftype.strip().lower() != "exact":
+            continue
+        if key.strip().lower() in {"cycle", "start.cycle"}:
+            return filters
+
+    filters.append(("exact", "cycle", cycle))
+    return filters
+
+
 def _collect_unified_filters() -> list[tuple[str, str, str]]:
     """Read filter rows and return (type, key, value) tuples."""
     filters = []
@@ -310,7 +341,7 @@ def _collect_unified_filters() -> list[tuple[str, str, str]]:
 
 def _fetch_page() -> pd.DataFrame:
     """Metadata-only fetch via fast REST API (single HTTP round-trip)."""
-    unified = _state["unified_filters"]
+    unified = _with_cycle_filter(_state["unified_filters"])
     offset = _state["page"] * _state["page_size"]
     limit = _state["page_size"]
 
@@ -499,12 +530,36 @@ def _default_mask_path_for(detector: str):
             else smid.default_saxs_mask_path())
 
 
+def _normalize_mask_path(path_str: str | None) -> str | None:
+    """Expand user/env vars and make custom mask paths absolute."""
+    if not path_str:
+        return None
+    raw = str(path_str).strip()
+    if not raw:
+        return None
+
+    import os
+    from pathlib import Path
+
+    p = Path(os.path.expandvars(raw)).expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    return str(p)
+
+
 def _thumbnail_figure(arr, title):
     from bokeh.plotting import figure as bk_figure
     from bokeh.models import (
         ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
         PolyDrawTool, PolyEditTool,
     )
+
+    # Ensure 2-D — squeeze singleton dims, take first sub-frame if needed
+    arr = np.asarray(arr)
+    if arr.ndim > 2:
+        arr = np.squeeze(arr)
+        while arr.ndim > 2:
+            arr = arr[0]
 
     h, w = arr.shape
     finite = arr[np.isfinite(arr) & (arr > 0)]
@@ -705,6 +760,13 @@ def _update_image_in_place(arr, title):
                 _deferred_reload()
         return
 
+    # Ensure 2-D
+    arr = np.asarray(arr)
+    if arr.ndim > 2:
+        arr = np.squeeze(arr)
+        while arr.ndim > 2:
+            arr = arr[0]
+
     h, w = arr.shape
     display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
 
@@ -831,7 +893,7 @@ def _live_count_fire():
         return
     try:
         total = tb.count_fast(
-            _get_cat(), unified_filters=unified,
+            _get_cat(), unified_filters=_with_cycle_filter(unified),
         )
     except Exception:
         return  # silently ignore errors during live count
@@ -927,7 +989,7 @@ def _make_filter_row(ftype: str = "Text in field", key: str = "", val: str = "")
             vals = tb.distinct_values(
                 _get_cat(),
                 key=k,
-                unified_filters=other_filters or None,
+                unified_filters=_with_cycle_filter(other_filters or None),
                 counts=True,
                 size_limit=tb.DISTINCT_SIZE_LIMIT,
             )
@@ -1582,11 +1644,33 @@ def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray 
     """Fetch a single image frame, using the disk cache when a uid is known."""
     uid = _state.get("selected_uid")
     if uid:
-        return get_or_fetch_image_frame(
+        arr = get_or_fetch_image_frame(
             uid, field, frame_idx,
             lambda: tb.fetch_all_frames(run, "primary", field),
         )
-    return tb.fetch_frame(run, "primary", field, frame_idx=frame_idx, _dataset=ds)
+    else:
+        arr = tb.fetch_frame(run, "primary", field, frame_idx=frame_idx, _dataset=ds)
+    return _coerce_to_2d_frame(arr)
+
+
+def _coerce_to_2d_frame(arr) -> np.ndarray | None:
+    """Reduce a detector frame to a 2-D array for display.
+
+    Some streams return per-frame arrays with extra leading axes (e.g. a
+    multi-exposure detector field shaped ``(N, K, H, W)`` indexes to
+    ``(K, H, W)``).  Squeeze singleton dims; if still 3-D+, take the
+    first sub-frame along each extra axis so downstream image widgets
+    always see ``(H, W)``.
+    """
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if a.ndim <= 2:
+        return a
+    a = np.squeeze(a)
+    while a.ndim > 2:
+        a = a[0]
+    return a
 
 
 def _render_image_frame(field, idx):
@@ -1711,6 +1795,16 @@ def _mv_compute_data_range(frames):
         if hi is None or fhi > hi:
             hi = fhi
     if lo is None:
+        # Fallback: use full finite range (including zero/negative)
+        all_finite = np.concatenate(
+            [arr[np.isfinite(arr)].ravel() for arr in frames if np.any(np.isfinite(arr))]
+        ) if frames else np.array([])
+        if all_finite.size:
+            lo = max(float(np.percentile(all_finite, 1)), 1e-6)
+            hi = float(np.percentile(all_finite, 99.5))
+            if hi <= lo:
+                hi = lo + 1.0
+            return lo, hi
         return 1e-3, 1.0
     lo = max(lo, 1e-6)
     if hi <= lo:
@@ -1753,8 +1847,22 @@ def _build_multiview_grid(frames, field):
         frame_labels = [f"frame {frame_offset + i}" for i in range(len(frames))]
 
     # Per-frame display arrays + global data range
-    displays = [np.where(np.isfinite(a), a, 0).astype(np.float32) for a in frames]
-    data_lo, data_hi = _mv_compute_data_range(frames)
+    displays = []
+    for a in frames:
+        a = np.asarray(a)
+        if a.ndim > 2:
+            a = np.squeeze(a)
+            while a.ndim > 2:
+                a = a[0]
+        if a.ndim < 2:
+            # Skip degenerate frames (e.g. 1-D after squeeze)
+            continue
+        displays.append(np.where(np.isfinite(a), a, 0).astype(np.float32))
+    if not displays:
+        w_mv_grid.object = None
+        w_mv_status.object = "*No renderable frames (all degenerate or empty).*"
+        return
+    data_lo, data_hi = _mv_compute_data_range(displays)
     _multiview_cache["data_lo"] = data_lo
     _multiview_cache["data_hi"] = data_hi
 
@@ -1766,15 +1874,9 @@ def _build_multiview_grid(frames, field):
     try:
         w_mv_range.start = log10_lo - 0.5
         w_mv_range.end = log10_hi + 0.5
-        # Clamp current value into new bounds
-        cur_lo, cur_hi = w_mv_range.value
-        cur_lo = max(min(cur_lo, w_mv_range.end - 0.05), w_mv_range.start)
-        cur_hi = max(min(cur_hi, w_mv_range.end), cur_lo + 0.05)
-        # On a fresh detector load, snap to data percentiles
-        if (_multiview_cache.get("field") != field
-                or _multiview_cache.get("mapper") is None):
-            cur_lo, cur_hi = log10_lo, log10_hi
-        w_mv_range.value = (cur_lo, cur_hi)
+        # Always snap to data range — prevents stale ranges from a previous
+        # scan making the grid appear blank.
+        w_mv_range.value = (log10_lo, log10_hi)
     finally:
         _multiview_cache["suspend_range_cb"] = False
 
@@ -1785,11 +1887,19 @@ def _build_multiview_grid(frames, field):
     if use_log:
         mapper = LogColorMapper(palette=palette,
                                 low=max(lo_val, 1e-9),
-                                high=max(hi_val, lo_val * 1.1))
+                                high=max(hi_val, lo_val * 1.1),
+                                nan_color="gray")
     else:
-        mapper = LinearColorMapper(palette=palette, low=lo_val, high=hi_val)
+        mapper = LinearColorMapper(palette=palette, low=lo_val, high=hi_val,
+                                   nan_color="gray")
 
-    rows, cols = _mv_grid_dims(len(frames))
+    # For log color scale, replace zeros/negatives with mapper.low so they
+    # render as the lowest palette color instead of transparent.
+    if use_log:
+        clip_lo = float(mapper.low)
+        displays = [np.where(d > 0, d, clip_lo) for d in displays]
+
+    rows, cols = _mv_grid_dims(len(displays))
     figs = []
     renderers = []
     shared_x = None
@@ -1945,6 +2055,7 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
             )
         else:
             arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
+        arr = _coerce_to_2d_frame(arr)
         if arr is None:
             continue
         frames.append(_orient_frame(arr, field))
@@ -1953,6 +2064,18 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
     _multiview_cache["total_frames"] = total_frames
     _multiview_cache["page"] = page
     _multiview_cache["uid"] = _state.get("selected_uid")
+
+    # Diagnostic: log shape & data statistics for debugging blank grids
+    if frames:
+        shapes = set(f.shape for f in frames)
+        sample = frames[0]
+        log.info(
+            "multiview: %d frames loaded, shapes=%s, sample min=%.3g max=%.3g "
+            "finite_pos=%d/%d",
+            len(frames), shapes,
+            float(np.nanmin(sample)), float(np.nanmax(sample)),
+            int(np.sum(np.isfinite(sample) & (sample > 0))), sample.size,
+        )
 
     # Update pagination buttons
     w_mv_prev.disabled = (page <= 0)
@@ -2348,7 +2471,7 @@ w_proc_geometry = pn.widgets.Select(
 
 # --- Output grid ---
 w_proc_nq = pn.widgets.IntInput(
-    name="n_q", value=DEFAULT_N_Q, start=100, end=10000, step=100, width=90,
+    name="n_q", value=3000, start=100, end=10000, step=100, width=90,
 )
 w_proc_nchi = pn.widgets.IntInput(
     name="n_χ", value=DEFAULT_N_CHI, start=36, end=720, step=36, width=90,
@@ -2371,7 +2494,7 @@ w_proc_saxs_mask = pn.widgets.TextInput(
 )
 w_proc_waxs_mask = pn.widgets.TextInput(
     name="WAXS mask",
-    value=DEFAULT_WAXS_MASK,
+    value="~/smi/waxs_hotspots.json",
     placeholder=f"(default: {DEFAULT_WAXS_MASK_NAME})",
     width=320,
 )
@@ -2403,7 +2526,7 @@ w_proc_waxs_row_delta = pn.widgets.FloatInput(
     name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.50, width=80,
 )
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
-    name="WAXS Δcol", value=DEFAULT_WAXS_COL_DELTA, step=0.50, width=80,
+    name="WAXS Δcol", value=0, step=0.50, width=80,
 )
 w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
     name="WAXS col/arc°", value=DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG,
@@ -2423,7 +2546,7 @@ w_proc_dezinger_kernel = pn.widgets.IntInput(
     start=3, end=21, step=2, width=90,
 )
 w_proc_pixel_splitting = pn.widgets.IntInput(
-    name="Pixel splitting", value=DEFAULT_PIXEL_SPLITTING,
+    name="Pixel splitting", value=3,
     start=1, end=8, step=1, width=100,
 )
 
@@ -3782,8 +3905,16 @@ def _build_proc_iq_plot():
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
+        merged_iq = getattr(result, "merged_iq", None)
+        det_mode = _iq_detector_mode(merged_iq) if merged_iq is not None else "both"
+        y_key = "I"
+        if det_mode == "saxs_only" and "saxs_I" in pf_iq:
+            y_key = "saxs_I"
+        elif det_mode == "waxs_only" and "waxs_I" in pf_iq:
+            y_key = "waxs_I"
+
         for i in range(n_frames):
-            I_frame = pf_iq["I"].isel(frame=i).values
+            I_frame = pf_iq[y_key].isel(frame=i).values
             mask = np.isfinite(I_frame) & (I_frame > 0)
             if mask.any():
                 lbl = frame_labels[i] if i < len(frame_labels) else f"frame {i}"
@@ -3863,23 +3994,50 @@ def _build_merged_iq_plot(result, uid, note=""):
         active_scroll="wheel_zoom",
     )
 
+    det_mode = _iq_detector_mode(iq)
+
     mask = np.isfinite(I) & (I > 0)
-    if mask.any():
+    if det_mode != "saxs_only" and det_mode != "waxs_only" and mask.any():
         _add_trace(p, q[mask], I[mask], color="black", width=1.2, legend_label="merged")
     if "saxs_I" in iq:
         sI = iq["saxs_I"].values
         sm = np.isfinite(sI) & (sI > 0)
         if sm.any():
-            _add_trace(p, q[sm], sI[sm], color="blue", width=0.8, alpha=0.6, legend_label="SAXS")
+            width = 1.2 if det_mode == "saxs_only" else 0.8
+            alpha = 0.9 if det_mode == "saxs_only" else 0.6
+            _add_trace(p, q[sm], sI[sm], color="blue", width=width, alpha=alpha, legend_label="SAXS")
     if "waxs_I" in iq:
         wI = iq["waxs_I"].values
         wm = np.isfinite(wI) & (wI > 0)
         if wm.any():
-            _add_trace(p, q[wm], wI[wm], color="red", width=0.8, alpha=0.6, legend_label="WAXS")
+            width = 1.2 if det_mode == "waxs_only" else 0.8
+            alpha = 0.9 if det_mode == "waxs_only" else 0.6
+            _add_trace(p, q[wm], wI[wm], color="red", width=width, alpha=alpha, legend_label="WAXS")
     p.xaxis.axis_label = "q (nm⁻¹)"
     p.yaxis.axis_label = "I(q)"
     p.legend.click_policy = "hide"
     w_proc_iq_plot.object = p
+
+
+def _iq_detector_mode(iq) -> str:
+    """Classify I(q) availability as both/saxs_only/waxs_only/none."""
+    has_saxs = False
+    has_waxs = False
+    if iq is None:
+        return "none"
+    if "saxs_I" in iq:
+        s = iq["saxs_I"].values
+        has_saxs = bool(np.isfinite(s).any() and (s > 0).any())
+    if "waxs_I" in iq:
+        w = iq["waxs_I"].values
+        has_waxs = bool(np.isfinite(w).any() and (w > 0).any())
+    if has_saxs and has_waxs:
+        return "both"
+    if has_saxs:
+        return "saxs_only"
+    if has_waxs:
+        return "waxs_only"
+    return "none"
 
 
 def _on_proc_iq_mode_change(event):
@@ -5084,6 +5242,12 @@ w_batch_max_workers = pn.widgets.IntInput(
 w_batch_skip_existing = pn.widgets.Checkbox(
     name="Skip uids already in collection", value=True,
 )
+w_batch_skip_processed = pn.widgets.Checkbox(
+    name="Skip uids in processed history", value=True,
+)
+w_batch_add_to_collection = pn.widgets.Checkbox(
+    name="Add processed scans to collection", value=True,
+)
 w_batch_max_jobs = pn.widgets.IntInput(
     name="Max jobs", value=PAGE_SIZE, start=1, end=BatchProcessor.MAX_QUEUE,
     width=110,
@@ -5097,8 +5261,82 @@ w_btn_batch_cancel = pn.widgets.Button(
 w_btn_batch_clear = pn.widgets.Button(
     name="Clear log", button_type="light", disabled=True,
 )
+w_btn_batch_clear_processed = pn.widgets.Button(
+    name="Clear processed list", button_type="light",
+)
+w_batch_processed_status = pn.pane.Markdown(
+    "*Processed history: 0 uids*",
+    margin=(0, 5),
+)
+w_batch_memory_status = pn.pane.Markdown(
+    "*Batch memory: RSS 0.0 MB, peak 0.0 MB*",
+    margin=(0, 5),
+)
 
-_batch_state: dict[str, Any] = {"doc": None, "processor": None}
+_batch_state: dict[str, Any] = {
+    "doc": None,
+    "processor": None,
+    "processed_uids": set(),
+    "processed_lock": threading.Lock(),
+    "rss_peak_mb": 0.0,
+}
+
+
+def _batch_rss_mb() -> float | None:
+    """Return process RSS in MB, or None if unavailable."""
+    try:
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return float(rss_kb) / 1024.0
+    except Exception:
+        pass
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss
+        return float(rss) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def _batch_memory_status_text() -> str:
+    """Build memory telemetry line for the Batch UI."""
+    rss = _batch_rss_mb()
+    if rss is None:
+        return "*Batch memory: unavailable*"
+    peak = max(float(_batch_state.get("rss_peak_mb", 0.0)), rss)
+    _batch_state["rss_peak_mb"] = peak
+    return f"*Batch memory: RSS {rss:.1f} MB, peak {peak:.1f} MB*"
+
+
+def _batch_processed_contains(uid: str) -> bool:
+    with _batch_state["processed_lock"]:
+        return uid in _batch_state["processed_uids"]
+
+
+def _batch_processed_add(uid: str) -> None:
+    with _batch_state["processed_lock"]:
+        _batch_state["processed_uids"].add(uid)
+
+
+def _batch_processed_count() -> int:
+    with _batch_state["processed_lock"]:
+        return len(_batch_state["processed_uids"])
+
+
+def _batch_processed_clear() -> int:
+    with _batch_state["processed_lock"]:
+        n = len(_batch_state["processed_uids"])
+        _batch_state["processed_uids"].clear()
+    return n
+
+
+def _batch_cleanup_memory() -> None:
+    """Release temporary references created during one batch job."""
+    try:
+        plt.close("all")
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _try_parse_tuple(d: dict, key: str, text: str, default: tuple) -> None:
@@ -5186,6 +5424,8 @@ def _build_proc_params(uid: str) -> tuple:
     """
     geometry = w_proc_geometry.value
     waxs_kw = _build_waxs_overrides()
+    saxs_mask_path = _normalize_mask_path(w_proc_saxs_mask.value)
+    waxs_mask_path = _normalize_mask_path(w_proc_waxs_mask.value)
 
     if geometry == "grazing":
         from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
@@ -5194,7 +5434,7 @@ def _build_proc_params(uid: str) -> tuple:
             uid=uid,
             tiled_uri=DEFAULT_TILED_URI,
             catalog=DEFAULT_CATALOG,
-            waxs_mask_path=w_proc_waxs_mask.value or None,
+            waxs_mask_path=waxs_mask_path,
         )
         if w_proc_nqxy.value != DEFAULT_N_QXY:
             gi_params["n_qxy"] = w_proc_nqxy.value
@@ -5232,8 +5472,8 @@ def _build_proc_params(uid: str) -> tuple:
         catalog=DEFAULT_CATALOG,
         solid_angle_correction=w_proc_solid_angle.value,
         geometry=geometry,
-        saxs_mask_path=w_proc_saxs_mask.value or None,
-        waxs_mask_path=w_proc_waxs_mask.value or None,
+        saxs_mask_path=saxs_mask_path,
+        waxs_mask_path=waxs_mask_path,
         cache_geometry=w_cache_enabled.value,
     )
     # Supply pre-cached images if available
@@ -5427,9 +5667,11 @@ def _batch_process_fn(uid: str):
 
 
 def _batch_skip(uid: str) -> bool:
-    if not w_batch_skip_existing.value:
-        return False
-    return uid in _collection
+    if w_batch_skip_processed.value and _batch_processed_contains(uid):
+        return True
+    if w_batch_skip_existing.value and uid in _collection:
+        return True
+    return False
 
 
 def _batch_dispatch(snap: dict) -> None:
@@ -5503,9 +5745,14 @@ def _batch_dispatch(snap: dict) -> None:
             w_btn_batch_queue.disabled = running
             w_btn_batch_cancel.disabled = not running
             w_btn_batch_clear.disabled = running or total == 0
+            w_btn_batch_clear_processed.disabled = running
+            w_batch_processed_status.object = (
+                f"*Processed history: {_batch_processed_count()} uids*"
+            )
 
             # Keep the collection panel in sync as jobs land.
-            _refresh_collection()
+            if w_batch_add_to_collection.value:
+                _refresh_collection()
         except Exception:
             log.exception("batch: UI render failed")
 
@@ -5523,26 +5770,28 @@ def _batch_add_fn(result, summary, params):
     # ScanCollection internals are plain dicts; updates are GIL-protected.
     # We add on the worker thread so the snapshot fired immediately after
     # already reflects the new collection size.
+    uid = getattr(result, "uid", None)
     primary_df = params.pop("_primary_df", None)
     baseline_df = params.pop("_baseline_df", None)
     config_df = params.pop("_config_df", None)
     raw_metadata = params.pop("_raw_metadata", None)
-    _collection.add(
-        result, summary, params,
-        primary_df=primary_df,
-        baseline_df=baseline_df,
-        config_df=config_df,
-        raw_metadata=raw_metadata,
-    )
+    try:
+        if w_batch_add_to_collection.value:
+            _collection.add(
+                result, summary, params,
+                primary_df=primary_df,
+                baseline_df=baseline_df,
+                config_df=config_df,
+                raw_metadata=raw_metadata,
+            )
 
-    # Auto-export if enabled
-    if w_export_auto.value and hasattr(result, "uid") and result.uid:
-        try:
+        # Auto-export if enabled
+        if w_export_auto.value and uid:
             out_dir = _resolve_export_dir()
             if out_dir:
                 export_scan(
                     out_dir=out_dir,
-                    uid=result.uid,
+                    uid=uid,
                     result=result,
                     params=params,
                     primary_df=primary_df,
@@ -5554,8 +5803,18 @@ def _batch_add_fn(result, summary, params):
                     basename_template=w_export_basename.value,
                     frame_label_col=_get_frame_label_cols() or None,
                 )
-        except Exception:
-            log.exception("Batch auto-export failed for %s", result.uid[:8])
+
+        if uid:
+            _batch_processed_add(uid)
+    finally:
+        if not w_batch_add_to_collection.value:
+            primary_df = None
+            baseline_df = None
+            config_df = None
+            raw_metadata = None
+            result = None
+            summary = None
+        _batch_cleanup_memory()
 
 
 def _prefetch_image_caches(uids: list[str]) -> None:
@@ -5612,12 +5871,13 @@ def _on_batch_queue(event):
 
     max_jobs = max(1, int(w_batch_max_jobs.value or 25))
     skip_existing = w_batch_skip_existing.value
+    skip_processed = w_batch_skip_processed.value
 
     # Use UIDs from the current search table (already fetched for display)
     # then page forward through more results if needed.  This guarantees
     # the same search filters and ordering the user sees.
     items: list[tuple[str, str]] = []
-    unified = _state.get("unified_filters", [])
+    unified = _with_cycle_filter(_state.get("unified_filters", []))
     page_size = _state.get("page_size", PAGE_SIZE)
 
     # Start from UIDs already visible in the table
@@ -5625,6 +5885,8 @@ def _on_batch_queue(event):
     if df is not None and len(df) > 0 and "uid" in df.columns:
         for uid in df["uid"].tolist():
             if not uid:
+                continue
+            if skip_processed and _batch_processed_contains(uid):
                 continue
             if skip_existing and uid in _collection:
                 continue
@@ -5644,6 +5906,8 @@ def _on_batch_queue(event):
         for s in page_summaries:
             uid = s.get("uid", "")
             if not uid:
+                continue
+            if skip_processed and _batch_processed_contains(uid):
                 continue
             if skip_existing and uid in _collection:
                 continue
@@ -5690,9 +5954,18 @@ def _on_batch_clear(event):
     bp.clear_terminal()
 
 
+def _on_batch_clear_processed(event):
+    n = _batch_processed_clear()
+    w_batch_processed_status.object = "*Processed history: 0 uids*"
+    pn.state.notifications.info(
+        f"Cleared processed history ({n} uid{'s' if n != 1 else ''})."
+    )
+
+
 w_btn_batch_queue.on_click(_on_batch_queue)
 w_btn_batch_cancel.on_click(_on_batch_cancel)
 w_btn_batch_clear.on_click(_on_batch_clear)
+w_btn_batch_clear_processed.on_click(_on_batch_clear_processed)
 
 
 batch_panel = pn.Column(
@@ -5700,12 +5973,23 @@ batch_panel = pn.Column(
         "**Batch process scans from the current search results.** "
         "Each job uses the parameters configured in the *Parameters* "
         "sub-tab above.  Reductions run on a background thread so the "
-        "interface stays interactive; results land in the Scan Collection "
-        "as they complete.  Already-processed uids are skipped if the "
-        "checkbox is on.",
+        "interface stays interactive.  You can optionally keep results out "
+        "of the Scan Collection to reduce memory usage; processed uid "
+        "history can be used to skip repeats.",
     ),
-    pn.Row(w_btn_batch_queue, w_btn_batch_cancel, w_btn_batch_clear),
-    pn.Row(w_batch_max_jobs, w_batch_max_workers, w_batch_skip_existing),
+    pn.Row(
+        w_btn_batch_queue,
+        w_btn_batch_cancel,
+        w_btn_batch_clear,
+        w_btn_batch_clear_processed,
+    ),
+    pn.Row(w_batch_max_jobs, w_batch_max_workers),
+    pn.Row(
+        w_batch_skip_existing,
+        w_batch_skip_processed,
+        w_batch_add_to_collection,
+    ),
+    w_batch_processed_status,
     w_batch_status,
     w_batch_progress,
     w_batch_table,
@@ -5730,13 +6014,13 @@ w_export_dir = pn.widgets.TextInput(
 w_export_resolved_path = pn.pane.Markdown("", sizing_mode="stretch_width")
 w_export_subdir = pn.widgets.TextInput(
     name="Subdirectory template",
-    value="{uid_short}_{sample_name}",
+    value="",
+    placeholder="e.g. {uid_short}_{sample_name}",
     width=300,
 )
 w_export_basename = pn.widgets.TextInput(
     name="Base filename template",
-    value="",
-    placeholder="e.g. {sample_name}_{scan_id}",
+    value="{sample_name}_{scan_id}",
     width=300,
 )
 w_export_frame_label_1 = pn.widgets.Select(
@@ -5764,9 +6048,9 @@ w_export_png_2d = pn.widgets.Checkbox(name="PNG 2D map", value=True)
 w_export_png_iq = pn.widgets.Checkbox(name="PNG I(q)", value=True)
 w_export_png_linecuts = pn.widgets.Checkbox(name="PNG linecuts", value=True)
 w_export_csv_iq = pn.widgets.Checkbox(name="CSV I(q) + per-frame", value=True)
-w_export_csv_scalars = pn.widgets.Checkbox(name="CSV primary scalars", value=True)
-w_export_csv_baseline = pn.widgets.Checkbox(name="CSV baseline", value=True)
-w_export_metadata = pn.widgets.Checkbox(name="Metadata JSON", value=True)
+w_export_csv_scalars = pn.widgets.Checkbox(name="CSV primary scalars", value=False)
+w_export_csv_baseline = pn.widgets.Checkbox(name="CSV baseline", value=False)
+w_export_metadata = pn.widgets.Checkbox(name="Metadata JSON", value=False)
 
 w_export_auto = pn.widgets.Checkbox(
     name="Auto-export after processing",
@@ -5778,6 +6062,12 @@ w_btn_export_current = pn.widgets.Button(
 )
 w_btn_export_collection = pn.widgets.Button(
     name="Export entire collection", button_type="success", width=180,
+)
+w_btn_download_current = pn.widgets.Button(
+    name="⬇ Download current scan", button_type="light", width=180,
+)
+w_btn_download_collection = pn.widgets.Button(
+    name="⬇ Download collection", button_type="light", width=180,
 )
 w_export_status = pn.pane.Markdown("", sizing_mode="stretch_width")
 w_export_spinner = pn.indicators.LoadingSpinner(
@@ -5809,23 +6099,35 @@ def _refresh_export_resolved_path():
     ds = w_proposal_select.value
     proj = w_proposal_project.value
     rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
+    scan_cycle = None
 
-    # Try proposal dropdown first
-    if ds and not ds.startswith("("):
-        resolved = resolve_output_dir(ds, proj, relative_path=rel)
-        if resolved:
-            w_export_resolved_path.object = f"*Resolved: `{resolved}`*"
-            return
-
-    # Fallback: use scan metadata
     uid = _state.get("selected_uid")
     if uid:
         try:
             run = _get_cat()[uid]
             md = dict(run.metadata)
+            scan_cycle = md.get("start", {}).get("cycle")
+        except Exception:
+            scan_cycle = None
+
+    # Try proposal dropdown first
+    if ds and not ds.startswith("("):
+        resolved = resolve_output_dir(ds, proj, cycle=scan_cycle, relative_path=rel)
+        if resolved:
+            w_export_resolved_path.object = f"*Resolved: `{resolved}`*"
+            return
+
+    # Fallback: use scan metadata
+    if uid:
+        try:
+            run = _get_cat()[uid]
+            md = dict(run.metadata)
             scan_ds = md.get("start", {}).get("data_session")
+            scan_cycle = md.get("start", {}).get("cycle")
             if scan_ds:
-                resolved = resolve_output_dir(scan_ds, proj, relative_path=rel)
+                resolved = resolve_output_dir(
+                    scan_ds, proj, cycle=scan_cycle, relative_path=rel,
+                )
                 if resolved:
                     w_export_resolved_path.object = (
                         f"*Resolved (from scan): `{resolved}`*"
@@ -5874,6 +6176,7 @@ def _resolve_export_dir() -> Path | None:
     ds = w_proposal_select.value
     proj = w_proposal_project.value
     rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
+    scan_cycle = None
 
     # If project is "(all)", try to get the actual project name from scan metadata
     if not proj or proj == "(all)":
@@ -5883,12 +6186,22 @@ def _resolve_export_dir() -> Path | None:
                 run = _get_cat()[uid]
                 md = dict(run.metadata)
                 proj = md.get("start", {}).get("project_name") or proj
+                scan_cycle = md.get("start", {}).get("cycle")
+            except Exception:
+                pass
+    else:
+        uid = _state.get("selected_uid")
+        if uid:
+            try:
+                run = _get_cat()[uid]
+                md = dict(run.metadata)
+                scan_cycle = md.get("start", {}).get("cycle")
             except Exception:
                 pass
 
     # If proposal dropdown has a valid data session, use it directly
     if ds and not ds.startswith("("):
-        resolved = resolve_output_dir(ds, proj, relative_path=rel)
+        resolved = resolve_output_dir(ds, proj, cycle=scan_cycle, relative_path=rel)
         if resolved:
             resolved.mkdir(parents=True, exist_ok=True)
             return resolved
@@ -5900,8 +6213,11 @@ def _resolve_export_dir() -> Path | None:
             run = _get_cat()[uid]
             md = dict(run.metadata)
             scan_ds = md.get("start", {}).get("data_session")
+            scan_cycle = md.get("start", {}).get("cycle")
             if scan_ds:
-                resolved = resolve_output_dir(scan_ds, proj, relative_path=rel)
+                resolved = resolve_output_dir(
+                    scan_ds, proj, cycle=scan_cycle, relative_path=rel,
+                )
                 if resolved:
                     resolved.mkdir(parents=True, exist_ok=True)
                     return resolved
@@ -6105,11 +6421,251 @@ def _on_export_collection(event):
 w_btn_export_current.on_click(_on_export_current)
 w_btn_export_collection.on_click(_on_export_collection)
 
+
+def _on_download_current(event):
+    """Export current scan to a temp dir, zip it, and serve via browser download."""
+    import io
+    import tempfile
+    import zipfile
+
+    uid = _state.get("selected_uid")
+    if not uid:
+        pn.state.notifications.warning("No scan selected.")
+        return
+    w_export_spinner.value = True
+    w_export_spinner.visible = True
+    w_export_status.object = "*Preparing download…*"
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            out = _do_export_single_to_dir(uid, Path(tmpdir))
+            if not out:
+                w_export_status.object = "**Download failed:** could not generate export."
+                return
+            scan_dir, files = out
+            # Create zip in memory
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    fpath = scan_dir / f
+                    if fpath.exists():
+                        zf.write(fpath, arcname=f)
+            buf.seek(0)
+            # Determine filename
+            uid_short = uid[:8]
+            summary = _detail_cache.get("summary") or {}
+            sample = summary.get("sample_name", "scan")
+            zip_name = f"{sample}_{uid_short}.zip"
+            # Serve download via Panel
+            from bokeh.models.callbacks import CustomJS
+            import base64
+            b64 = base64.b64encode(buf.read()).decode()
+            # Use pn.state.execute to trigger browser-side download
+            js = f"""
+            var link = document.createElement('a');
+            link.href = 'data:application/zip;base64,{b64}';
+            link.download = '{zip_name}';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            """
+            pn.state.execute(js)
+            w_export_status.object = f"**Download started:** `{zip_name}` ({len(files)} files)"
+    except Exception as exc:
+        log.exception("Download failed")
+        w_export_status.object = f"**Download error:** `{exc}`"
+    finally:
+        w_export_spinner.value = False
+        w_export_spinner.visible = False
+
+
+def _do_export_single_to_dir(uid: str, out_dir) -> tuple | None:
+    """Like _do_export_single but writes to a specified directory."""
+    from pathlib import Path
+
+    result = _proc_result_cache.get("result")
+    gi_result = _proc_result_cache.get("gi_result")
+    params = _last_result.get("params") or {}
+
+    # Gather 2D cache
+    proc_2d = None
+    if _proc_2d_cache.get("image") is not None:
+        proc_2d = {
+            "x": _proc_2d_cache.get("x"),
+            "y": _proc_2d_cache.get("y"),
+            "image": _proc_2d_cache.get("image"),
+            "x_label": _proc_2d_cache.get("x_label", ""),
+            "y_label": _proc_2d_cache.get("y_label", ""),
+            "title": _proc_2d_cache.get("title", ""),
+        }
+
+    cuts = list(_persisted_cuts)
+
+    # Primary/baseline/config
+    primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
+    baseline_df = None
+    config_df = None
+    run = _ensure_run()
+    if _detail_cache.get("baseline_loaded") and run:
+        if "baseline" in tb.stream_names(run):
+            try:
+                baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+            except Exception:
+                pass
+        try:
+            config_df = _config_to_dataframe(run)
+        except Exception:
+            pass
+
+    # Raw metadata
+    raw_md = None
+    try:
+        if run:
+            raw_md = dict(run.metadata)
+    except Exception:
+        pass
+
+    # Frame labels
+    frame_labels = None
+    label_cols = _get_frame_label_cols()
+    if label_cols and primary_df is not None and not primary_df.empty:
+        parts = []
+        for col in label_cols:
+            if col in primary_df.columns:
+                parts.append(primary_df[col].astype(str))
+        if parts:
+            frame_labels = pd.concat(parts, axis=1).apply(
+                lambda row: " | ".join(row), axis=1,
+            ).tolist()
+
+    return export_scan(
+        out_dir=out_dir,
+        uid=uid,
+        result=result,
+        gi_result=gi_result,
+        cuts=cuts,
+        proc_2d_cache=proc_2d,
+        params=params,
+        primary_df=primary_df,
+        baseline_df=baseline_df,
+        config_df=config_df,
+        raw_metadata=raw_md,
+        raw_images=None,  # skip raw images for download (too large)
+        frame_labels=frame_labels,
+        formats=_export_formats(),
+        subdir_template="",  # flat — no subdir in zip
+        basename_template=w_export_basename.value,
+        frame_label_col=_get_frame_label_cols() or None,
+    )
+
+
+w_btn_download_current.on_click(_on_download_current)
+
+
+def _on_download_collection(event):
+    """Export all scans in the collection to a zip and serve via browser download."""
+    import io
+    import tempfile
+    import zipfile
+
+    if len(_collection) == 0:
+        pn.state.notifications.warning("Collection is empty.")
+        return
+    w_export_spinner.value = True
+    w_export_spinner.visible = True
+    w_export_status.object = f"*Preparing download of {len(_collection)} scans…*"
+    try:
+        buf = io.BytesIO()
+        total_files = 0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for coll_uid in _collection.uids:
+                    coll_result = _collection.get_result(coll_uid)
+                    coll_params = _collection._processing.get(coll_uid, {})
+                    coll_primary = _collection.get_primary_df(coll_uid)
+                    coll_baseline = _collection.get_baseline_df(coll_uid)
+                    coll_config = _collection.get_config_df(coll_uid)
+                    coll_raw_md = _collection.get_raw_metadata(coll_uid)
+
+                    uid_short = coll_uid[:8]
+                    scan_dir = Path(tmpdir) / uid_short
+                    scan_dir.mkdir(exist_ok=True)
+
+                    try:
+                        _, files = export_scan(
+                            out_dir=Path(tmpdir),
+                            uid=coll_uid,
+                            result=coll_result,
+                            params=coll_params,
+                            primary_df=coll_primary,
+                            baseline_df=coll_baseline,
+                            config_df=coll_config,
+                            raw_metadata=coll_raw_md,
+                            raw_images=None,  # skip raw images for download
+                            formats=_export_formats(),
+                            subdir_template=w_export_subdir.value or "{uid_short}",
+                            basename_template=w_export_basename.value,
+                            frame_label_col=_get_frame_label_cols() or None,
+                        )
+                        # Add files to zip under a scan subdirectory
+                        actual_subdir = w_export_subdir.value or "{uid_short}"
+                        try:
+                            sub_name = actual_subdir.format(
+                                uid=coll_uid, uid_short=uid_short,
+                                scan_id="", sample_name="",
+                            )
+                        except Exception:
+                            sub_name = uid_short
+                        export_dir = Path(tmpdir) / sub_name
+                        for f in files:
+                            fpath = export_dir / f
+                            if fpath.exists():
+                                zf.write(fpath, arcname=f"{sub_name}/{f}")
+                                total_files += 1
+                    except Exception as exc:
+                        log.warning("Download: export failed for %s: %s",
+                                    coll_uid[:8], exc)
+
+        buf.seek(0)
+        zip_name = f"collection_{len(_collection)}scans.zip"
+        import base64
+        b64 = base64.b64encode(buf.read()).decode()
+        js = f"""
+        var link = document.createElement('a');
+        link.href = 'data:application/zip;base64,{b64}';
+        link.download = '{zip_name}';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        """
+        pn.state.execute(js)
+        w_export_status.object = (
+            f"**Download started:** `{zip_name}` "
+            f"({len(_collection)} scans, {total_files} files)"
+        )
+    except Exception as exc:
+        log.exception("Collection download failed")
+        w_export_status.object = f"**Download error:** `{exc}`"
+    finally:
+        w_export_spinner.value = False
+        w_export_spinner.visible = False
+
+
+w_btn_download_collection.on_click(_on_download_collection)
+
 export_panel = pn.Column(
     pn.pane.Markdown(
         "**Export processed results** to disk in multiple formats. "
         "Output is always within the proposal directory. "
         "Use `{project_name}` in the relative path to include the selected project."
+    ),
+    pn.pane.Alert(
+        "⚠️ **Permissions note:** Writing to the proposal directory requires that "
+        "this app is running under your own user credentials. If you are using a "
+        "shared deployment, use the **Download** button instead — it sends files "
+        "through your browser, which saves them with your own permissions.",
+        alert_type="warning",
     ),
     pn.Row(w_export_dir, sizing_mode="stretch_width"),
     w_export_resolved_path,
@@ -6134,6 +6690,7 @@ export_panel = pn.Column(
     pn.Row(w_export_csv_iq, w_export_csv_scalars, w_export_csv_baseline, w_export_metadata),
     pn.layout.Divider(),
     pn.Row(w_btn_export_current, w_btn_export_collection, w_export_auto),
+    pn.Row(w_btn_download_current, w_btn_download_collection),
     pn.Row(w_export_status, w_export_spinner),
     sizing_mode="stretch_width",
 )
@@ -6447,7 +7004,7 @@ def _on_bxp_queue(event):
     skip_existing = w_bxp_skip_existing.value
 
     items: list[tuple[str, str]] = []
-    unified = _state.get("unified_filters", [])
+    unified = _with_cycle_filter(_state.get("unified_filters", []))
     page_size = _state.get("page_size", PAGE_SIZE)
 
     df = w_table.value
@@ -6686,6 +7243,11 @@ w_login_form = pn.Column(
     pn.pane.Markdown("**Tiled login**"),
     w_login_user,
     w_login_pass,
+    pn.pane.Alert(
+        "After signing in, check for Duo confirmation.",
+        alert_type="warning",
+        margin=(0, 0, 8, 0),
+    ),
     pn.Row(w_login_submit),
     w_login_msg,
     visible=False,
@@ -6721,7 +7283,7 @@ def _toggle_login_form(event=None):
 def _on_login_submit(event=None):
     user_in = (w_login_user.value or "").strip()
     pwd = w_login_pass.value or ""
-    w_login_msg.object = "*signing in…*"
+    w_login_msg.object = "*signing in... check Duo confirmation prompt*"
     w_login_submit.disabled = True
     try:
         user = _tiled_login(user_in, pwd)
@@ -6761,6 +7323,9 @@ def _on_logout(event=None):
 
 w_btn_login.on_click(_toggle_login_form)
 w_login_submit.on_click(_on_login_submit)
+# PasswordInput commits `value` on Enter. Mirror that to button clicks so
+# pressing Enter in the password field submits just like clicking Sign in.
+w_login_pass.jscallback(args={"submit": w_login_submit}, value="submit.clicks += 1")
 w_btn_logout.on_click(_on_logout)
 
 
@@ -6891,7 +7456,7 @@ def _live_pick_initial_uid() -> str | None:
     """Return the most recent run uid in the catalog, or None."""
     try:
         summaries, _total = tb.fetch_page_fast(
-            _get_cat(), unified_filters=[], offset=0, limit=1,
+            _get_cat(), unified_filters=_with_cycle_filter([]), offset=0, limit=1,
         )
     except Exception as exc:
         log.warning("live: initial uid fetch failed: %s", exc)
@@ -7168,6 +7733,13 @@ w_btn_update.on_click(_on_update)
 def _filter_summary_text() -> str:
     """Build a compact one-line summary of active filters."""
     filters = _collect_unified_filters()
+    cycle = _selected_cycle_value()
+    has_explicit_cycle = any(
+        ftype == "exact" and key.strip().lower() in {"cycle", "start.cycle"}
+        for ftype, key, _val in filters
+    )
+    if cycle and not has_explicit_cycle:
+        filters = list(filters) + [("exact", "cycle", cycle)]
     if not filters:
         return "*No filters active*"
     parts = []
@@ -7410,7 +7982,7 @@ def _populate_project_names(data_session: str):
     w_proposal_spinner.value = True
     w_proposal_spinner.visible = True
     try:
-        ds_filter = [("exact", "data_session", data_session)]
+        ds_filter = _with_cycle_filter([("exact", "data_session", data_session)])
         vals = tb.distinct_values(
             _get_cat(),
             key="project_name",
@@ -7887,18 +8459,22 @@ def _resolve_coll_export_dir() -> Path | None:
     """Resolve the collection export output directory."""
     rel = w_coll_export_dir.value.strip() or "projects/{project_name}/analysis"
     proj = w_proposal_project.value
+    cycle = _selected_cycle_value()
     # Try proposal dropdown
     ds = w_proposal_select.value
     if ds and not ds.startswith("("):
-        return resolve_output_dir(ds, proj, relative_path=rel)
+        return resolve_output_dir(ds, proj, cycle=cycle, relative_path=rel)
     # Fallback: use first scan's data_session
     if _collection.uids:
         first_uid = _collection.uids[0]
         md = _collection.get_raw_metadata(first_uid)
         if md:
             scan_ds = md.get("start", {}).get("data_session")
+            scan_cycle = md.get("start", {}).get("cycle")
             if scan_ds:
-                return resolve_output_dir(scan_ds, proj, relative_path=rel)
+                return resolve_output_dir(
+                    scan_ds, proj, cycle=scan_cycle, relative_path=rel,
+                )
     return None
 
 
@@ -8130,8 +8706,8 @@ def _startup_search():
 
         cat = _get_cat()
 
-        # Always start unfiltered — show most recent scans
-        unified = []
+        # Startup search honors selected cycle when one is active.
+        unified = _with_cycle_filter([])
 
         if count_hint is None and not unified:
             # First run or cache missing — use len(cat) which is faster

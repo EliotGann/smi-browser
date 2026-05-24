@@ -141,14 +141,50 @@ def fetch_proposal_directory(proposal_id: str) -> str | None:
     Calls ``GET /v1/proposal/{id}/directories`` and returns the first
     directory path, or *None* if unavailable.
     """
+    dirs = fetch_proposal_directories(proposal_id)
+    if dirs:
+        return dirs[0].get("path")
+    return None
+
+
+def fetch_proposal_directories(proposal_id: str) -> list[dict[str, Any]]:
+    """Return all directory entries for a proposal.
+
+    Calls ``GET /v1/proposal/{id}/directories``.
+    """
     try:
         data = _get(f"/proposal/{proposal_id}/directories")
         dirs = data.get("directories", [])
-        if dirs:
-            return dirs[0].get("path")
+        if isinstance(dirs, list):
+            return dirs
     except Exception:
         log.debug("Failed to fetch directory for proposal %s", proposal_id)
-    return None
+    return []
+
+
+def fetch_proposal_directory_for_cycle(
+    proposal_id: str,
+    cycle: str | None,
+) -> str | None:
+    """Return a proposal directory path matching *cycle* when possible.
+
+    If *cycle* is not provided or no matching directory exists, returns the
+    first directory entry as a fallback for backward compatibility.
+    """
+    dirs = fetch_proposal_directories(proposal_id)
+    if not dirs:
+        return None
+
+    if cycle:
+        cycle_norm = str(cycle).strip().lower()
+        for entry in dirs:
+            entry_cycle = str(entry.get("cycle", "")).strip().lower()
+            path = entry.get("path")
+            if entry_cycle == cycle_norm and path:
+                return path
+
+    first = dirs[0]
+    return first.get("path")
 
 
 # ---------------------------------------------------------------------------
