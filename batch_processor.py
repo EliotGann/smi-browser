@@ -74,6 +74,7 @@ class BatchProcessor:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._workers: list[threading.Thread] = []
+        self._alive_workers = 0
         self._running = False
 
     # -- inspection ------------------------------------------------------
@@ -125,7 +126,7 @@ class BatchProcessor:
                 self._queue.put(uid)
                 added += 1
         if added:
-            self._fire()
+            self._fire(force=True)
         return added
 
     def start(self) -> None:
@@ -135,6 +136,7 @@ class BatchProcessor:
         self._running = True
         self._cancel.clear()
         self._workers = []
+        self._alive_workers = self._max_workers
         for i in range(self._max_workers):
             t = threading.Thread(
                 target=self._worker_loop,
@@ -143,7 +145,7 @@ class BatchProcessor:
             )
             t.start()
             self._workers.append(t)
-        self._fire()
+        self._fire(force=True)
 
     def cancel(self) -> None:
         """Drain pending queue and request workers to stop after current job."""
@@ -159,7 +161,7 @@ class BatchProcessor:
                 self._queue.task_done()
         except queue.Empty:
             pass
-        self._fire()
+        self._fire(force=True)
 
     def clear_terminal(self) -> None:
         """Forget jobs in terminal states (done/error/skipped/cancelled)."""
@@ -182,7 +184,20 @@ class BatchProcessor:
 
     # -- internals -------------------------------------------------------
 
-    def _fire(self) -> None:
+    _FIRE_INTERVAL = 1.0  # min seconds between status callbacks
+
+    def _fire(self, force: bool = False) -> None:
+        """Invoke status_cb with a snapshot, throttled to avoid flooding UI.
+
+        When ``force=True`` (used for terminal state transitions like
+        batch-complete or cancel), the callback fires unconditionally.
+        """
+        now = time.monotonic()
+        if not force:
+            last = getattr(self, "_last_fire", 0.0)
+            if now - last < self._FIRE_INTERVAL:
+                return
+        self._last_fire = now
         try:
             self._status_cb(self.snapshot())
         except Exception:
@@ -207,15 +222,13 @@ class BatchProcessor:
                 self._run_one(uid)
                 self._queue.task_done()
         finally:
-            # Last worker out turns off the running flag.
+            # Use an atomic counter to detect the last worker exiting.
             with self._lock:
-                still_alive = any(
-                    w is not threading.current_thread() and w.is_alive()
-                    for w in self._workers
-                )
-            if not still_alive:
+                self._alive_workers -= 1
+                is_last = self._alive_workers == 0
+            if is_last:
                 self._running = False
-                self._fire()
+                self._fire(force=True)
 
     def _run_one(self, uid: str) -> None:
         if self._cancel.is_set():
@@ -256,6 +269,10 @@ class BatchProcessor:
             log.exception("batch: add_fn failed for %s", uid)
             self._mark_error(uid, f"add failed: {exc}", t0)
             return
+        finally:
+            # Immediately release references to large objects so they can
+            # be collected even if this frame is kept alive briefly.
+            del result, summary, params
 
         with self._lock:
             j = self._jobs[uid]
@@ -263,6 +280,26 @@ class BatchProcessor:
             j.finished = time.time()
             j.duration_s = time.perf_counter() - t0
         self._fire()
+
+        # Prune completed jobs to prevent unbounded dict growth.
+        self._prune_terminal_jobs()
+
+    # Maximum number of terminal (done/error/skipped/cancelled) jobs to
+    # keep in memory.  Matches MAX_QUEUE so all jobs in a single batch
+    # stay visible in the UI.
+    _MAX_TERMINAL_KEPT = 2000
+
+    def _prune_terminal_jobs(self) -> None:
+        """Drop old terminal jobs so _jobs doesn't grow unboundedly."""
+        with self._lock:
+            terminal = [
+                uid for uid, j in self._jobs.items()
+                if j.state in _TERMINAL
+            ]
+            excess = len(terminal) - self._MAX_TERMINAL_KEPT
+            if excess > 0:
+                for uid in terminal[:excess]:
+                    del self._jobs[uid]
 
     def _mark_error(self, uid: str, msg: str, t0: float) -> None:
         with self._lock:

@@ -92,6 +92,27 @@ def _file_lock(path: Path) -> threading.Lock:
         return lock
 
 
+def prune_lock_table(max_size: int = 200) -> int:
+    """Remove old entries from _LOCK_TABLE to prevent unbounded growth.
+
+    Only removes locks that are not currently held.  Returns the number
+    of entries removed.
+    """
+    with _LOCK_TABLE_LOCK:
+        if len(_LOCK_TABLE) <= max_size:
+            return 0
+        # Remove unlocked entries from the front (oldest inserted first)
+        to_remove = []
+        for key, lock in list(_LOCK_TABLE.items()):
+            if len(_LOCK_TABLE) - len(to_remove) <= max_size:
+                break
+            if not lock.locked():
+                to_remove.append(key)
+        for key in to_remove:
+            del _LOCK_TABLE[key]
+        return len(to_remove)
+
+
 # ---------------------------------------------------------------------------
 # ScanCache
 # ---------------------------------------------------------------------------

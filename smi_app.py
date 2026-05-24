@@ -50,6 +50,7 @@ from live_stream import LiveStreamManager
 from smi_browser import nsls2api
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
+    prune_lock_table,
 )
 
 log = logging.getLogger(__name__)
@@ -5239,6 +5240,9 @@ _BATCH_ROW_COLORS = {
 w_batch_max_workers = pn.widgets.IntInput(
     name="Workers", value=1, start=1, end=16, width=90,
 )
+w_batch_low_memory_mode = pn.widgets.Checkbox(
+    name="Low-memory mode (force 1 worker)", value=True,
+)
 w_batch_skip_existing = pn.widgets.Checkbox(
     name="Skip uids already in collection", value=True,
 )
@@ -5251,6 +5255,9 @@ w_batch_add_to_collection = pn.widgets.Checkbox(
 w_batch_max_jobs = pn.widgets.IntInput(
     name="Max jobs", value=PAGE_SIZE, start=1, end=BatchProcessor.MAX_QUEUE,
     width=110,
+)
+w_batch_log_rows = pn.widgets.IntInput(
+    name="Log rows", value=200, start=25, end=2000, width=110,
 )
 w_btn_batch_queue = pn.widgets.Button(
     name="Queue scans", button_type="primary",
@@ -5308,6 +5315,13 @@ def _batch_memory_status_text() -> str:
     return f"*Batch memory: RSS {rss:.1f} MB, peak {peak:.1f} MB*"
 
 
+def _batch_effective_workers() -> int:
+    requested = max(1, int(w_batch_max_workers.value or 1))
+    if w_batch_low_memory_mode.value:
+        return 1
+    return requested
+
+
 def _batch_processed_contains(uid: str) -> bool:
     with _batch_state["processed_lock"]:
         return uid in _batch_state["processed_uids"]
@@ -5337,6 +5351,28 @@ def _batch_cleanup_memory() -> None:
     except Exception:
         pass
     gc.collect()
+
+
+def _batch_trim_allocator_now() -> None:
+    """Best-effort request to return free heap pages to the OS."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _batch_post_job_cleanup() -> None:
+    """Aggressive cleanup after each batch job to limit RSS growth."""
+    if w_batch_low_memory_mode.value:
+        try:
+            clear_geometry_cache()
+        except Exception:
+            pass
+    _batch_cleanup_memory()
+    prune_lock_table()
+    _batch_trim_allocator_now()
 
 
 def _try_parse_tuple(d: dict, key: str, text: str, default: tuple) -> None:
@@ -5474,7 +5510,7 @@ def _build_proc_params(uid: str) -> tuple:
         geometry=geometry,
         saxs_mask_path=saxs_mask_path,
         waxs_mask_path=waxs_mask_path,
-        cache_geometry=w_cache_enabled.value,
+        cache_geometry=(w_cache_enabled.value and not w_batch_low_memory_mode.value),
     )
     # Supply pre-cached images if available
     _cp = cache_path(uid)
@@ -5623,26 +5659,54 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
         log.exception("cache: failed to write reduction for %s", uid[:8])
 
 
-def _batch_process_fn(uid: str):
-    """BatchProcessor.process_fn: run one reduction and return the result."""
-    run_fn, params, geometry = _build_proc_params(uid)
-    result = run_fn(**params)
+# ---------------------------------------------------------------------------
+# Subprocess-isolated batch worker
+# ---------------------------------------------------------------------------
 
-    # Persist reduction outputs to the disk cache so subsequent sessions
-    # can reload without re-processing.
-    _cache_reduction_result(uid, result, geometry, params)
+def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
+    """Run one reduction + cache + export in an isolated subprocess.
 
-    # Fetch primary/baseline scalars and raw metadata so the collection
-    # can offer label columns and eventual export.
-    # Also build the summary from run metadata (no longer pre-fetched at
-    # queue time for speed).
+    This function is the target for ``multiprocessing.Process(target=...)``.
+    It inherits the parent's imports via fork but allocates all heavy arrays
+    in its OWN address space.  When it exits, the OS reclaims everything —
+    no heap fragmentation, no module-level caches lingering.
+    """
+    import threading as _thr
+
+    # After fork, threading locks inherited from parent may be in a bad
+    # state.  Replace the matplotlib serialisation lock with a fresh one
+    # so export_scan doesn't deadlock.
     try:
-        run = _get_cat()[uid]
-        primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
-        baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
-        config_df = _config_to_dataframe(run)
-        raw_md = dict(run.metadata)
-        start_md = raw_md.get("start", {})
+        import smi_browser.export as _export_mod
+        _export_mod._MPL_LOCK = _thr.Lock()
+    except Exception:
+        pass
+
+    # Force a fresh tiled connection (parent's HTTP sockets are not
+    # usable in the child after fork).
+    global _cat
+    _cat = None
+
+    try:
+        run_fn, params, geometry = _build_proc_params(uid)
+        result = run_fn(**params)
+
+        _cache_reduction_result(uid, result, geometry, params)
+
+        # Fetch scalars for export / summary
+        primary_df = baseline_df = config_df = raw_md = None
+        try:
+            run = _get_cat()[uid]
+            primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
+            baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+            config_df = _config_to_dataframe(run)
+            raw_md = dict(run.metadata)
+            del run
+        except Exception:
+            pass
+
+        # Build lightweight summary
+        start_md = (raw_md or {}).get("start", {})
         summary = {
             "uid": uid,
             "sample_name": start_md.get(
@@ -5652,18 +5716,101 @@ def _batch_process_fn(uid: str):
             "plan_name": start_md.get("plan_name", "?"),
             "scan_id": start_md.get("scan_id", "?"),
         }
-    except Exception:
-        primary_df = None
-        baseline_df = None
-        config_df = None
-        raw_md = None
-        summary = _batch_state.get("summaries", {}).get(uid, {})
-    # Pack extra data into params (BatchProcessor passes it through).
-    params["_primary_df"] = primary_df
-    params["_baseline_df"] = baseline_df
-    params["_config_df"] = config_df
-    params["_raw_metadata"] = raw_md
-    return result, summary, params
+
+        # Auto-export while result is alive
+        if export_config.get("auto_export"):
+            out_dir = export_config.get("export_dir")
+            if out_dir:
+                export_scan(
+                    out_dir=out_dir,
+                    uid=uid,
+                    result=result,
+                    params=params,
+                    primary_df=primary_df,
+                    baseline_df=baseline_df,
+                    config_df=config_df,
+                    raw_metadata=raw_md,
+                    formats=export_config.get("formats", []),
+                    subdir_template=export_config.get("subdir_template", ""),
+                    basename_template=export_config.get("basename_template", ""),
+                    frame_label_col=export_config.get("frame_label_col"),
+                )
+
+        conn.send(("ok", summary))
+    except Exception as exc:
+        conn.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        conn.close()
+
+
+def _snapshot_export_config() -> dict:
+    """Snapshot current export-related widget values into a plain dict.
+
+    This is called in the parent process before forking so the child has
+    all the settings it needs without touching Panel widgets (which may
+    not survive fork cleanly in future Panel versions).
+    """
+    return {
+        "auto_export": bool(w_export_auto.value),
+        "export_dir": _resolve_export_dir() or "",
+        "formats": _export_formats(),
+        "subdir_template": w_export_subdir.value or "",
+        "basename_template": w_export_basename.value or "",
+        "frame_label_col": _get_frame_label_cols() or None,
+    }
+
+
+def _batch_process_fn(uid: str):
+    """BatchProcessor.process_fn — runs reduction in an isolated subprocess.
+
+    Each scan's heavy work (reduce + cache + export) runs in a forked child
+    process.  When the child exits, ALL memory it allocated is returned to
+    the OS unconditionally — no heap fragmentation, no module-level caches.
+    This guarantees constant memory usage regardless of how many scans are
+    processed.
+    """
+    import multiprocessing as mp
+
+    export_config = _snapshot_export_config()
+
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_batch_subprocess_target,
+        args=(uid, export_config, child_conn),
+        daemon=True,
+    )
+    proc.start()
+    child_conn.close()  # parent doesn't write to child's end
+
+    # Wait for result from child
+    try:
+        status, data = parent_conn.recv()
+    except EOFError:
+        proc.join(timeout=10)
+        raise RuntimeError(
+            f"Batch subprocess for {uid[:8]} died unexpectedly "
+            f"(exit code {proc.exitcode})"
+        )
+    finally:
+        parent_conn.close()
+
+    proc.join(timeout=300)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        raise RuntimeError(f"Batch subprocess for {uid[:8]} timed out")
+
+    if proc.exitcode and proc.exitcode != 0:
+        raise RuntimeError(
+            f"Batch subprocess for {uid[:8]} exited with code {proc.exitcode}"
+        )
+
+    if status == "error":
+        raise RuntimeError(data)
+
+    summary = data
+    return None, summary, {}
 
 
 def _batch_skip(uid: str) -> bool:
@@ -5701,8 +5848,10 @@ def _batch_dispatch(snap: dict) -> None:
                 f"queued={states['queued']}, running={states['running']})"
             )
 
+            # Build table from full job list
+            jobs_view = snap["jobs"]
             rows = []
-            for j in snap["jobs"]:
+            for j in jobs_view:
                 dur = j.get("duration_s")
                 rows.append({
                     "uid_short": (j["uid"] or "")[:8],
@@ -5715,26 +5864,9 @@ def _batch_dispatch(snap: dict) -> None:
                 rows,
                 columns=["uid_short", "label", "state", "duration_s", "error"],
             )
-            # Only do a full replace when the shape changes (new jobs added
-            # or cleared).  Otherwise patch individual cells so Tabulator
-            # keeps its scroll position instead of jumping to the top.
-            old_df = w_batch_table.value
-            if (
-                old_df is not None
-                and len(old_df) == len(new_df)
-                and list(old_df.columns) == list(new_df.columns)
-            ):
-                patches = {}
-                for col in new_df.columns:
-                    for idx in range(len(new_df)):
-                        ov = old_df.iat[idx, old_df.columns.get_loc(col)]
-                        nv = new_df.iat[idx, new_df.columns.get_loc(col)]
-                        if ov != nv:
-                            patches.setdefault(col, []).append((idx, nv))
-                if patches:
-                    w_batch_table.patch(patches)
-            else:
-                w_batch_table.value = new_df
+            # Always do a full replace — patching is slow for large tables
+            # and caused delayed/stale UI.
+            w_batch_table.value = new_df
 
             # Apply row colours based on job state.
             def _color_batch_rows(row):
@@ -5749,6 +5881,7 @@ def _batch_dispatch(snap: dict) -> None:
             w_batch_processed_status.object = (
                 f"*Processed history: {_batch_processed_count()} uids*"
             )
+            w_batch_memory_status.object = _batch_memory_status_text()
 
             # Keep the collection panel in sync as jobs land.
             if w_batch_add_to_collection.value:
@@ -5766,55 +5899,64 @@ def _batch_dispatch(snap: dict) -> None:
         log.exception("batch: add_next_tick_callback failed")
 
 
-def _batch_add_fn(result, summary, params):
-    # ScanCollection internals are plain dicts; updates are GIL-protected.
-    # We add on the worker thread so the snapshot fired immediately after
-    # already reflects the new collection size.
-    uid = getattr(result, "uid", None)
-    primary_df = params.pop("_primary_df", None)
-    baseline_df = params.pop("_baseline_df", None)
-    config_df = params.pop("_config_df", None)
-    raw_metadata = params.pop("_raw_metadata", None)
+class _CachedResult:
+    """Minimal stub with .uid and .merged_iq for collection display."""
+
+    def __init__(self, uid: str, merged_iq, geometry: str = "transmission"):
+        self.uid = uid
+        self.merged_iq = merged_iq
+        self.merged_qchi = None
+        self.per_frame_iq = None
+        self.timing = None
+        self.geometry = geometry
+
+
+def _batch_add_to_collection_from_cache(uid: str, summary: dict) -> None:
+    """Reload cached I(q) arrays and add a lightweight result to collection."""
+    import xarray as xr
+
     try:
-        if w_batch_add_to_collection.value:
-            _collection.add(
-                result, summary, params,
-                primary_df=primary_df,
-                baseline_df=baseline_df,
-                config_df=config_df,
-                raw_metadata=raw_metadata,
-            )
+        cache = ScanCache(uid)
+        cached = cache.read_reduction()
+        if cached is None:
+            return
+        arrays = cached.get("arrays", {})
+        params = cached.get("params", {})
+        q = arrays.get("iq_q")
+        I = arrays.get("iq_I")
+        if q is None or I is None:
+            return
+        # Build minimal xarray Dataset matching what collection expects
+        merged_iq = xr.Dataset(
+            {"I": xr.DataArray(I, dims=["q"], coords={"q": q})},
+        )
+        geometry = params.get("geometry", "transmission")
+        stub = _CachedResult(uid, merged_iq, geometry=geometry)
+        _collection.add(stub, summary)
+    except Exception:
+        log.debug("batch: collection add from cache failed for %s", uid[:8])
 
-        # Auto-export if enabled
-        if w_export_auto.value and uid:
-            out_dir = _resolve_export_dir()
-            if out_dir:
-                export_scan(
-                    out_dir=out_dir,
-                    uid=uid,
-                    result=result,
-                    params=params,
-                    primary_df=primary_df,
-                    baseline_df=baseline_df,
-                    config_df=config_df,
-                    raw_metadata=raw_metadata,
-                    formats=_export_formats(),
-                    subdir_template=w_export_subdir.value,
-                    basename_template=w_export_basename.value,
-                    frame_label_col=_get_frame_label_cols() or None,
-                )
 
+def _batch_add_fn(result, summary, params):
+    """Lightweight bookkeeping after a batch job completes.
+
+    Heavy reduction runs in a subprocess.  This function (in the parent)
+    records the uid and optionally reloads the cached I(q) into the
+    collection for live display (only when collection add is enabled,
+    which is auto-disabled for batches > 50 scans).
+    """
+    uid = summary.get("uid") if isinstance(summary, dict) else None
+    try:
         if uid:
             _batch_processed_add(uid)
+            # Reload from disk cache into collection (lightweight — only
+            # the merged I(q) arrays, not the full result).
+            if w_batch_add_to_collection.value:
+                _batch_add_to_collection_from_cache(uid, summary)
     finally:
-        if not w_batch_add_to_collection.value:
-            primary_df = None
-            baseline_df = None
-            config_df = None
-            raw_metadata = None
-            result = None
-            summary = None
-        _batch_cleanup_memory()
+        result = None
+        summary = None
+        params = None
 
 
 def _prefetch_image_caches(uids: list[str]) -> None:
@@ -5839,7 +5981,7 @@ def _prefetch_image_caches(uids: list[str]) -> None:
 
 def _ensure_batch_processor() -> BatchProcessor:
     bp = _batch_state.get("processor")
-    workers = max(1, int(w_batch_max_workers.value or 1))
+    workers = _batch_effective_workers()
     # Re-create when worker count changes or the previous run finished
     # (BatchProcessor is single-shot in the sense that its worker threads
     # exit when the queue drains; restarting cleanly = new instance).
@@ -5868,6 +6010,12 @@ def _on_batch_queue(event):
         _batch_state["doc"] = pn.state.curdoc
     except Exception:
         _batch_state["doc"] = None
+    _batch_state["rss_peak_mb"] = 0.0
+
+    if w_batch_low_memory_mode.value and (w_batch_max_workers.value or 1) > 1:
+        pn.state.notifications.info(
+            "Low-memory mode is on; batch workers are forced to 1."
+        )
 
     max_jobs = max(1, int(w_batch_max_jobs.value or 25))
     skip_existing = w_batch_skip_existing.value
@@ -5921,6 +6069,16 @@ def _on_batch_queue(event):
         return
 
     _batch_state["summaries"] = {}  # populated lazily during processing
+
+    # Auto-disable collection add for large batches (memory grows per scan
+    # stored in the collection).
+    _BATCH_COLLECTION_MAX = 50
+    if len(items) > _BATCH_COLLECTION_MAX and w_batch_add_to_collection.value:
+        w_batch_add_to_collection.value = False
+        pn.state.notifications.warning(
+            f"Collection add disabled — batch has >{_BATCH_COLLECTION_MAX} "
+            f"scans. Re-enable manually for small batches."
+        )
 
     # Ensure empty cache files exist so reduce_smi_combined skips the
     # redundant populate_cache (second Tiled fetch) for each scan.
@@ -5984,6 +6142,7 @@ batch_panel = pn.Column(
         w_btn_batch_clear_processed,
     ),
     pn.Row(w_batch_max_jobs, w_batch_max_workers),
+    pn.Row(w_batch_low_memory_mode),
     pn.Row(
         w_batch_skip_existing,
         w_batch_skip_processed,
