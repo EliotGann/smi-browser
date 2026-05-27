@@ -41,16 +41,34 @@ log = logging.getLogger(__name__)
 def cache_root() -> Path:
     """Return the directory holding per-scan cache files.
 
-    Resolved from ``$SMI_BROWSER_CACHE_DIR`` (preferred) or
-    ``${TMPDIR:-/tmp}/smi_browser_cache``.
+    Resolved from ``$SMI_BROWSER_CACHE_DIR`` (preferred), then
+    ``${TMPDIR:-/tmp}/smi_browser_cache`` if that directory is writable,
+    otherwise ``~/.local/share/smi_browser_cache`` as a user-owned fallback.
     """
     env = os.environ.get("SMI_BROWSER_CACHE_DIR")
     if env:
         root = Path(env).expanduser()
-    else:
-        root = Path(tempfile.gettempdir()) / "smi_browser_cache"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    tmp_root = Path(tempfile.gettempdir()) / "smi_browser_cache"
+    try:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        if os.access(tmp_root, os.W_OK):
+            return tmp_root
+    except OSError:
+        pass
+
+    # Shared /tmp cache exists but is owned by another user — fall back to
+    # a user-owned location so writes don't fail silently.
+    fallback = Path.home() / ".local" / "share" / "smi_browser_cache"
+    fallback.mkdir(parents=True, exist_ok=True)
+    log.warning(
+        "cache: %s is not writable; using %s instead. "
+        "Set SMI_BROWSER_CACHE_DIR to override.",
+        tmp_root, fallback,
+    )
+    return fallback
 
 
 def cache_max_bytes() -> int:

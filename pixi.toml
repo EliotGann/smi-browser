@@ -23,7 +23,7 @@ httpx = "*"
 # To switch to a released version:  pyhyperscattering = ">=0.2"
 # To pin to a GitHub fork:
 #   pyhyperscattering = { git = "https://github.com/YOURFORK/PyHyperScattering.git", branch = "feature/smi-tiled-loader" }
-pyhyperscattering = { path = "../../PyHyperScattering", editable = true }
+pyhyperscattering = { path = "../PyHyperScattering", editable = true }
 
 [tasks]
 serve = "panel serve smi_app.py --show --autoreload"

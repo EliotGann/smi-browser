@@ -41,6 +41,10 @@ class ScanCollection:
         self._baseline_dfs: dict[str, pd.DataFrame] = {}  # uid -> baseline scalars
         self._config_dfs: dict[str, pd.DataFrame] = {}    # uid -> primary config
         self._raw_metadata: dict[str, dict] = {}          # uid -> full tiled metadata
+        # Pin state: ``True`` = curated, ``False`` = transient preview from
+        # a recent multi-scan reduction.  The Collection panel filters on
+        # this flag so unpinned previews don't clutter the curated view.
+        self._pinned: dict[str, bool] = {}
 
     @property
     def uids(self) -> list[str]:
@@ -56,7 +60,8 @@ class ScanCollection:
              primary_df: pd.DataFrame | None = None,
              baseline_df: pd.DataFrame | None = None,
              config_df: pd.DataFrame | None = None,
-             raw_metadata: dict | None = None):
+             raw_metadata: dict | None = None,
+             pinned: bool = True):
         """Add a processed scan to the collection.
 
         Parameters
@@ -69,6 +74,12 @@ class ScanCollection:
             Primary stream configuration data (detector settings, motor offsets).
         raw_metadata : dict, optional
             Full tiled metadata dict (for export).
+        pinned : bool, default True
+            ``True`` (default) means the scan is part of the curated
+            collection — preserves the historical behaviour of
+            ``collection.add``.  Pass ``pinned=False`` when staging a
+            preview reduction from a multi-scan batch; the Collection
+            panel will hide it unless the *Show unpinned* toggle is on.
         """
         self._results[result.uid] = result
         self._metadata[result.uid] = metadata
@@ -87,6 +98,11 @@ class ScanCollection:
                 self._color_idx % len(self._PALETTE)
             ]
             self._color_idx += 1
+        # Promote-on-re-add: if a pinned scan is re-added it stays pinned;
+        # if a previously-unpinned scan is added with pinned=True, promote.
+        self._pinned[result.uid] = bool(pinned) or self._pinned.get(
+            result.uid, False
+        )
 
     def remove(self, uid: str):
         self._results.pop(uid, None)
@@ -97,6 +113,35 @@ class ScanCollection:
         self._baseline_dfs.pop(uid, None)
         self._config_dfs.pop(uid, None)
         self._raw_metadata.pop(uid, None)
+        self._pinned.pop(uid, None)
+
+    # ------------------------------------------------------------------
+    # Pin / unpin state
+    # ------------------------------------------------------------------
+
+    def is_pinned(self, uid: str) -> bool:
+        return bool(self._pinned.get(uid, False))
+
+    def pin(self, uid: str) -> None:
+        if uid in self._results:
+            self._pinned[uid] = True
+
+    def unpin(self, uid: str) -> None:
+        if uid in self._pinned:
+            self._pinned[uid] = False
+
+    def pinned_uids(self) -> list[str]:
+        return [u for u in self._results if self._pinned.get(u, False)]
+
+    def unpinned_uids(self) -> list[str]:
+        return [u for u in self._results if not self._pinned.get(u, False)]
+
+    def clear_unpinned(self) -> int:
+        """Drop every unpinned scan; returns how many were removed."""
+        victims = self.unpinned_uids()
+        for uid in victims:
+            self.remove(uid)
+        return len(victims)
 
     def get_color(self, uid: str) -> str:
         return self._colors.get(uid, "#888888")
@@ -166,7 +211,8 @@ class ScanCollection:
     def get_raw_metadata(self, uid: str) -> dict | None:
         return self._raw_metadata.get(uid)
 
-    def summary_table(self, label_column: str | None = None) -> pd.DataFrame:
+    def summary_table(self, label_column: str | None = None,
+                      pinned_only: bool = False) -> pd.DataFrame:
         """DataFrame summary of all scans in the collection.
 
         Parameters
@@ -174,9 +220,14 @@ class ScanCollection:
         label_column : str, optional
             A primary or baseline field name (baseline fields prefixed with
             ``baseline:``) to include as an extra column in the table.
+        pinned_only : bool, default False
+            When True, hide unpinned (preview) scans from the result.
         """
         rows = []
-        for uid in self._results:
+        uid_iter = (
+            self.pinned_uids() if pinned_only else list(self._results)
+        )
+        for uid in uid_iter:
             res = self._results[uid]
             meta = self._metadata.get(uid, {})
             timing = res.timing or {}
@@ -186,6 +237,7 @@ class ScanCollection:
             else:
                 detectors = meta.get("detectors", "?")
             row = {
+                "pinned":    self._pinned.get(uid, False),
                 "color":     self._colors.get(uid, "#888888"),
                 "uid_short": uid[:8],
                 "sample":    self.resolved_sample_name(uid),
@@ -198,9 +250,10 @@ class ScanCollection:
             if label_column:
                 row["label_val"] = self.get_label_value(uid, label_column)
             rows.append(row)
-        cols = ["color", "uid_short", "sample", "plan", "detectors", "geometry", "total_s", "uid"]
+        cols = ["pinned", "color", "uid_short", "sample", "plan", "detectors",
+                "geometry", "total_s", "uid"]
         if label_column:
-            cols.insert(3, "label_val")
+            cols.insert(4, "label_val")
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
     def varying_parameters(self) -> dict[str, list]:

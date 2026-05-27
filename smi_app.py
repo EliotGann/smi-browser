@@ -259,8 +259,33 @@ _state = {
     "page":         0,
     "page_size":    PAGE_SIZE,
     "total":        0,
-    "selected_uid": None,
+    # Ordered list of selected uids; first entry is the "primary" — the one
+    # whose data populates per-scan widgets (table, JSON, image figure, etc.).
+    # The legacy "selected_uid" derived field is exposed via _selected_uid().
+    "selected_uids": [],
 }
+
+
+def _selected_uid() -> str | None:
+    """Return the primary (first-selected) uid, or None if no selection."""
+    uids = _state.get("selected_uids") or []
+    return uids[0] if uids else None
+
+
+def _selected_uids() -> list[str]:
+    """Return the list of currently selected uids (primary first)."""
+    return list(_state.get("selected_uids") or [])
+
+
+def _set_selected_uids(uids) -> None:
+    """Replace the selection list. Accepts a list, tuple, or single uid/None."""
+    if uids is None:
+        _state["selected_uids"] = []
+        return
+    if isinstance(uids, str):
+        _state["selected_uids"] = [uids] if uids else []
+        return
+    _state["selected_uids"] = [u for u in uids if u]
 
 _detail_cache = {
     "uid":              None,
@@ -685,7 +710,19 @@ def _thumbnail_figure(arr, title):
     )
     line_draw_tool = PolyDrawTool(renderers=[line_renderer], num_objects=20)
     p.add_tools(line_draw_tool)
-    line_renderer.visible = bool(w_align_enable.value)
+    align_on = bool(w_align_enable.value)
+    line_renderer.visible = align_on
+    # If alignment is already enabled when the figure is built (e.g. after a
+    # log-toggle or scan-switch rebuild), make the line-draw tool the
+    # currently active drag tool so the user can immediately draw without
+    # having to click the toolbar icon.  The _on_align_enable watcher only
+    # fires on value changes, not on figure rebuilds.
+    if align_on:
+        try:
+            p.toolbar.active_drag = line_draw_tool
+            p.toolbar.active_tap = line_draw_tool
+        except Exception:
+            pass
 
     # Watch the line source for changes (server-side callback)
     try:
@@ -715,6 +752,57 @@ def _thumbnail_figure(arr, title):
     return p, source, mapper
 
 
+def _pack_rgb_to_rgba_uint32(arr) -> np.ndarray:
+    """Pack an ``(H, W, 3)`` or ``(H, W, 4)`` RGB array into Bokeh's expected
+    ``(H, W)`` uint32 layout."""
+    a = np.asarray(arr)
+    if a.dtype != np.uint8:
+        # Floating-point camera frames may be 0..1 or 0..255.  Detect by max.
+        if a.dtype.kind == "f":
+            amax = float(np.nanmax(a)) if a.size else 0.0
+            scale = 255.0 if amax <= 1.0001 else 255.0 / max(amax, 1.0)
+            a = np.clip(a * scale, 0, 255).astype(np.uint8)
+        else:
+            a = np.clip(a, 0, 255).astype(np.uint8)
+    if a.shape[-1] == 3:
+        h, w = a.shape[:2]
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = a
+        rgba[..., 3] = 255
+    else:
+        rgba = a
+    h, w = rgba.shape[:2]
+    return np.ascontiguousarray(rgba).view(dtype=np.uint32).reshape(h, w)
+
+
+def _build_rgb_figure(arr, title: str):
+    """Build a simple Bokeh figure that renders an RGB camera frame.
+
+    Returns ``(figure, source, None)`` matching the ``_thumbnail_figure``
+    interface (mapper is None — RGB doesn't go through a colour mapper).
+    """
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import ColumnDataSource
+
+    h, w = arr.shape[:2]
+    packed = _pack_rgb_to_rgba_uint32(arr)
+    source = ColumnDataSource(
+        data=dict(image=[packed], x=[0], y=[0], dw=[w], dh=[h]),
+    )
+    p = bk_figure(
+        title=title, width=600, height=600,
+        x_range=(0, w), y_range=(0, h),
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        match_aspect=True,
+        sizing_mode="stretch_both",
+    )
+    p.image_rgba(image="image", x="x", y="y", dw="dw", dh="dh", source=source)
+    p.xaxis.axis_label = "col (px)"
+    p.yaxis.axis_label = "row (px)"
+    return p, source, None
+
+
 def _update_image_in_place(arr, title):
     """Update the existing image figure in-place, preserving zoom/pan state."""
     from bokeh.models import LogColorMapper, LinearColorMapper
@@ -722,6 +810,40 @@ def _update_image_in_place(arr, title):
     fig = _image_cache.get("figure")
     source = _image_cache.get("source")
     mapper = _image_cache.get("mapper")
+
+    # If the current frame is an RGB camera image, drive a dedicated
+    # image_rgba figure rather than the scalar-with-colour-mapper path.
+    if _is_rgb_frame(arr):
+        rgb_arr = np.asarray(arr)
+        was_rgb = _image_cache.get("is_rgb", False)
+        if fig is None or source is None or not was_rgb:
+            fig, source, _ = _build_rgb_figure(rgb_arr, title)
+            _image_cache["figure"] = fig
+            _image_cache["source"] = source
+            _image_cache["mapper"] = None
+            _image_cache["is_rgb"] = True
+            _image_cache["fig_image_shape"] = tuple(rgb_arr.shape[:2])
+            w_image_thumb.object = fig
+            return
+        # Same figure / still RGB → just update the packed source.
+        h, w = rgb_arr.shape[:2]
+        packed = _pack_rgb_to_rgba_uint32(rgb_arr)
+        source.data = dict(image=[packed], x=[0], y=[0], dw=[w], dh=[h])
+        if fig is not None:
+            try:
+                fig.title.text = title
+            except Exception:
+                pass
+        return
+
+    # Scalar (SAXS/WAXS/monochrome) — rebuild the figure if we're coming
+    # back from an RGB frame, otherwise fall through to the in-place path.
+    if _image_cache.get("is_rgb"):
+        fig = source = mapper = None
+        _image_cache["is_rgb"] = False
+        _image_cache["figure"] = None
+        _image_cache["source"] = None
+        _image_cache["mapper"] = None
 
     if fig is None or source is None:
         # No existing figure — create fresh
@@ -731,9 +853,11 @@ def _update_image_in_place(arr, title):
         _image_cache["mapper"] = mapper
         _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
-        # Sync color-scale widgets to the initial mapper range
+        # Sync color-scale widgets to the initial mapper range; pass the
+        # frame so the slider can be widened to the full data span.
         try:
-            _cs_sync_widgets_to_range(float(mapper.low), float(mapper.high))
+            _cs_sync_widgets_to_range(float(mapper.low), float(mapper.high),
+                                      arr=arr)
         except Exception:
             pass
         # Build initial histogram
@@ -741,11 +865,11 @@ def _update_image_in_place(arr, title):
             _build_histogram(arr)
         except Exception:
             pass
-        # Auto-load the default mask if Show-mask is enabled (handles the
-        # initial render and detector switches).  Defer to the next tick
-        # so Bokeh has finished syncing the freshly-attached figure before
-        # we push polygon data into its mask source.
-        if w_mask_show.value:
+        # Auto-load the default mask if Show-mask is enabled AND the
+        # current field actually belongs to a SAXS/WAXS detector.  For
+        # camera images the mask overlay is meaningless and was previously
+        # being auto-loaded as a SAXS default.
+        if w_mask_show.value and _current_detector_kind() is not None:
             def _deferred_reload():
                 try:
                     _on_mask_reload(None)
@@ -786,7 +910,7 @@ def _update_image_in_place(arr, title):
     if not w_cs_lock.value:
         vlo, vhi = _cs_finite_range(arr)
         _cs_apply_to_mapper(vlo, vhi)
-        _cs_sync_widgets_to_range(vlo, vhi)
+        _cs_sync_widgets_to_range(vlo, vhi, arr=arr)
 
     # Update image data (keeps zoom/pan state)
     source.data = dict(image=[display], x=[0], y=[0], dw=[w], dh=[h])
@@ -1069,7 +1193,8 @@ w_page_info = pn.pane.Markdown("–/–", width=80)
 w_table = pn.widgets.Tabulator(
     value=_EMPTY_DF.copy(),
     pagination=None,
-    selectable=1,
+    # selectable=True → multi-row selection via Ctrl/Shift+click.
+    selectable=True,
     show_index=False,
     sizing_mode="stretch_width",
     height=600,
@@ -1106,6 +1231,11 @@ w_meta_json = pn.pane.JSON(
     sizing_mode="stretch_both",
     margin=(5, 5),
 )
+
+# Container that holds either the single JSON pane (above) or a side-by-side
+# multi-scan comparison layout when more than one scan is selected.  Driven by
+# _render_meta_layout() during _load_metadata.
+w_meta_container = pn.Column(w_meta_json, sizing_mode="stretch_both")
 w_primary_table = pn.widgets.Tabulator(
     value=pd.DataFrame(), show_index=False,
     sizing_mode="stretch_width", height=280,
@@ -1141,9 +1271,21 @@ w_baseline_table = pn.widgets.Tabulator(
     },
 )
 w_baseline_status = pn.pane.Markdown("*Click tab to load.*")
+w_baseline_diff_only = pn.widgets.Checkbox(
+    name="Differing only (across selected scans)", value=False, visible=False,
+)
 
 # Images tab — frame slider for browsing raw detector images
 w_image_thumb = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=400)
+
+# Container that holds either the single-scan thumbnail above, or a grid of
+# small per-scan thumbnails when multi-select is active.  Driven by
+# _render_explore_layout().
+w_image_container = pn.Column(w_image_thumb, sizing_mode="stretch_both", min_height=500)
+
+# Hint shown above the image area in multi mode — explains which tools are
+# disabled while a grid is on screen.
+w_image_multi_hint = pn.pane.Markdown("", sizing_mode="stretch_width", visible=False)
 w_image_status = pn.pane.Markdown("")
 w_image_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
 w_image_slider = pn.widgets.IntSlider(
@@ -1261,16 +1403,47 @@ def _cs_finite_range(arr: np.ndarray) -> tuple[float, float]:
     return lo, hi
 
 
-def _cs_sync_widgets_to_range(lo: float, hi: float) -> None:
-    """Update min/max/range widgets to reflect new bounds without firing callbacks."""
+def _cs_sync_widgets_to_range(
+    lo: float, hi: float, arr: np.ndarray | None = None,
+) -> None:
+    """Update min/max/range widgets to reflect new bounds without firing callbacks.
+
+    When ``arr`` is supplied the slider bounds expand to cover the array's
+    full min/max so the user can drag the lo/hi spans across the entire
+    histogram (not just the percentile window).
+    """
     use_log = bool(w_cs_log.value)
     if use_log:
         slider_lo = float(np.log10(max(lo, 1e-12)))
         slider_hi = float(np.log10(max(hi, lo * 1.0001)))
-        pad_lo, pad_hi = slider_lo - 0.5, slider_hi + 0.5
     else:
-        pad_lo, pad_hi = lo - abs(lo) * 0.5 - 1e-6, hi + abs(hi) * 0.5 + 1e-6
         slider_lo, slider_hi = lo, hi
+
+    if arr is not None:
+        finite = np.asarray(arr)
+        finite = finite[np.isfinite(finite)]
+        if use_log:
+            finite = finite[finite > 0]
+        if finite.size:
+            if use_log:
+                pad_lo = float(np.log10(max(float(np.min(finite)), 1e-12)))
+                pad_hi = float(np.log10(max(float(np.max(finite)),
+                                            10 ** pad_lo * 1.0001)))
+            else:
+                pad_lo = float(np.min(finite))
+                pad_hi = float(np.max(finite))
+                if pad_hi <= pad_lo:
+                    pad_hi = pad_lo + 1.0
+        else:
+            pad_lo, pad_hi = slider_lo - 1.0, slider_hi + 1.0
+    elif use_log:
+        # No array — fall back to ±2 decade pad so the slider is wide
+        # enough to reach into outliers.
+        pad_lo, pad_hi = slider_lo - 2.0, slider_hi + 2.0
+    else:
+        span = max(abs(hi - lo), 1.0)
+        pad_lo, pad_hi = lo - span, hi + span
+
     _image_cache["cs_suspend"] = True
     try:
         w_cs_range.start = pad_lo
@@ -1381,6 +1554,13 @@ def _update_hist_spans() -> None:
 # ----- Color scale callbacks -----
 
 def _on_cs_cmap(event):
+    # Multi-grid: rebuild so every tile uses the new palette.
+    if len(_selected_uids()) > 1:
+        try:
+            _render_explore_multi_grid()
+        except Exception:
+            log.exception("explore multi-grid palette refresh failed")
+        return
     mapper = _image_cache.get("mapper")
     if mapper is None:
         return
@@ -1392,6 +1572,12 @@ def _on_cs_cmap(event):
 
 def _on_cs_log(_event=None):
     """Toggling log requires rebuilding the mapper (Log vs Linear class)."""
+    if len(_selected_uids()) > 1:
+        try:
+            _render_explore_multi_grid()
+        except Exception:
+            log.exception("explore multi-grid log toggle refresh failed")
+        return
     # Force a figure rebuild on next render
     _image_cache["figure"] = None
     _image_cache["source"] = None
@@ -1417,6 +1603,15 @@ def _on_cs_range(event):
         w_cs_max.value = hi_v
     finally:
         _image_cache["cs_suspend"] = False
+    # Multi-grid: each tile is in its own Panel pane and the mapper
+    # mutation doesn't propagate.  Re-render keeping the slider value.
+    if len(_selected_uids()) > 1:
+        try:
+            _render_explore_multi_grid()
+        except Exception:
+            log.exception("explore multi-grid range refresh failed")
+        _update_hist_spans()
+        return
     _cs_apply_to_mapper(lo_v, hi_v)
     _update_hist_spans()
 
@@ -1643,7 +1838,7 @@ w_align_width.param.watch(lambda *_: _update_line_analysis(), "value")
 
 def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray | None:
     """Fetch a single image frame, using the disk cache when a uid is known."""
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if uid:
         arr = get_or_fetch_image_frame(
             uid, field, frame_idx,
@@ -1654,22 +1849,42 @@ def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray 
     return _coerce_to_2d_frame(arr)
 
 
-def _coerce_to_2d_frame(arr) -> np.ndarray | None:
-    """Reduce a detector frame to a 2-D array for display.
+def _is_rgb_frame(arr) -> bool:
+    """Heuristic: does ``arr`` look like an (H, W, 3) or (H, W, 4) RGB frame?"""
+    a = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
+    return (
+        a.ndim == 3
+        and a.shape[-1] in (3, 4)
+        # 3-channel arrays that aren't RGB (e.g. a 3-frame stack of small
+        # detector tiles) would also match shape[-1] in (3, 4); guard by
+        # requiring the spatial dims to be substantially larger than the
+        # channel axis, which is true for any real camera image.
+        and a.shape[0] > 8
+        and a.shape[1] > 8
+    )
 
-    Some streams return per-frame arrays with extra leading axes (e.g. a
-    multi-exposure detector field shaped ``(N, K, H, W)`` indexes to
-    ``(K, H, W)``).  Squeeze singleton dims; if still 3-D+, take the
-    first sub-frame along each extra axis so downstream image widgets
-    always see ``(H, W)``.
+
+def _coerce_to_2d_frame(arr) -> np.ndarray | None:
+    """Reduce a detector frame to a 2-D array (or pass through RGB).
+
+    Detector fields generally return per-frame ``(N, H, W)`` stacks indexed
+    to one ``(H, W)`` slice for display.  Visual-camera fields, however,
+    return ``(H, W, 3)`` (or ``(H, W, 4)``) colour arrays which we preserve
+    as-is so the upstream renderer can draw them as RGB.  Anything else
+    with >2 dims has its leading singleton axes squeezed and any remaining
+    extra axes resolved by taking the first slice.
     """
     if arr is None:
         return None
     a = np.asarray(arr)
     if a.ndim <= 2:
         return a
+    if _is_rgb_frame(a):
+        return a
     a = np.squeeze(a)
     while a.ndim > 2:
+        if _is_rgb_frame(a):
+            return a
         a = a[0]
     return a
 
@@ -1698,6 +1913,14 @@ def _on_image_slider(event):
     field = _image_cache.get("field")
     if not field:
         return
+    if len(_selected_uids()) > 1:
+        # Multi-grid: re-render the grid at the new frame index (clamped
+        # per-scan inside the renderer).
+        try:
+            _render_explore_multi_grid(field=field, frame_idx=int(event.new))
+        except Exception:
+            log.exception("explore multi-grid frame refresh failed")
+        return
     _render_image_frame(field, event.new)
     _update_explore_cursor(event.new)
 
@@ -1721,6 +1944,12 @@ def _on_image_field(event):
         _image_cache["n_frames"] = n
         w_image_slider.value = 0
         w_image_slider.end = max(0, n - 1)
+    if len(_selected_uids()) > 1:
+        try:
+            _render_explore_multi_grid(field=field, frame_idx=0)
+        except Exception:
+            log.exception("explore multi-grid field switch failed")
+        return
     _render_image_frame(field, 0)
 
 
@@ -1753,7 +1982,7 @@ w_mv_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
 w_mv_label = pn.widgets.Select(
     name="Frame label", options=["(frame #)"], value="(frame #)", width=180,
 )
-w_mv_grid = pn.pane.Bokeh(object=None, sizing_mode="stretch_both", min_height=500)
+w_mv_grid = pn.Column(sizing_mode="stretch_both", min_height=500)
 
 # Pagination controls for scans with more frames than MV_MAX_FRAMES
 w_mv_prev = pn.widgets.Button(name="\u25C0 Prev", width=80, button_type="default", disabled=True)
@@ -1813,8 +2042,25 @@ def _mv_compute_data_range(frames):
     return lo, hi
 
 
-def _build_multiview_grid(frames, field):
-    """Build the Bokeh gridplot of all frames with linked axes."""
+def _build_multiview_grid(frames, field, *,
+                          labels: list[str] | None = None,
+                          ncols: int | None = None):
+    """Build the Bokeh gridplot of all frames with linked axes.
+
+    Parameters
+    ----------
+    frames
+        Iterable of 2-D arrays to render.
+    field
+        Image field name (used in the data-range cache key).
+    labels
+        Optional per-frame title strings.  When omitted, labels are derived
+        from the active label column (or ``"frame {i}"``).
+    ncols
+        Optional explicit column count.  When omitted, ``grid_dims(N)``
+        picks a roughly 2:1 layout.  Multi-scan mode sets this to "max
+        frames in any one scan" so each scan gets its own row.
+    """
     from bokeh.plotting import figure as bk_figure
     from bokeh.layouts import gridplot
     from bokeh.models import (
@@ -1823,29 +2069,33 @@ def _build_multiview_grid(frames, field):
     )
 
     if not frames:
-        w_mv_grid.object = None
+        w_mv_grid.objects = []
         return
 
-    # Build per-frame labels from primary scalar column if selected
+    # Build per-frame labels from primary scalar column if selected, unless
+    # the caller supplied an explicit list (multi-scan mode does).
     frame_offset = _multiview_cache.get("page", 0) * MV_MAX_FRAMES
-    label_col = w_mv_label.value
-    frame_labels: list[str] = []
-    if label_col and label_col != "(frame #)":
-        df = w_primary_table.value
-        if df is not None and label_col in df.columns:
-            vals = df[label_col].values
-            for i in range(len(frames)):
-                abs_i = frame_offset + i
-                if abs_i < len(vals):
-                    v = vals[abs_i]
-                    try:
-                        frame_labels.append(f"{label_col}={float(v):.4g}")
-                    except (ValueError, TypeError):
-                        frame_labels.append(f"{label_col}={v}")
-                else:
-                    frame_labels.append(f"frame {abs_i}")
-    if not frame_labels:
-        frame_labels = [f"frame {frame_offset + i}" for i in range(len(frames))]
+    if labels is not None:
+        frame_labels = list(labels)
+    else:
+        label_col = w_mv_label.value
+        frame_labels = []
+        if label_col and label_col != "(frame #)":
+            df = w_primary_table.value
+            if df is not None and label_col in df.columns:
+                vals = df[label_col].values
+                for i in range(len(frames)):
+                    abs_i = frame_offset + i
+                    if abs_i < len(vals):
+                        v = vals[abs_i]
+                        try:
+                            frame_labels.append(f"{label_col}={float(v):.4g}")
+                        except (ValueError, TypeError):
+                            frame_labels.append(f"{label_col}={v}")
+                    else:
+                        frame_labels.append(f"frame {abs_i}")
+        if not frame_labels:
+            frame_labels = [f"frame {frame_offset + i}" for i in range(len(frames))]
 
     # Per-frame display arrays + global data range
     displays = []
@@ -1860,7 +2110,7 @@ def _build_multiview_grid(frames, field):
             continue
         displays.append(np.where(np.isfinite(a), a, 0).astype(np.float32))
     if not displays:
-        w_mv_grid.object = None
+        w_mv_grid.objects = []
         w_mv_status.object = "*No renderable frames (all degenerate or empty).*"
         return
     data_lo, data_hi = _mv_compute_data_range(displays)
@@ -1900,7 +2150,11 @@ def _build_multiview_grid(frames, field):
         clip_lo = float(mapper.low)
         displays = [np.where(d > 0, d, clip_lo) for d in displays]
 
-    rows, cols = _mv_grid_dims(len(displays))
+    if ncols is not None and ncols > 0:
+        cols = int(ncols)
+        rows = int(np.ceil(len(displays) / cols))
+    else:
+        rows, cols = _mv_grid_dims(len(displays))
     figs = []
     renderers = []
     shared_x = None
@@ -1962,7 +2216,7 @@ def _build_multiview_grid(frames, field):
 
     grid = gridplot(grid_cells, sizing_mode="stretch_both",
                     toolbar_location="above", merge_tools=True)
-    w_mv_grid.object = grid
+    w_mv_grid.objects = [grid]
     _multiview_cache["renderers"] = renderers
     _multiview_cache["mapper"] = mapper
     _multiview_cache["log"] = use_log
@@ -1985,7 +2239,25 @@ def _load_multiview():
 
     if not info or not info["images"]:
         w_mv_status.object = "*No image fields found.*"
-        w_mv_grid.object = None
+        w_mv_grid.objects = []
+        return
+
+    # Multi-scan: defer to the dedicated loader once the field selector is
+    # populated from the primary scan's info (so the user can pick the
+    # detector that's common across selected scans).
+    if len(_selected_uids()) > 1:
+        image_fields = list(info["images"])
+        _multiview_cache["loading"] = True
+        try:
+            if list(w_mv_field.options) != image_fields:
+                w_mv_field.options = image_fields
+            prev = w_mv_field.value
+            field = prev if prev in image_fields else image_fields[0]
+            if w_mv_field.value != field:
+                w_mv_field.value = field
+        finally:
+            _multiview_cache["loading"] = False
+        _fetch_and_build_multiview_multi(field)
         return
 
     # Ensure primary scalars are loaded so the label dropdown has options
@@ -2021,6 +2293,373 @@ def _load_multiview():
     _fetch_and_build_multiview(field)
 
 
+def _render_multiview_multi_gridbox(frames: list[np.ndarray],
+                                    labels: list[str] | None,
+                                    field: str,
+                                    ncols: int | None = None,
+                                    preserve_range: bool = False) -> None:
+    """Build a Panel GridBox of one Bokeh figure per frame.
+
+    Shared renderer for both the single-scan and multi-scan paths.  Each
+    tile is an independent ``pn.pane.Bokeh`` so image data isn't lost in
+    the gridplot serialization round-trip.  Same-shape figures share
+    ``x_range`` / ``y_range`` so pan & zoom are linked.
+    """
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
+    )
+    from smi_browser.figures.multiview import grid_dims
+
+    if not frames:
+        w_mv_grid.objects = []
+        return
+
+    # Default labels: build the same "frame N" / "{col}={val}" labels the
+    # original single-scan renderer produced when no labels were given.
+    if labels is None:
+        labels = _mv_default_labels(len(frames))
+
+    # Preserve RGB frames untouched; otherwise normalise to a finite scalar
+    # display array (the path the single-scan renderer always used).
+    displays: list[np.ndarray] = []
+    is_rgb_list: list[bool] = []
+    keep_labels: list[str] = []
+    for a, lbl in zip(frames, labels):
+        a = np.asarray(a)
+        if _is_rgb_frame(a):
+            displays.append(a)
+            is_rgb_list.append(True)
+            keep_labels.append(lbl)
+            continue
+        if a.ndim > 2:
+            a = np.squeeze(a)
+            while a.ndim > 2:
+                a = a[0]
+        if a.ndim < 2:
+            continue
+        displays.append(np.where(np.isfinite(a), a, 0).astype(np.float32))
+        is_rgb_list.append(False)
+        keep_labels.append(lbl)
+
+    if not displays:
+        w_mv_grid.objects = []
+        w_mv_status.object = "*No renderable frames.*"
+        return
+
+    # Compute scalar data range from non-RGB frames only — the colour mapper
+    # doesn't apply to RGB tiles.
+    scalar_displays = [d for d, rgb in zip(displays, is_rgb_list) if not rgb]
+    data_lo, data_hi = (_mv_compute_data_range(scalar_displays)
+                        if scalar_displays else (1.0, 100.0))
+    _multiview_cache["data_lo"] = data_lo
+    _multiview_cache["data_hi"] = data_hi
+
+    if not preserve_range:
+        # First-time render: reset the slider bounds + value so the user
+        # sees a sensible default range matching the data's percentiles.
+        # Bounds are widened well beyond the percentile range so the
+        # slider can traverse the full histogram (including outliers).
+        if scalar_displays:
+            all_finite = np.concatenate([
+                d[np.isfinite(d) & (d > 0)].ravel()
+                for d in scalar_displays
+            ]) if scalar_displays else np.array([])
+            if all_finite.size:
+                full_lo = max(float(np.min(all_finite)), 1e-12)
+                full_hi = max(float(np.max(all_finite)), full_lo * 10)
+            else:
+                full_lo, full_hi = data_lo, data_hi
+        else:
+            full_lo, full_hi = data_lo, data_hi
+        log10_lo = float(np.log10(max(data_lo, 1e-9)))
+        log10_hi = float(np.log10(max(data_hi, data_lo * 10)))
+        log10_full_lo = float(np.log10(full_lo))
+        log10_full_hi = float(np.log10(full_hi))
+        _multiview_cache["suspend_range_cb"] = True
+        try:
+            w_mv_range.start = log10_full_lo
+            w_mv_range.end = log10_full_hi
+            w_mv_range.value = (log10_lo, log10_hi)
+        finally:
+            _multiview_cache["suspend_range_cb"] = False
+
+    lo_val = 10 ** w_mv_range.value[0]
+    hi_val = 10 ** w_mv_range.value[1]
+    palette = w_mv_cmap.value
+    use_log = bool(w_mv_log.value)
+    if use_log:
+        mapper = LogColorMapper(palette=palette,
+                                low=max(lo_val, 1e-9),
+                                high=max(hi_val, lo_val * 1.1),
+                                nan_color="gray")
+        clip_lo = float(mapper.low)
+        displays = [
+            d if rgb else np.where(d > 0, d, clip_lo)
+            for d, rgb in zip(displays, is_rgb_list)
+        ]
+    else:
+        mapper = LinearColorMapper(palette=palette, low=lo_val, high=hi_val,
+                                   nan_color="gray")
+
+    if ncols is None or ncols <= 0:
+        _r, ncols = grid_dims(len(displays))
+
+    # Aspect template: explicit width/height set the figure's intrinsic
+    # aspect ratio; sizing_mode="scale_both" then scales to fill its cell
+    # in the GridBox while preserving that aspect.  The base width grows
+    # for low column counts so 2-tile layouts don't look tiny.
+    base_w = max(320, int(1600 / max(1, ncols)))
+
+    # Reuse axis range objects across re-renders so the user's pan/zoom is
+    # preserved when the colour scale changes.  Keyed by shape so mixed-
+    # shape selections still get correct natural ranges.
+    saved_ranges: dict[tuple[int, int], tuple] = (
+        _multiview_cache.get("axis_ranges") or {}
+    ) if preserve_range else {}
+
+    panes = []
+    renderers = []
+    new_ranges: dict[tuple[int, int], tuple] = {}
+    n = len(displays)
+    # Attach the colorbar to the last scalar tile so the legend is visible
+    # without duplicating it.
+    last_scalar_idx = -1
+    for j in range(n - 1, -1, -1):
+        if not is_rgb_list[j]:
+            last_scalar_idx = j
+            break
+    for i, (disp, label, is_rgb) in enumerate(
+        zip(displays, keep_labels, is_rgb_list)
+    ):
+        h, w = disp.shape[:2]
+        tile_h = max(220, int(base_w * h / max(1, w)))
+        shape_key = (h, w)
+        # Prefer a remembered range (same shape from a previous render)
+        # over the natural full-image range — this is what preserves zoom.
+        if shape_key in new_ranges:
+            xr, yr = new_ranges[shape_key]
+        elif shape_key in saved_ranges:
+            xr, yr = saved_ranges[shape_key]
+        else:
+            xr, yr = (0, w), (0, h)
+        p = bk_figure(
+            title=label,
+            width=base_w, height=tile_h,
+            sizing_mode="scale_both",
+            x_range=xr, y_range=yr,
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+            match_aspect=True,
+            toolbar_location="above",
+        )
+        if shape_key not in new_ranges:
+            new_ranges[shape_key] = (p.x_range, p.y_range)
+        if is_rgb:
+            packed = _pack_rgb_to_rgba_uint32(disp)
+            src = ColumnDataSource(data=dict(image=[packed], x=[0], y=[0],
+                                             dw=[w], dh=[h]))
+            r = p.image_rgba(image="image", x="x", y="y", dw="dw", dh="dh",
+                             source=src)
+        else:
+            src = ColumnDataSource(data=dict(image=[disp], x=[0], y=[0],
+                                             dw=[w], dh=[h]))
+            r = p.image(image="image", x="x", y="y", dw="dw", dh="dh",
+                        color_mapper=mapper, source=src)
+            if i == last_scalar_idx:
+                p.add_layout(
+                    ColorBar(color_mapper=mapper, label_standoff=6, width=10),
+                    "right",
+                )
+        p.xaxis.visible = False
+        p.yaxis.visible = False
+        p.title.text_font_size = "9pt"
+        panes.append(pn.pane.Bokeh(p, sizing_mode="stretch_both"))
+        renderers.append(r)
+
+    grid = pn.GridBox(*panes, ncols=ncols, sizing_mode="stretch_both")
+    w_mv_grid.objects = [grid]
+    _multiview_cache["renderers"] = renderers
+    _multiview_cache["mapper"] = mapper
+    _multiview_cache["log"] = use_log
+    _multiview_cache["field"] = field
+    # Cache enough state to allow a quick re-render when the colour scale
+    # changes (intensity slider, colormap, log toggle).  pn.GridBox of
+    # independent panes doesn't propagate model mutations to the figures,
+    # so we have to rebuild from scratch — preserving the axis ranges so
+    # the user's pan/zoom carries over.
+    _multiview_cache["render_frames"] = list(frames)
+    _multiview_cache["render_labels"] = labels
+    _multiview_cache["render_ncols"] = ncols
+    _multiview_cache["axis_ranges"] = new_ranges
+
+
+def _mv_default_labels(n: int) -> list[str]:
+    """Build per-frame labels from the active label-column selector and the
+    current page offset.  Falls back to ``"frame {i}"`` when no label
+    column is chosen."""
+    frame_offset = _multiview_cache.get("page", 0) * MV_MAX_FRAMES
+    label_col = w_mv_label.value
+    if label_col and label_col != "(frame #)":
+        df = w_primary_table.value
+        if df is not None and label_col in df.columns:
+            vals = df[label_col].values
+            labels = []
+            for i in range(n):
+                abs_i = frame_offset + i
+                if abs_i < len(vals):
+                    v = vals[abs_i]
+                    try:
+                        labels.append(f"{label_col}={float(v):.4g}")
+                    except (ValueError, TypeError):
+                        labels.append(f"{label_col}={v}")
+                else:
+                    labels.append(f"frame {abs_i}")
+            return labels
+    return [f"frame {frame_offset + i}" for i in range(n)]
+
+
+def _fetch_and_build_multiview_multi(field: str) -> None:
+    """Multi-scan grid: one row per selected scan, frames as columns.
+
+    Frame count is capped at ``MV_MAX_FRAMES`` total across all scans;
+    when scans differ in frame count, shorter rows are padded with blanks
+    so each scan's frames stay aligned in a column.
+    """
+    uids = _selected_uids()
+    if len(uids) < 2 or not field:
+        return
+
+    w_mv_spinner.value = True
+    w_mv_spinner.visible = True
+    w_mv_status.object = f"*Loading multi-scan grid for `{field}`…*"
+    t0 = time.perf_counter()
+
+    # Resolve per-scan run nodes + frame counts.
+    runs: dict[str, Any] = {}
+    n_per_scan: dict[str, int] = {}
+    for uid in uids:
+        try:
+            run = _get_cat()[uid]
+        except Exception:
+            log.exception("multiview-multi: cannot resolve %s", uid[:8])
+            runs[uid] = None
+            n_per_scan[uid] = 0
+            continue
+        runs[uid] = run
+        try:
+            info = tb.stream_info_for(run, "primary")
+            shape = info["fields"].get(field, ())
+            n_per_scan[uid] = shape[0] if len(shape) >= 3 else 1
+        except Exception:
+            n_per_scan[uid] = 0
+
+    if not any(n_per_scan.values()):
+        w_mv_spinner.value = False
+        w_mv_spinner.visible = False
+        w_mv_status.object = (
+            f"*No frames of `{field}` available in the selected scans.*"
+        )
+        w_mv_grid.objects = []
+        return
+
+    n_scans = len(uids)
+    # Per-scan budget: split MV_MAX_FRAMES evenly so we never exceed the cap.
+    per_scan_budget = max(1, MV_MAX_FRAMES // n_scans)
+    max_n_any = max(n_per_scan.values())
+    cols = min(per_scan_budget, max_n_any)
+    truncated = any(n_per_scan[u] > cols for u in uids)
+
+    # Fetch each scan's frames; pad shorter scans with None so the grid
+    # stays rectangular.
+    flat_frames: list[np.ndarray | None] = []
+    flat_labels: list[str] = []
+    for uid in uids:
+        run = runs.get(uid)
+        n = min(cols, n_per_scan.get(uid, 0))
+        scan_label = _scan_label(uid)
+        for i in range(cols):
+            if run is None or i >= n:
+                flat_frames.append(None)
+                flat_labels.append(f"{scan_label} · (no frame {i})")
+                continue
+            try:
+                arr = get_or_fetch_image_frame(
+                    uid, field, i,
+                    lambda r=run: tb.fetch_all_frames(r, "primary", field),
+                )
+            except Exception:
+                log.exception("multiview-multi: fetch failed %s [%d]",
+                              uid[:8], i)
+                arr = None
+            if arr is not None:
+                arr = _coerce_to_2d_frame(arr)
+                if arr is not None:
+                    arr = _orient_frame(arr, field)
+            flat_frames.append(arr)
+            flat_labels.append(f"{scan_label} · frame {i}")
+
+    valid_frames = [f for f in flat_frames if f is not None]
+    if not valid_frames:
+        w_mv_spinner.value = False
+        w_mv_spinner.visible = False
+        w_mv_status.object = "*No renderable frames in the selected scans.*"
+        w_mv_grid.objects = []
+        return
+
+    # _build_multiview_grid skips None frames silently — but to keep one row
+    # per scan we need rectangular shape, so substitute zero arrays for the
+    # missing slots using the first valid frame's shape.
+    sample_shape = valid_frames[0].shape
+    padded_frames: list[np.ndarray] = []
+    padded_labels: list[str] = []
+    for arr, label in zip(flat_frames, flat_labels):
+        if arr is None:
+            padded_frames.append(np.zeros(sample_shape, dtype=np.float32))
+        else:
+            padded_frames.append(arr)
+        padded_labels.append(label)
+
+    _multiview_cache["frames"] = padded_frames
+    _multiview_cache["n_frames"] = len(padded_frames)
+    _multiview_cache["total_frames"] = sum(n_per_scan.values())
+    _multiview_cache["page"] = 0
+    _multiview_cache["uid"] = None  # multi mode
+    _multiview_cache["multi_uids"] = list(uids)
+
+    # Pagination buttons aren't meaningful here.
+    w_mv_prev.disabled = True
+    w_mv_next.disabled = True
+    if truncated:
+        w_mv_page_status.object = (
+            f"⚠ Showing first {cols} of up to {max_n_any} frames per scan "
+            f"(cap: {MV_MAX_FRAMES} frames total)"
+        )
+    else:
+        w_mv_page_status.object = ""
+
+    try:
+        # Use a Panel GridBox of individual Bokeh figures rather than
+        # bokeh.gridplot here — the multi-grid render path needs each tile
+        # to be an independent pane.  This bypasses the gridplot-related
+        # image-rendering issues seen in earlier attempts.
+        _render_multiview_multi_gridbox(padded_frames, padded_labels,
+                                        field, ncols=cols)
+    except Exception as exc:
+        log.exception("multiview-multi: grid build failed")
+        w_mv_grid.objects = []
+        w_mv_status.object = f"**Grid build error:** `{exc}`"
+    else:
+        dt_ms = (time.perf_counter() - t0) * 1000
+        w_mv_status.object = (
+            f"**primary/{field}** — {n_scans} scans × {cols} frames "
+            f"({dt_ms:.0f} ms)"
+        )
+    finally:
+        w_mv_spinner.value = False
+        w_mv_spinner.visible = False
+
+
 def _fetch_and_build_multiview(field: str, *, page: int = 0):
     """Fetch a page of frames for `field` and (re)build the grid."""
     run = _ensure_run()
@@ -2047,7 +2686,7 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
     t0 = time.perf_counter()
     ds = _detail_cache.get("primary_dataset")
     frames = []
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     for i in range(start, end):
         if uid:
             arr = get_or_fetch_image_frame(
@@ -2064,7 +2703,7 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
     _multiview_cache["n_frames"] = len(frames)
     _multiview_cache["total_frames"] = total_frames
     _multiview_cache["page"] = page
-    _multiview_cache["uid"] = _state.get("selected_uid")
+    _multiview_cache["uid"] = _selected_uid()
 
     # Diagnostic: log shape & data statistics for debugging blank grids
     if frames:
@@ -2087,10 +2726,10 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
         w_mv_page_status.object = ""
 
     try:
-        _build_multiview_grid(frames, field)
+        _render_multiview_multi_gridbox(frames, None, field)
     except Exception as exc:
         log.exception("multiview grid build failed")
-        w_mv_grid.object = None
+        w_mv_grid.objects = []
         w_mv_spinner.value = False
         w_mv_spinner.visible = False
         w_mv_status.object = f"**Grid build error:** `{exc}`"
@@ -2109,44 +2748,49 @@ def _on_mv_field(event):
     field = event.new
     if not field:
         return
-    _fetch_and_build_multiview(field)
+    if len(_selected_uids()) > 1:
+        _fetch_and_build_multiview_multi(field)
+    else:
+        _fetch_and_build_multiview(field)
+
+
+def _mv_rerender_from_cache() -> bool:
+    """Re-render the Grid tab from the cached render state.
+
+    ``pn.GridBox`` of independent ``pn.pane.Bokeh`` panes doesn't propagate
+    mapper / palette mutations to the rendered figures, so we rebuild
+    from the cached frames whenever a colour-scale widget changes.  No-op
+    (returns False) if no grid has been rendered yet.
+    """
+    frames = _multiview_cache.get("render_frames")
+    field = _multiview_cache.get("field")
+    if not frames or not field:
+        return False
+    labels = _multiview_cache.get("render_labels")
+    ncols = _multiview_cache.get("render_ncols")
+    # Preserve the user's current slider value during these re-renders —
+    # otherwise dragging the intensity slider would snap back to data
+    # defaults every frame.
+    _render_multiview_multi_gridbox(frames, labels, field, ncols=ncols,
+                                    preserve_range=True)
+    return True
 
 
 def _on_mv_cmap(event):
-    mapper = _multiview_cache.get("mapper")
-    if mapper is None:
-        return
-    try:
-        mapper.palette = event.new
-    except Exception as exc:
-        log.warning("multiview palette update failed: %s", exc)
+    _mv_rerender_from_cache()
 
 
 def _on_mv_log(event):
-    # Switching between Linear / Log mapper requires a rebuild
-    field = _multiview_cache.get("field")
-    frames = _multiview_cache.get("frames")
-    if not field or not frames:
-        return
-    _build_multiview_grid(frames, field)
+    _mv_rerender_from_cache()
 
 
 def _on_mv_range(event):
     if _multiview_cache.get("suspend_range_cb"):
         return
-    mapper = _multiview_cache.get("mapper")
-    if mapper is None:
-        return
-    lo, hi = event.new
-    lo_v = 10 ** float(lo)
-    hi_v = 10 ** float(hi)
-    if hi_v <= lo_v:
-        hi_v = lo_v * 1.0001
-    try:
-        mapper.low = max(lo_v, 1e-9) if isinstance(mapper.low, (int, float)) else lo_v
-        mapper.high = hi_v
-    except Exception as exc:
-        log.warning("multiview range update failed: %s", exc)
+    # Rebuild so every tile picks up the new mapper bounds (mapper mutation
+    # alone doesn't propagate to figures inside a GridBox of independent
+    # panes).
+    _mv_rerender_from_cache()
 
 
 w_mv_field.param.watch(_on_mv_field, "value")
@@ -2162,7 +2806,7 @@ def _on_mv_label(event):
     field = _multiview_cache.get("field")
     frames = _multiview_cache.get("frames")
     if field and frames:
-        _build_multiview_grid(frames, field)
+        _render_multiview_multi_gridbox(frames, None, field)
 
 
 w_mv_label.param.watch(_on_mv_label, "value")
@@ -2193,9 +2837,17 @@ w_mv_next.on_click(_on_mv_next)
 # Mask-overlay callbacks (Explore tab)
 # ---------------------------------------------------------------------------
 
-def _current_detector_kind() -> str:
+def _current_detector_kind() -> str | None:
+    """Return ``"saxs"`` / ``"waxs"`` for the active image field, else None.
+
+    Non-scattering image fields (visual cameras, monitors, etc.) get
+    classified as ``None`` rather than silently defaulting to SAXS — the
+    SAXS default mask would otherwise be auto-loaded over a camera frame.
+    """
     field = w_image_field.value
-    return _detector_for_field(field) or "saxs" if field else "saxs"
+    if not field:
+        return None
+    return _detector_for_field(field)
 
 
 def _apply_mask_to_overlay(mask_dict: dict, *, source_label: str = ""):
@@ -2369,6 +3021,12 @@ def _on_mask_edit(event):
 def _on_mask_reload(_event):
     """Reload the bundled PyHyper default mask for the current detector."""
     detector = _current_detector_kind()
+    if detector is None:
+        # Non-scattering detector (camera/monitor) — no mask applies.
+        w_mask_status.object = (
+            "*Mask overlay applies only to SAXS / WAXS detectors.*"
+        )
+        return
     path = _default_mask_path_for(detector)
     try:
         mask = smid.load_mask_polygons(path)
@@ -3001,10 +3659,11 @@ w_gi_grid_row.visible = False
 w_card_gi.visible = False
 
 w_btn_process = pn.widgets.Button(
-    name="⚙ Process", button_type="success", width=110,
+    name="⚙ Process", button_type="success", width_policy="fit",
 )
 w_btn_add_collection = pn.widgets.Button(
-    name="+ Add to Collection", button_type="primary", width=150, disabled=True,
+    name="+ Add to Collection", button_type="primary", width_policy="fit",
+    disabled=True,
 )
 w_proc_status = pn.pane.Markdown("*Select a scan and click Process.*")
 w_proc_spinner = pn.indicators.LoadingSpinner(value=False, size=40, visible=False)
@@ -3584,6 +4243,10 @@ _coll_ns = _coll_mod.wire(_collection, plot_style_widget=w_plot_style)
 
 w_coll_table = _coll_ns.coll_table
 w_btn_coll_remove = _coll_ns.btn_remove
+w_btn_coll_pin = _coll_ns.btn_pin
+w_btn_coll_unpin = _coll_ns.btn_unpin
+w_btn_coll_clear_unpinned = _coll_ns.btn_clear_unpinned
+w_coll_pinned_only = _coll_ns.pinned_only
 w_coll_label = _coll_ns.label_select
 w_coll_compare_plot = _coll_ns.compare_plot
 
@@ -3882,7 +4545,7 @@ def _build_proc_iq_plot():
 
     iq = result.merged_iq
     mode = w_proc_iq_mode.value
-    uid = _state.get("selected_uid") or ""
+    uid = _selected_uid() or ""
 
     if mode == "per-frame" and hasattr(result, "per_frame_iq") and result.per_frame_iq is not None:
         # Per-frame I(q) from PyHyper (preferred path)
@@ -4191,7 +4854,8 @@ def _on_reset(_event=None):
     _cancel.set()  # abort any in-flight queries immediately
     _filter_rows.clear()
     _add_filter()  # start with one empty row
-    _state.update(unified_filters=[], page=0, total=0, selected_uid=None)
+    _state.update(unified_filters=[], page=0, total=0)
+    _set_selected_uids(None)
     w_table.value = _EMPTY_DF.copy()
     w_status.object = "*Ready*"
     _refresh_pagination()
@@ -4236,7 +4900,7 @@ def _reset_detail(preserve_figure=False):
     # Don't clear image_field options — preserve detector selection
     w_explore_plot.object = None
     # Grid (multi-view) tab — drop the figure so a new scan rebuilds fresh
-    w_mv_grid.object = None
+    w_mv_grid.objects = []
     w_mv_status.object = "*Click tab to load.*"
     _multiview_cache.update(
         uid=None, field=None, n_frames=0, total_frames=0, page=0,
@@ -4268,7 +4932,7 @@ def _reset_detail(preserve_figure=False):
 
 
 def _ensure_run():
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if not uid:
         return None
     if _detail_cache["uid"] == uid and _detail_cache["run"] is not None:
@@ -4282,6 +4946,137 @@ def _ensure_run():
     return run
 
 
+def _sanitize_meta(obj, _key=None):
+    """Recursively coerce a metadata blob to JSON-serialisable values.
+
+    Epoch timestamps under a key literally called ``"time"`` are formatted as
+    human-readable date strings; everything that ``json.dumps`` can't handle
+    falls back to ``str(...)``.
+    """
+    import json as _json
+
+    if isinstance(obj, dict):
+        return {k: _sanitize_meta(v, _key=k) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_meta(v) for v in obj]
+    if _key == "time" and isinstance(obj, (int, float)) and 1e9 < obj < 2e10:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(obj).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def _fetch_meta_for(uid: str) -> dict:
+    """Fetch and sanitise a scan's raw tiled metadata.  Returns {} on error."""
+    if not uid:
+        return {}
+    try:
+        run = _get_cat()[uid]
+    except Exception:
+        log.exception("metadata fetch failed for %s", uid[:8] if uid else "?")
+        return {}
+    try:
+        return _sanitize_meta(dict(run.metadata))
+    except Exception:
+        log.exception("metadata sanitize failed for %s", uid[:8] if uid else "?")
+        return {}
+
+
+def _render_meta_layout() -> None:
+    """Populate ``w_meta_container`` with single or side-by-side metadata view.
+
+    Drives off ``_selected_uids()``.  For N>1, builds a row of JSON panes
+    (one per scan) plus a Diff sub-tab showing only the keys that vary.
+    """
+    from smi_browser.models.summary import (
+        varying_keys as _varying_keys,
+        reconstruct_nested as _reconstruct_nested,
+    )
+
+    uids = _selected_uids()
+    if not uids:
+        w_meta_container.objects = [
+            pn.pane.Markdown("*Select a scan.*", margin=(5, 5)),
+        ]
+        return
+
+    if len(uids) == 1:
+        # Single-scan path: w_meta_json has already been populated by
+        # _load_metadata; just put it in the container.
+        w_meta_container.objects = [w_meta_json]
+        return
+
+    # Multi-scan: fetch the others (primary is already in w_meta_json.object).
+    primary_meta = w_meta_json.object or {}
+    secondary_metas = [_fetch_meta_for(u) for u in uids[1:]]
+    all_metas = [primary_meta, *secondary_metas]
+
+    # Force long string values (paths, long metadata blobs) to wrap inside
+    # their column rather than pushing the side-by-side row out horizontally.
+    json_wrap_css = """
+    :host {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+    }
+    :host pre, :host code, :host span, :host div {
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+        max-width: 100%;
+    }
+    """
+
+    # Share row width evenly across columns; below ~280px per column the
+    # JSON tree gets unreadable, so add a horizontal scroll fallback at that
+    # point rather than crushing further.
+    col_width = max(280, int(1200 / max(1, len(uids))))
+
+    def _pane_column(uid: str, meta: dict, depth: int = 3) -> pn.Column:
+        # Show scan_id prominently — it's the human-memorable identifier;
+        # uid_short is the unambiguous tiebreaker shown in parentheses.
+        sid = _scan_id_for(uid, meta)
+        header = (
+            f"**scan {sid}**  ·  `{uid[:8]}`" if sid else f"**`{uid[:8]}`**"
+        )
+        title = pn.pane.Markdown(header, margin=(0, 5))
+        pane = pn.pane.JSON(
+            object=meta, depth=depth, theme="light",
+            sizing_mode="stretch_both", margin=(5, 5),
+            stylesheets=[json_wrap_css],
+        )
+        return pn.Column(title, pane, width=col_width, sizing_mode="stretch_height")
+
+    side_by_side = pn.Row(
+        *[_pane_column(u, m) for u, m in zip(uids, all_metas)],
+        sizing_mode="stretch_height", scroll=True,
+    )
+
+    diff = _varying_keys(all_metas)
+    if diff:
+        filtered_metas = _reconstruct_nested(diff, len(uids))
+        diff_view = pn.Row(
+            *[_pane_column(u, m, depth=6)
+              for u, m in zip(uids, filtered_metas)],
+            sizing_mode="stretch_both", scroll=True,
+        )
+    else:
+        diff_view = pn.pane.Markdown(
+            "*No differing fields detected across these scans.*",
+            margin=(10, 5),
+        )
+
+    w_meta_container.objects = [
+        pn.Tabs(
+            ("Side-by-side", side_by_side),
+            (f"Differing only ({len(diff)})", diff_view),
+            sizing_mode="stretch_both",
+        ),
+    ]
+
+
 def _load_metadata(uid):
     t0 = time.perf_counter()
     run = _ensure_run()
@@ -4290,32 +5085,17 @@ def _load_metadata(uid):
 
     # Show full raw metadata as collapsible JSON
     raw_md = dict(run.metadata)
-    # Convert non-serialisable values to strings
-    import json as _json
-
-    def _sanitize(obj, _key=None):
-        if isinstance(obj, dict):
-            return {k: _sanitize(v, _key=k) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [_sanitize(v) for v in obj]
-        # Convert epoch timestamps to human-readable
-        if _key == "time" and isinstance(obj, (int, float)) and 1e9 < obj < 2e10:
-            import datetime as _dt
-            return _dt.datetime.fromtimestamp(obj).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            _json.dumps(obj)
-            return obj
-        except (TypeError, ValueError):
-            return str(obj)
-
-    w_meta_json.object = _sanitize(raw_md)
+    w_meta_json.object = _sanitize_meta(raw_md)
+    _render_meta_layout()
 
     sid = summary.get("scan_id", "?")
     sample = summary.get("sample_name", "?")
     det = summary.get("detectors", "?")
     dt_ms = (time.perf_counter() - t0) * 1000
+    n_sel = len(_selected_uids())
+    extra = f"  ·  **+{n_sel - 1} more selected**" if n_sel > 1 else ""
     w_detail_title.object = (
-        f"### {sid} — {sample} [{det}] ({dt_ms:.0f} ms)"
+        f"### {sid} — {sample} [{det}] ({dt_ms:.0f} ms){extra}"
     )
 
 
@@ -4336,7 +5116,7 @@ def _load_primary():
     # Single read: get dataset, extract scalars from it
     info = tb.stream_info_for(run, "primary")
     ds = info.get("dataset")
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if uid:
         scalar_data = get_or_fetch_scalars(
             uid, "primary",
@@ -4385,29 +5165,29 @@ def _load_primary():
     _refresh_export_resolved_path()
 
 
-def _load_baseline():
-    if _detail_cache["baseline_loaded"]:
-        return
-    run = _ensure_run()
-    if run is None:
-        return
-    t0 = time.perf_counter()
-    w_baseline_status.object = "*Loading…*"
+def _fetch_baseline_rows_for(uid: str, run=None) -> list[dict]:
+    """Return ``[{source, field, before, after}, ...]`` for one scan.
 
-    rows = []
+    ``run`` may be passed in for the primary uid (we already have the node);
+    for other uids it's fetched from the catalog.  Both baseline-stream
+    scalars and primary-stream configuration snapshots are included.
+    """
+    rows: list[dict] = []
+    if not uid:
+        return rows
+    if run is None:
+        try:
+            run = _get_cat()[uid]
+        except Exception:
+            log.exception("baseline fetch: cannot resolve run %s", uid[:8])
+            return rows
 
     try:
-        # --- Baseline stream scalars ---
-        has_baseline = "baseline" in tb.stream_names(run)
-        if has_baseline:
-            uid = _state.get("selected_uid")
-            if uid:
-                scalar_data = get_or_fetch_scalars(
-                    uid, "baseline",
-                    lambda: tb.fetch_scalars(run, "baseline"),
-                )
-            else:
-                scalar_data = tb.fetch_scalars(run, "baseline")
+        if "baseline" in tb.stream_names(run):
+            scalar_data = get_or_fetch_scalars(
+                uid, "baseline",
+                lambda: tb.fetch_scalars(run, "baseline"),
+            )
             for key, arr in sorted(scalar_data.items()):
                 arr = np.asarray(arr).flatten()
                 if arr.size >= 2:
@@ -4420,36 +5200,429 @@ def _load_baseline():
                     rows.append({"source": "baseline", "field": key,
                                  "before": str(arr.tolist()), "after": ""})
 
-        # --- Primary stream configuration data ---
         try:
             config_data = tb.fetch_primary_config(run)
             for key, val in sorted(config_data.items()):
                 rows.append({"source": "config", "field": key,
                              "before": str(val), "after": ""})
         except Exception as exc:
-            log.warning("Config fetch failed: %s", exc)
+            log.warning("Config fetch failed for %s: %s", uid[:8], exc)
+    except Exception:
+        log.exception("Baseline/config load failed for %s", uid[:8])
 
-    except Exception as exc:
-        log.exception("Baseline/config load failed")
-        w_baseline_status.object = f"**Error:** `{exc}`"
+    return rows
+
+
+def _baseline_diff_only_visible() -> bool:
+    try:
+        return bool(w_baseline_diff_only.value)
+    except Exception:
+        return False
+
+
+def _load_baseline():
+    # Cache key: the full selection list.  If it matches the last build we
+    # can skip the fetch loop entirely.
+    cached_uids = _detail_cache.get("baseline_uids")
+    if _detail_cache.get("baseline_loaded") and cached_uids == _selected_uids():
+        # Already up to date; just re-apply the diff-only filter in case the
+        # toggle moved while we weren't watching.
+        _apply_baseline_filter()
+        return
+    run = _ensure_run()
+    if run is None:
+        return
+    t0 = time.perf_counter()
+    w_baseline_status.object = "*Loading…*"
+
+    uids = _selected_uids()
+    if not uids:
+        w_baseline_table.value = pd.DataFrame(
+            columns=["source", "field", "before", "after"],
+        )
         _detail_cache["baseline_loaded"] = True
+        _detail_cache["baseline_uids"] = []
+        _detail_cache["baseline_full_df"] = None
         return
 
-    df = pd.DataFrame(rows, columns=["source", "field", "before", "after"])
+    # Build a {uid: rows_list} mapping.  Primary uses the already-resolved
+    # run; secondaries are fetched on demand (hits the disk cache when warm).
+    per_scan: dict[str, list[dict]] = {}
+    per_scan[uids[0]] = _fetch_baseline_rows_for(uids[0], run=run)
+    for uid in uids[1:]:
+        per_scan[uid] = _fetch_baseline_rows_for(uid)
+
+    multi = len(uids) > 1
+
+    if not multi:
+        # Single-scan path: 4-column wide table identical to the pre-multi UI
+        # so users who never multi-select see the familiar layout.
+        df = pd.DataFrame(
+            per_scan[uids[0]] or [],
+            columns=["source", "field", "before", "after"],
+        )
+    else:
+        # Multi-scan path: one row per (source, field), columns expand into
+        # per-scan before/after pairs.  Layout:
+        #     source | field | <label1>_before | <label1>_after | ...
+        labels = [_scan_label(u) for u in uids]
+        # Deduplicate labels (in case two scans share a scan_id label).
+        seen: dict[str, int] = {}
+        unique_labels = []
+        for i, lab in enumerate(labels):
+            if lab in seen:
+                seen[lab] += 1
+                unique_labels.append(f"{lab} ({uids[i][:6]})")
+            else:
+                seen[lab] = 0
+                unique_labels.append(lab)
+        labels = unique_labels
+
+        all_keys: list[tuple[str, str]] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for uid in uids:
+            for r in per_scan[uid]:
+                key = (r["source"], r["field"])
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_keys.append(key)
+
+        # Indexable {uid: {(source, field): (before, after)}} for quick lookup.
+        idx: dict[str, dict[tuple[str, str], tuple[str, str]]] = {}
+        for uid, scan_rows in per_scan.items():
+            idx[uid] = {
+                (r["source"], r["field"]): (r["before"], r["after"])
+                for r in scan_rows
+            }
+
+        rows = []
+        for source, field in all_keys:
+            row: dict = {"source": source, "field": field}
+            befores = []
+            afters = []
+            for uid, label in zip(uids, labels):
+                b, a = idx[uid].get((source, field), ("", ""))
+                row[f"{label} · before"] = b
+                row[f"{label} · after"] = a
+                befores.append(b)
+                afters.append(a)
+            row["__varying__"] = (
+                len({str(v) for v in befores}) > 1
+                or len({str(v) for v in afters}) > 1
+            )
+            rows.append(row)
+
+        cols = ["source", "field"]
+        for label in labels:
+            cols.append(f"{label} · before")
+            cols.append(f"{label} · after")
+        cols.append("__varying__")
+        df = pd.DataFrame(rows, columns=cols)
+
     dt_ms = (time.perf_counter() - t0) * 1000
-    w_baseline_table.value = df
-    n_baseline = sum(1 for r in rows if r["source"] == "baseline")
-    n_config = sum(1 for r in rows if r["source"] == "config")
+
+    # Stash the full DataFrame so the diff-only toggle can filter without
+    # re-fetching.
+    _detail_cache["baseline_full_df"] = df
+    _detail_cache["baseline_loaded"] = True
+    _detail_cache["baseline_uids"] = list(uids)
+
+    n_baseline = int((df["source"] == "baseline").sum()) if "source" in df else 0
+    n_config = int((df["source"] == "config").sum()) if "source" in df else 0
     parts = []
     if n_baseline:
         parts.append(f"{n_baseline} baseline")
     if n_config:
         parts.append(f"{n_config} config")
+    if multi:
+        n_var = int(df["__varying__"].sum()) if "__varying__" in df else 0
+        parts.append(f"{n_var} differing")
     if parts:
-        w_baseline_status.object = f"**{' + '.join(parts)} fields** ({dt_ms:.0f} ms)"
+        w_baseline_status.object = (
+            f"**{' + '.join(parts)} fields** ({dt_ms:.0f} ms)"
+        )
     else:
         w_baseline_status.object = "*No baseline or config data.*"
-    _detail_cache["baseline_loaded"] = True
+
+    # Show the diff-only toggle only when multi.
+    w_baseline_diff_only.visible = multi
+    _apply_baseline_filter()
+
+
+def _apply_baseline_filter() -> None:
+    """Push the cached baseline DataFrame to the table, honouring the toggle."""
+    df = _detail_cache.get("baseline_full_df")
+    if df is None:
+        w_baseline_table.value = pd.DataFrame(
+            columns=["source", "field", "before", "after"],
+        )
+        return
+    if "__varying__" in df.columns and _baseline_diff_only_visible():
+        view = df[df["__varying__"]].drop(columns=["__varying__"])
+    elif "__varying__" in df.columns:
+        view = df.drop(columns=["__varying__"])
+    else:
+        view = df
+    w_baseline_table.value = view
+
+
+def _on_baseline_diff_toggle(*_events) -> None:
+    _apply_baseline_filter()
+
+
+w_baseline_diff_only.param.watch(_on_baseline_diff_toggle, "value")
+
+
+def _render_explore_multi_grid(field: str | None = None,
+                               frame_idx: int | None = None) -> None:
+    """Render a grid of one frame per selected scan into ``w_image_container``.
+
+    Called when the Explore tab is active and the selection has more than one
+    scan.  The mask/alignment/line-profile tooling doesn't multiplex across
+    figures, so this renderer is intentionally tooling-free; switching back
+    to a single selection restores the full single-scan UI.
+    """
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.layouts import gridplot
+    from bokeh.models import ColumnDataSource, LinearColorMapper, LogColorMapper
+
+    from smi_browser.figures.multiview import grid_dims, compute_data_range
+
+    uids = _selected_uids()
+    if len(uids) < 2:
+        return
+
+    if field is None:
+        field = _image_cache.get("field") or w_image_field.value
+    if not field:
+        w_image_container.objects = [
+            pn.pane.Markdown("*No image field selected.*", margin=(10, 5)),
+        ]
+        return
+
+    if frame_idx is None:
+        frame_idx = int(w_image_slider.value or 0)
+
+    frames: list[np.ndarray | None] = []
+    labels: list[str] = []
+    n_frames_per: list[int] = []
+    for uid in uids:
+        labels.append(_scan_label(uid))
+        try:
+            run = _get_cat()[uid]
+        except Exception:
+            log.exception("explore-grid: cannot resolve %s", uid[:8])
+            frames.append(None)
+            n_frames_per.append(0)
+            continue
+
+        # Detect frame count so we can clamp frame_idx per-scan (scans may
+        # have different lengths).
+        try:
+            info = tb.stream_info_for(run, "primary")
+            shape = info["fields"].get(field, ())
+            n_total = shape[0] if len(shape) >= 3 else 1
+        except Exception:
+            n_total = 1
+        n_frames_per.append(int(n_total))
+        idx = min(frame_idx, max(0, n_total - 1))
+
+        arr = get_or_fetch_image_frame(
+            uid, field, idx,
+            lambda r=run: tb.fetch_all_frames(r, "primary", field),
+        )
+        if arr is not None:
+            arr = _coerce_to_2d_frame(arr)
+            if arr is not None:
+                arr = _orient_frame(arr, field)
+        frames.append(arr)
+
+    valid_frames = [f for f in frames if f is not None]
+    if not valid_frames:
+        w_image_container.objects = [
+            pn.pane.Markdown(
+                f"*No frames available for `{field}` in the selected scans.*",
+                margin=(10, 5),
+            ),
+        ]
+        return
+
+    # Shared colour scale across the grid so intensities are comparable.
+    use_log = bool(w_cs_log.value)
+    palette = w_cs_cmap.value or "Turbo256"
+    try:
+        from bokeh.palettes import all_palettes
+        base = palette[:-3] if palette.endswith("256") else palette
+        palette_list = all_palettes.get(base, all_palettes["Turbo"])[256]
+    except Exception:
+        from bokeh.palettes import Turbo256
+        palette_list = Turbo256
+
+    # RGB frames don't go through the scalar mapper, so exclude them from
+    # the shared-range calculation.
+    scalar_frames = [f for f in valid_frames if not _is_rgb_frame(f)]
+    if scalar_frames:
+        data_lo, data_hi = compute_data_range(scalar_frames)
+    else:
+        data_lo, data_hi = 1.0, 100.0  # placeholder; only RGB tiles render
+
+    # If the Color Scale slider has a sensible non-default value, honour it
+    # so the user can drag without it snapping back to percentile defaults
+    # on every re-render.  Otherwise initialise the slider to the data
+    # range and use that.
+    try:
+        slider_lo, slider_hi = w_cs_range.value
+    except Exception:
+        slider_lo, slider_hi = None, None
+
+    if use_log:
+        data_log_lo = float(np.log10(max(data_lo, 1e-9)))
+        data_log_hi = float(np.log10(max(data_hi, data_lo * 10)))
+        if (slider_lo is not None and slider_hi is not None
+                and slider_hi > slider_lo
+                # ignore stale slider values from a different scan
+                and abs(slider_lo - data_log_lo) < 6
+                and abs(slider_hi - data_log_hi) < 6):
+            lo, hi = 10 ** float(slider_lo), 10 ** float(slider_hi)
+        else:
+            lo, hi = data_lo, data_hi
+            _image_cache["cs_suspend"] = True
+            try:
+                if scalar_frames:
+                    flat = np.concatenate([
+                        f[np.isfinite(f) & (f > 0)].ravel()
+                        for f in scalar_frames
+                    ])
+                    if flat.size:
+                        full_lo = max(float(np.min(flat)), 1e-12)
+                        full_hi = max(float(np.max(flat)), full_lo * 10)
+                        w_cs_range.start = float(np.log10(full_lo))
+                        w_cs_range.end = float(np.log10(full_hi))
+                w_cs_range.value = (data_log_lo, data_log_hi)
+            finally:
+                _image_cache["cs_suspend"] = False
+        lo = max(lo, 1e-9)
+        mapper = LogColorMapper(palette=palette_list, low=lo, high=hi,
+                                nan_color="gray")
+    else:
+        if (slider_lo is not None and slider_hi is not None
+                and slider_hi > slider_lo
+                and data_lo - 100 <= slider_lo <= data_hi + 100):
+            lo, hi = float(slider_lo), float(slider_hi)
+        else:
+            lo, hi = data_lo, data_hi
+        mapper = LinearColorMapper(palette=palette_list, low=lo, high=hi,
+                                   nan_color="gray")
+
+    _rows_n, cols_n = grid_dims(len(uids))
+    base_w = max(320, int(1600 / max(1, cols_n)))
+
+    # Add a ColorBar to the last scalar (non-RGB) tile.
+    last_scalar_idx = -1
+    for j in range(len(frames) - 1, -1, -1):
+        if frames[j] is not None and not _is_rgb_frame(frames[j]):
+            last_scalar_idx = j
+            break
+
+    # Reuse axis range objects across re-renders so the user's pan/zoom is
+    # preserved when the colour scale changes.
+    saved_ranges: dict[tuple[int, int], tuple] = (
+        _image_cache.get("multi_axis_ranges") or {}
+    )
+
+    panes = []
+    new_ranges: dict[tuple[int, int], tuple] = {}
+    for i, (uid, arr, label, n_total) in enumerate(
+        zip(uids, frames, labels, n_frames_per)
+    ):
+        if arr is None:
+            panes.append(pn.pane.Markdown(
+                f"**{label}** — no frame", margin=(10, 5),
+                sizing_mode="stretch_width",
+            ))
+            continue
+        is_rgb = _is_rgb_frame(arr)
+        h, w = arr.shape[:2]
+        sub_title = label
+        if n_total > 1:
+            shown = min(int(frame_idx), n_total - 1)
+            sub_title = f"{label}  ·  frame {shown}/{n_total - 1}"
+        tile_h = max(240, int(base_w * h / max(1, w)))
+        shape_key = (h, w)
+        if shape_key in new_ranges:
+            xr, yr = new_ranges[shape_key]
+        elif shape_key in saved_ranges:
+            xr, yr = saved_ranges[shape_key]
+        else:
+            xr, yr = (0, w), (0, h)
+        fig = bk_figure(
+            title=sub_title,
+            width=base_w, height=tile_h,
+            sizing_mode="scale_both",
+            x_range=xr, y_range=yr,
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+            match_aspect=True,
+            toolbar_location="above",
+        )
+        if shape_key not in new_ranges:
+            new_ranges[shape_key] = (fig.x_range, fig.y_range)
+        if is_rgb:
+            packed = _pack_rgb_to_rgba_uint32(arr)
+            src = ColumnDataSource(data=dict(image=[packed], x=[0], y=[0],
+                                             dw=[w], dh=[h]))
+            fig.image_rgba(image="image", x="x", y="y", dw="dw", dh="dh",
+                           source=src)
+        else:
+            # Finite-only display values; zero-clip when the log mapper is on
+            # (zero pixels would otherwise render transparent and the tile
+            # would look blank).
+            display = np.where(np.isfinite(arr), arr, 0).astype(np.float32)
+            if use_log:
+                display = np.where(display > 0, display, float(mapper.low))
+            src = ColumnDataSource(data=dict(image=[display], x=[0], y=[0],
+                                             dw=[w], dh=[h]))
+            fig.image(image="image", x="x", y="y", dw="dw", dh="dh",
+                      color_mapper=mapper, source=src)
+            if i == last_scalar_idx:
+                from bokeh.models import ColorBar
+                fig.add_layout(
+                    ColorBar(color_mapper=mapper, label_standoff=6, width=10),
+                    "right",
+                )
+        fig.xaxis.visible = False
+        fig.yaxis.visible = False
+        fig.title.text_font_size = "9pt"
+        panes.append(pn.pane.Bokeh(fig, sizing_mode="stretch_both"))
+
+    # Lay out with Panel's GridBox — each figure is an independent Bokeh
+    # pane.  Stretching both axes lets the grid fill the available space.
+    grid = pn.GridBox(*panes, ncols=cols_n, sizing_mode="stretch_both")
+    w_image_container.objects = [grid]
+    _image_cache["multi_axis_ranges"] = new_ranges
+
+
+def _render_explore_layout() -> None:
+    """Swap the Explore tab between single-image and multi-grid views.
+
+    Called whenever the Explore tab's content needs to reflect a change in
+    the selection list.  Single-uid → show ``w_image_thumb`` and re-enable
+    the plotting tools; multi-uid → render a grid and hide tooling that
+    only operates on one figure.
+    """
+    uids = _selected_uids()
+    if len(uids) <= 1:
+        w_image_container.objects = [w_image_thumb]
+        w_image_multi_hint.visible = False
+        return
+
+    w_image_multi_hint.object = (
+        f"**{len(uids)} scans selected** — showing one frame per scan.  "
+        "Mask overlay, alignment and line-profile tools are single-scan only "
+        "and don't apply here; reduce the selection to one scan to re-enable them."
+    )
+    w_image_multi_hint.visible = True
+    _render_explore_multi_grid()
 
 
 def _load_images():
@@ -4525,6 +5698,11 @@ def _load_images():
             if _detail_cache.get("primary_loaded"):
                 _build_explore_plot()
             _detail_cache["images_loaded"] = True
+            # If multi-select is active, swap the single image for the grid.
+            try:
+                _render_explore_layout()
+            except Exception:
+                log.exception("explore multi-layout build failed")
             return
 
     w_image_spinner.value = False
@@ -4533,28 +5711,122 @@ def _load_images():
     _detail_cache["images_loaded"] = True
 
 
+def _uids_from_selection(sel, df) -> list[str]:
+    """Map row indices into a clean, ordered list of uids."""
+    if not sel or df is None or df.empty or "uid" not in df.columns:
+        return []
+    uids: list[str] = []
+    n = len(df)
+    for idx in sel:
+        if not (0 <= idx < n):
+            continue
+        uid = df.iloc[idx].get("uid")
+        if uid and uid != "?" and uid not in uids:
+            uids.append(uid)
+    return uids
+
+
 def _on_row_select(event):
+    """Watcher on w_table.selection — keep _selected_uids in sync.
+
+    The detail tabs are driven by the PRIMARY uid (first entry).  When the
+    primary changes we reload the right-hand panel; secondary-uid changes
+    are recorded silently so later multi-aware tabs can pick them up.
+    """
     sel = w_table.selection
-    if not sel:
-        return
     df = w_table.value
-    if sel[0] >= len(df):
+    new_uids = _uids_from_selection(sel, df)
+    current = _selected_uids()
+
+    if new_uids == current:
+        return  # Identical selection — nothing to do.
+
+    prev_primary = current[0] if current else None
+    new_primary = new_uids[0] if new_uids else None
+
+    _set_selected_uids(new_uids)
+
+    if new_primary == prev_primary:
+        # Only secondary uids changed; refresh the multi-count appendix in
+        # the title and rebuild any multi-aware tab content without doing
+        # a full primary reload.
+        if new_primary is not None:
+            try:
+                _refresh_detail_title()
+            except Exception:
+                log.exception("title refresh failed")
+            try:
+                _render_meta_layout()
+            except Exception:
+                log.exception("meta layout refresh failed")
+            try:
+                _update_primary_plot()
+            except Exception:
+                log.exception("primary overlay refresh failed")
+            # Invalidate the baseline table so it picks up the new selection
+            # next time the tab is viewed (or now, if it's already active).
+            _detail_cache["baseline_loaded"] = False
+            if w_detail_tabs.active == 2:
+                try:
+                    _load_baseline()
+                except Exception:
+                    log.exception("baseline refresh failed")
+            # Explore tab: swap between single-image and multi-grid layout.
+            try:
+                _render_explore_layout()
+            except Exception:
+                log.exception("explore layout swap failed")
+            # Grid tab: rebuild if currently visible.
+            if w_detail_tabs.active == 4:
+                try:
+                    _load_multiview()
+                except Exception:
+                    log.exception("multiview refresh failed")
+            # Update the Process button label so the user sees that they're
+            # about to launch a multi-reduce.
+            try:
+                _refresh_process_button_label()
+            except Exception:
+                log.exception("process button label refresh failed")
         return
-    uid = df.iloc[sel[0]]["uid"]
-    if not uid or uid == "?":
+
+    if new_primary is None:
+        # All deselected.
+        _reset_detail()
         return
-    # Preserve current tab and reload
+
+    # Primary uid changed — reload the detail tabs as before.
     active_tab = w_detail_tabs.active
-    _state["selected_uid"] = uid
     _reset_detail(preserve_figure=True)
-    _state["selected_uid"] = uid  # re-set after _reset_detail clears it
+    _set_selected_uids(new_uids)  # _reset_detail clears it
     try:
-        _load_metadata(uid)
+        _load_metadata(new_primary)
         # Set tab (may not fire watch if same value), then force-load content
         w_detail_tabs.active = active_tab
         _load_active_tab(active_tab)
     except Exception as exc:
         w_detail_title.object = f"**Error:** `{exc}`"
+    try:
+        _refresh_process_button_label()
+    except Exception:
+        log.exception("process button label refresh failed")
+
+
+def _refresh_detail_title() -> None:
+    """Re-render the detail title for the current primary uid + selection count.
+
+    Used when the multi-selection grows/shrinks without changing the primary
+    so we don't have to reload the whole detail panel.
+    """
+    summary = _detail_cache.get("summary")
+    if not summary:
+        return
+    sid = summary.get("scan_id", "?")
+    sample = summary.get("sample_name", "?")
+    det = summary.get("detectors", "?")
+    n_sel = len(_selected_uids())
+    extra = f"  ·  **+{n_sel - 1} more selected**" if n_sel > 1 else ""
+    w_detail_title.object = f"### {sid} — {sample} [{det}]{extra}"
 
 
 def _load_active_tab(active):
@@ -4577,7 +5849,7 @@ def _load_active_tab(active):
 
 
 def _on_detail_tab(event):
-    if not _state.get("selected_uid"):
+    if not _selected_uid():
         return
     try:
         _load_active_tab(event.new)
@@ -4590,9 +5862,115 @@ def _on_detail_tab(event):
             w_mv_spinner.visible = False
 
 
+# Stable per-uid palette for multi-scan overlays.  When a scan is also in
+# the ScanCollection, use its assigned color; otherwise fall back to the
+# same palette indexed by position in the current selection.  This keeps
+# colors consistent between the Primary/Baseline/Explore overlays and the
+# Collection comparison plot.
+from smi_browser.models.collection import ScanCollection as _ScanCollection
+
+_PALETTE = _ScanCollection._PALETTE
+
+
+def _color_for_uid(uid: str, fallback_idx: int = 0) -> str:
+    coll_color = _collection.get_color(uid) if uid in _collection else None
+    if coll_color and coll_color != "#888888":
+        return coll_color
+    return _PALETTE[fallback_idx % len(_PALETTE)]
+
+
+def _scan_id_for(uid: str, meta: dict | None = None) -> str | None:
+    """Return the scan_id for ``uid`` without an extra HTTP round-trip.
+
+    Resolution order:
+      1. Already-fetched ``meta`` dict (``start.scan_id`` from
+         :func:`_fetch_meta_for`) — used by the metadata side-by-side view.
+      2. The visible search table — populated for every uid on the current
+         page; cheap and always in memory.
+      3. The detail-cache summary (only the primary uid).
+      4. ``None`` if scan_id can't be resolved.
+    """
+    if not uid:
+        return None
+    # 1. Caller-supplied raw metadata
+    if meta:
+        sid = (meta.get("start") or {}).get("scan_id")
+        if sid not in (None, "?", ""):
+            return str(sid)
+    # 2. Search table
+    try:
+        df = w_table.value
+        if df is not None and not df.empty and "uid" in df.columns:
+            matches = df.index[df["uid"] == uid].tolist()
+            if matches:
+                row = df.loc[matches[0]]
+                sid = row.get("scan_id")
+                if sid not in (None, "?", ""):
+                    return str(sid)
+    except Exception:
+        pass
+    # 3. Detail-cache summary (only the primary)
+    if uid == _selected_uid():
+        sid = (_detail_cache.get("summary") or {}).get("scan_id")
+        if sid not in (None, "?", ""):
+            return str(sid)
+    return None
+
+
+def _scan_label(uid: str, meta: dict | None = None) -> str:
+    """Human-friendly identifier for ``uid``: ``"scan 12345"`` or
+    ``"aabbccdd"`` when scan_id is unavailable.
+    """
+    sid = _scan_id_for(uid, meta)
+    return f"scan {sid}" if sid else uid[:8]
+
+
+def _get_primary_df_for(uid: str) -> pd.DataFrame | None:
+    """Return the primary scalar DataFrame for ``uid``.
+
+    For the currently-loaded primary scan we re-use the in-memory table.
+    Other selected scans are fetched via the disk-cached scalar helper.
+    Returns ``None`` if the scan has no primary stream.
+    """
+    if not uid:
+        return None
+    if uid == _selected_uid() and _detail_cache.get("primary_loaded"):
+        df = w_primary_table.value
+        return df if df is not None else None
+    try:
+        run = _get_cat()[uid]
+    except Exception:
+        log.exception("primary fetch: cannot resolve run %s", uid[:8])
+        return None
+    if "primary" not in tb.stream_names(run):
+        return None
+    try:
+        scalar_data = get_or_fetch_scalars(
+            uid, "primary",
+            lambda: tb.fetch_scalars(run, "primary"),
+        )
+    except Exception:
+        log.exception("primary fetch failed for %s", uid[:8])
+        return None
+    if not scalar_data:
+        return None
+    return _scalars_to_dataframe(scalar_data)
+
+
 def _update_primary_plot(*_events, use_table_order: bool = False):
-    """Redraw the primary scatter plot as interactive Bokeh."""
+    """Redraw the primary scatter plot — overlaid across all selected scans.
+
+    The primary (first-selected) scan's data drives the table (and the
+    optional sort-by-table-order toggle).  Additional selected scans are
+    overlaid using their collection color, falling back to the palette.
+    """
     from bokeh.plotting import figure as bk_figure
+
+    uids = _selected_uids()
+    if not uids:
+        w_primary_plot.object = None
+        w_primary_fit_result.object = ""
+        return
 
     df = w_primary_table.value
     if use_table_order:
@@ -4606,23 +5984,51 @@ def _update_primary_plot(*_events, use_table_order: bool = False):
         w_primary_plot.object = None
         w_primary_fit_result.object = ""
         return
+
     try:
-        colors = ["black", "blue", "red", "green", "orange", "purple"]
+        n_y = len(y_cols)
+        multi = len(uids) > 1
+        title_suffix = f"  ({len(uids)} scans)" if multi else ""
         p = bk_figure(
-            title=f"{x_col} vs {', '.join(y_cols)}", height=280,
+            title=f"{x_col} vs {', '.join(y_cols)}{title_suffix}", height=280,
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
             sizing_mode="stretch_width",
         )
-        x = df[x_col].values
-        for i, y_col in enumerate(y_cols):
-            y = df[y_col].values
-            c = colors[i % len(colors)]
-            p.line(x, y, line_color=c, line_width=1.2, legend_label=y_col)
-            p.scatter(x, y, color=c, size=4, legend_label=y_col)
+
+        # Single-scan fallback palette (matches the pre-multi-select look)
+        single_palette = ["black", "blue", "red", "green", "orange", "purple"]
+
+        for scan_idx, uid in enumerate(uids):
+            scan_df = df if uid == uids[0] else _get_primary_df_for(uid)
+            if scan_df is None or scan_df.empty:
+                continue
+            if x_col not in scan_df.columns:
+                continue
+            x = scan_df[x_col].values
+            uid_color = _color_for_uid(uid, scan_idx)
+            scan_label = _scan_label(uid)
+            for y_idx, y_col in enumerate(y_cols):
+                if y_col not in scan_df.columns:
+                    continue
+                y = scan_df[y_col].values
+                if multi:
+                    # In multi mode color encodes the SCAN; line dash encodes Y.
+                    color = uid_color
+                    dash = ["solid", "dashed", "dotted", "dotdash", "dashdot"][y_idx % 5]
+                    label = f"{scan_label} · {y_col}" if n_y > 1 else scan_label
+                else:
+                    color = single_palette[y_idx % len(single_palette)]
+                    dash = "solid"
+                    label = y_col
+                p.line(x, y, line_color=color, line_width=1.2,
+                       line_dash=dash, legend_label=label)
+                p.scatter(x, y, color=color, size=4, legend_label=label)
+
         p.xaxis.axis_label = x_col
-        p.legend.click_policy = "hide"
-        p.legend.label_text_font_size = "8pt"
+        if p.legend:
+            p.legend.click_policy = "hide"
+            p.legend.label_text_font_size = "8pt"
         w_primary_plot.object = p
     except Exception as exc:
         log.warning("Primary plot failed: %s", exc)
@@ -4968,12 +6374,273 @@ w_table.param.watch(_on_row_select, "selection")
 # Callbacks — Processing
 # ---------------------------------------------------------------------------
 
-def _on_process(event):
-    uid = _state.get("selected_uid")
+def _refresh_process_button_label() -> None:
+    """Show the selection count on the Process and Export buttons when in
+    multi mode."""
+    n = len(_selected_uids())
+    if n > 1:
+        w_btn_process.name = f"⚙ Process {n} selected"
+        try:
+            w_btn_export_current.name = f"Export {n} selected"
+        except NameError:
+            pass
+    else:
+        w_btn_process.name = "⚙ Process"
+        try:
+            w_btn_export_current.name = "Export current scan"
+        except NameError:
+            pass
+
+
+def _enhanced_summary_for(uid: str) -> dict:
+    """Best-effort enhanced_summary for ``uid`` — used when bundling a result
+    into the collection from the multi-process loop, where ``_detail_cache``
+    only has the primary scan's data."""
     if not uid:
-        pn.state.notifications.warning("No scan selected.")
+        return {}
+    try:
+        run = _get_cat()[uid]
+    except Exception:
+        log.exception("summary fetch: cannot resolve %s", uid[:8])
+        return {}
+    try:
+        return enhanced_summary(run)
+    except Exception:
+        log.exception("summary fetch failed for %s", uid[:8])
+        return {}
+
+
+def _build_multi_2d_tile(uid: str, result, tile_w: int = 420) -> Any:
+    """Build a single compact 2D-map figure for the multi-result grid.
+
+    Uses ``ColumnDataSource`` with fixed pixel dimensions so the figure
+    renders reliably when wrapped in a Panel layout.  Cuts/PolyDraw
+    tooling is intentionally omitted — those are single-figure features.
+    """
+    from bokeh.plotting import figure as bk_figure
+    from bokeh.models import (
+        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
+    )
+
+    if getattr(result, "merged_qchi", None) is not None:
+        qchi = result.merged_qchi
+        img = qchi["intensity"].values
+        q = qchi["q"].values
+        chi = qchi["chi"].values
+        x_label = "q (nm⁻¹)"
+        y_label = "χ (°)"
+    elif hasattr(result, "frames") and hasattr(result, "qxy_grid"):
+        img = np.asarray(result.summed)
+        q = np.asarray(result.qxy_grid)
+        chi = np.asarray(result.qz_grid)
+        x_label = "q_xy (nm⁻¹)"
+        y_label = "q_z (nm⁻¹)"
+    else:
+        return None
+
+    if img.shape == (len(q), len(chi)):
+        img = img.T
+
+    display = np.where(np.isfinite(img), img, 0).astype(np.float32)
+    finite = img[np.isfinite(img) & (img > 0)]
+    if finite.size:
+        vlo = max(float(np.percentile(finite, 2)), 1e-6)
+        vhi = max(float(np.percentile(finite, 99.5)), vlo * 2)
+        mapper = LogColorMapper(palette="Turbo256", low=vlo, high=vhi)
+        display = np.where(display > 0, display, float(mapper.low))
+    else:
+        mapper = LinearColorMapper(
+            palette="Greys256",
+            low=float(np.nanmin(display)) if display.size else 0.0,
+            high=max(float(np.nanmax(display)) if display.size else 1.0, 1.0),
+        )
+
+    q0, q1 = float(q.min()), float(q.max())
+    c0, c1 = float(chi.min()), float(chi.max())
+
+    p = bk_figure(
+        title=f"{_scan_label(uid)}  ·  {result.geometry}",
+        width=tile_w, height=int(tile_w * 0.8),
+        x_range=(q0, q1), y_range=(c0, c1),
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        toolbar_location="above",
+    )
+    src = ColumnDataSource(data=dict(
+        image=[display], x=[q0], y=[c0], dw=[q1 - q0], dh=[c1 - c0],
+    ))
+    p.image(image="image", x="x", y="y", dw="dw", dh="dh",
+            color_mapper=mapper, source=src)
+    p.add_layout(ColorBar(color_mapper=mapper, label_standoff=6, width=10), "right")
+    p.xaxis.axis_label = x_label
+    p.yaxis.axis_label = y_label
+    p.title.text_font_size = "9pt"
+    return p
+
+
+def _build_multi_2d_grid(uids: list[str], results_by_uid: dict) -> Any:
+    """Return a Panel ``GridBox`` of small per-scan 2D maps.
+
+    Uses Panel's grid layout (one ``pn.pane.Bokeh`` per figure) rather than
+    ``bokeh.gridplot`` — the latter has been observed to drop image data
+    when figures are subsequently swapped into a Panel container.
+    """
+    from smi_browser.figures.multiview import grid_dims
+
+    valid = [(uid, results_by_uid.get(uid)) for uid in uids
+             if results_by_uid.get(uid) is not None]
+    if not valid:
+        return None
+    _rows, cols = grid_dims(len(valid))
+    tile_w = max(320, min(560, int(1200 / max(1, cols))))
+
+    panes = []
+    for uid, res in valid:
+        try:
+            fig = _build_multi_2d_tile(uid, res, tile_w=tile_w)
+            if fig is not None:
+                panes.append(pn.pane.Bokeh(fig))
+        except Exception:
+            log.exception("multi 2D tile build failed for %s", uid[:8])
+    if not panes:
+        return None
+    return pn.GridBox(*panes, ncols=cols)
+
+
+def _render_multi_process_views(uids: list[str]) -> None:
+    """Render the I(q) overlay and 2D map grid for a just-completed multi-reduce.
+
+    Pulls the results back out of the collection (which is where they were
+    just inserted with ``pinned=False``) so the same rendering helper that
+    powers the Collection panel can drive the I(q) overlay here too.
+    """
+    results_by_uid = {uid: _collection.get_result(uid) for uid in uids
+                      if uid in _collection}
+    valid_uids = [u for u, r in results_by_uid.items() if r is not None]
+
+    # I(q) overlay — reuse the collection's plot builder so colors match the
+    # Collection panel and the existing axis-style options are honored.
+    try:
+        iq_fig = _collection.iq_comparison_bokeh(
+            uids=valid_uids,
+            label_column=None,
+            plot_style=getattr(w_plot_style, "value", "markers"),
+        )
+        w_proc_iq_plot.object = iq_fig
+    except Exception:
+        log.exception("multi I(q) overlay failed")
+        w_proc_iq_plot.object = None
+
+    # 2D map grid
+    try:
+        w_proc_2d_plot.object = _build_multi_2d_grid(valid_uids, results_by_uid)
+    except Exception:
+        log.exception("multi 2D grid failed")
+        w_proc_2d_plot.object = None
+
+    # Single-scan frame controls don't apply across multiple results.
+    w_proc_frame_slider.visible = False
+    w_proc_iq_mode.visible = False
+    w_proc_iq_label.visible = False
+
+
+def _on_process_multi(uids: list[str]) -> None:
+    """Process every selected scan, staging each result into the collection
+    with ``pinned=False`` so the user can compare before promoting."""
+    if not uids:
         return
 
+    w_proc_status.object = f"*Processing {len(uids)} scans…*"
+    w_proc_spinner.value = True
+    w_proc_spinner.visible = True
+    w_btn_process.disabled = True
+    w_btn_add_collection.disabled = True
+    _proc_result_cache.update(result=None, gi_result=None)
+    _per_frame_qchi_cache.update(uid=None, data=None)
+    _processing_guard["active"] = True
+
+    processed: list[str] = []
+    errors: list[tuple[str, str]] = []
+    t0 = time.perf_counter()
+    try:
+        for i, uid in enumerate(uids):
+            w_proc_status.object = (
+                f"*Processing {i + 1}/{len(uids)} — `{uid[:8]}`…*"
+            )
+            try:
+                reduce_fn, params, _geom = _build_proc_params(uid)
+                result = reduce_fn(**params)
+            except Exception as exc:
+                log.exception("multi-process: reduction failed for %s", uid[:8])
+                errors.append((uid, str(exc)))
+                continue
+            try:
+                _cache_reduction_result(uid, result, params.get("geometry", "transmission"), params)
+            except Exception:
+                log.exception("multi-process: cache write failed for %s", uid[:8])
+            # Stage the result into the collection — unpinned.  Caller
+            # promotes via the "Pin selection" button.
+            summary = _enhanced_summary_for(uid)
+            try:
+                _collection.add(
+                    result, summary, params, pinned=False,
+                )
+                processed.append(uid)
+            except Exception:
+                log.exception("multi-process: collection add failed for %s",
+                              uid[:8])
+
+        dt = time.perf_counter() - t0
+        _proc_result_cache["multi_uids"] = processed
+        _proc_result_cache["multi_errors"] = errors
+
+        if processed:
+            _render_multi_process_views(processed)
+        else:
+            w_proc_iq_plot.object = None
+            w_proc_2d_plot.object = None
+
+        # Status banner
+        parts = [f"**Done** in {dt:.1f}s — {len(processed)} processed"]
+        if errors:
+            parts.append(f"{len(errors)} failed")
+        w_proc_status.object = " · ".join(parts) + (
+            "  ·  *click* **📌 Pin selection** *to promote to the curated collection*"
+            if processed else ""
+        )
+
+        # Enable the pin action and refresh the collection panel.
+        if processed:
+            w_btn_add_collection.name = f"📌 Pin {len(processed)} processed"
+            w_btn_add_collection.disabled = False
+            _refresh_collection()
+            try:
+                _open_collection_panel()
+            except Exception:
+                pass
+            try:
+                pn.state.notifications.success(
+                    f"{len(processed)} scans processed — staged as unpinned previews",
+                )
+            except Exception:
+                pass
+    finally:
+        _processing_guard["active"] = False
+        w_btn_process.disabled = False
+        w_proc_spinner.value = False
+        w_proc_spinner.visible = False
+
+
+def _on_process(event):
+    uids = _selected_uids()
+    if not uids:
+        pn.state.notifications.warning("No scan selected.")
+        return
+    if len(uids) > 1:
+        _on_process_multi(uids)
+        return
+
+    uid = uids[0]
     geometry = w_proc_geometry.value
     w_proc_status.object = f"*Processing `{uid[:12]}…` ({geometry})*"
     w_proc_spinner.value = True
@@ -5148,6 +6815,25 @@ def _on_process(event):
 
 
 def _on_add_to_collection(event):
+    # Multi-process mode: results are already in the collection (unpinned).
+    # This button just pins them.
+    multi_uids = _proc_result_cache.get("multi_uids") or []
+    if multi_uids:
+        for uid in multi_uids:
+            _collection.pin(uid)
+        _proc_result_cache["multi_uids"] = []
+        w_btn_add_collection.name = "+ Add to Collection"
+        w_btn_add_collection.disabled = True
+        _refresh_collection()
+        try:
+            pn.state.notifications.success(
+                f"Pinned {len(multi_uids)} scan{'s' if len(multi_uids) != 1 else ''} "
+                f"to the collection",
+            )
+        except Exception:
+            pass
+        return
+
     result = _last_result.get("result")
     if result is None:
         return
@@ -5178,6 +6864,7 @@ def _on_add_to_collection(event):
         baseline_df=baseline_df,
         config_df=config_df,
         raw_metadata=raw_metadata,
+        pinned=True,  # explicit single-scan add → pinned right away
     )
     _refresh_collection()
     _open_collection_panel()  # pop open the floating panel
@@ -6260,7 +7947,7 @@ def _refresh_export_resolved_path():
     rel = w_export_dir.value.strip() or "projects/{project_name}/analysis"
     scan_cycle = None
 
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if uid:
         try:
             run = _get_cat()[uid]
@@ -6339,7 +8026,7 @@ def _resolve_export_dir() -> Path | None:
 
     # If project is "(all)", try to get the actual project name from scan metadata
     if not proj or proj == "(all)":
-        uid = _state.get("selected_uid")
+        uid = _selected_uid()
         if uid:
             try:
                 run = _get_cat()[uid]
@@ -6349,7 +8036,7 @@ def _resolve_export_dir() -> Path | None:
             except Exception:
                 pass
     else:
-        uid = _state.get("selected_uid")
+        uid = _selected_uid()
         if uid:
             try:
                 run = _get_cat()[uid]
@@ -6366,7 +8053,7 @@ def _resolve_export_dir() -> Path | None:
             return resolved
 
     # Fallback: extract data_session from the currently selected scan's metadata
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if uid:
         try:
             run = _get_cat()[uid]
@@ -6498,10 +8185,14 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
 
 
 def _on_export_current(event):
-    uid = _state.get("selected_uid")
-    if not uid:
+    uids = _selected_uids()
+    if not uids:
         pn.state.notifications.warning("No scan selected.")
         return
+    if len(uids) > 1:
+        _on_export_multi(uids)
+        return
+    uid = uids[0]
     w_export_spinner.value = True
     w_export_spinner.visible = True
     w_export_status.object = "*Exporting…*"
@@ -6515,6 +8206,85 @@ def _on_export_current(event):
             )
     except Exception as exc:
         log.exception("Export failed")
+        w_export_status.object = f"**Export error:** `{exc}`"
+    finally:
+        w_export_spinner.value = False
+        w_export_spinner.visible = False
+
+
+def _on_export_multi(uids: list[str]) -> None:
+    """Export every selected scan into its own resolved project directory.
+
+    Scans that haven't been processed (so aren't in ``_collection``) are
+    skipped with a warning — the export pipeline needs the reduction result
+    to write its outputs.
+    """
+    if not uids:
+        return
+    out_dir = _resolve_export_dir()
+    if out_dir is None:
+        pn.state.notifications.error(
+            "Cannot resolve export directory. Set it manually or select a proposal."
+        )
+        return
+
+    available = [u for u in uids if u in _collection]
+    missing = [u for u in uids if u not in _collection]
+    if not available:
+        w_export_status.object = (
+            "**No selected scans have been processed yet.**  "
+            "Run *Process N selected* from the Process tab first."
+        )
+        return
+
+    w_export_spinner.value = True
+    w_export_spinner.visible = True
+    w_export_status.object = (
+        f"*Exporting {len(available)} selected scan{'s' if len(available) != 1 else ''}…*"
+    )
+    total_files = 0
+    errors = 0
+    try:
+        for uid in available:
+            res = _collection.get_result(uid)
+            if res is None:
+                errors += 1
+                continue
+            try:
+                _, files = export_scan(
+                    out_dir=out_dir,
+                    uid=uid,
+                    result=res,
+                    params=_collection._processing.get(uid, {}),
+                    primary_df=_collection.get_primary_df(uid),
+                    baseline_df=_collection.get_baseline_df(uid),
+                    config_df=_collection.get_config_df(uid),
+                    raw_metadata=_collection.get_raw_metadata(uid),
+                    formats=_export_formats(),
+                    subdir_template=w_export_subdir.value,
+                    basename_template=w_export_basename.value,
+                    frame_label_col=_get_frame_label_cols() or None,
+                )
+                total_files += len(files)
+            except Exception:
+                log.exception("Multi-export: failed for %s", uid[:8])
+                errors += 1
+
+        status_lines = [
+            f"**Exported** {len(available) - errors} of {len(uids)} "
+            f"scan{'s' if len(uids) != 1 else ''} ({total_files} files) → `{out_dir}`"
+        ]
+        if missing:
+            status_lines.append(
+                f"⚠ {len(missing)} skipped — not yet processed: "
+                f"{', '.join(u[:8] for u in missing[:5])}"
+                + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
+            )
+        if errors:
+            status_lines.append(f"⚠ {errors} scan(s) hit errors.")
+        w_export_status.object = "\n\n".join(status_lines)
+    except Exception as exc:
+        log.exception("Multi-export failed")
         w_export_status.object = f"**Export error:** `{exc}`"
     finally:
         w_export_spinner.value = False
@@ -6587,7 +8357,7 @@ def _on_download_current(event):
     import tempfile
     import zipfile
 
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if not uid:
         pn.state.notifications.warning("No scan selected.")
         return
@@ -7630,7 +9400,7 @@ def _live_switch_to(uid: str) -> None:
 
     Runs on the Bokeh document thread.
     """
-    if not uid or uid == _state.get("selected_uid"):
+    if not uid or uid == _selected_uid():
         # Same uid (or empty) — nothing to do beyond keeping the watch alive.
         if uid and _live["manager"] is not None:
             try:
@@ -7641,9 +9411,9 @@ def _live_switch_to(uid: str) -> None:
                 log.warning("live: re-watch failed: %s", exc)
         return
 
-    _state["selected_uid"] = uid
+    _set_selected_uids([uid])
     _reset_detail(preserve_figure=True)
-    _state["selected_uid"] = uid  # _reset_detail clears it
+    _set_selected_uids([uid])  # _reset_detail clears it
     try:
         _load_metadata(uid)
         _load_primary()
@@ -7660,6 +9430,21 @@ def _live_switch_to(uid: str) -> None:
         f"{summary.get('sample_name', '?')} · "
         f"{summary.get('detectors', '?')}"
     )
+
+    # Keep the table selection in sync with the uid being shown on the right.
+    # Lockout sets w_table.selectable = False, but programmatic assignment to
+    # .selection still works on Panel's Tabulator.  The idempotency guard in
+    # _on_row_select prevents this from triggering a redundant reload.
+    try:
+        df = w_table.value
+        if df is not None and not df.empty and "uid" in df.columns:
+            matches = df.index[df["uid"] == uid].tolist()
+            if matches:
+                row_pos = int(df.index.get_loc(matches[0]))
+                if w_table.selection != [row_pos]:
+                    w_table.selection = [row_pos]
+    except Exception:
+        log.exception("live: table selection sync failed")
 
     mgr = _live["manager"]
     if mgr is not None:
@@ -7678,11 +9463,17 @@ def _live_switch_to(uid: str) -> None:
 
 def _live_on_new_run(uid: str) -> None:
     log.info("live: new run %s", uid)
+    # Refresh the table to page 0 so the new run becomes visible and can be
+    # selected by _live_switch_to.
+    try:
+        _do_search(0)
+    except Exception:
+        log.exception("live: refresh on new run failed")
     _live_switch_to(uid)
 
 
 def _live_on_primary_extended(uid: str) -> None:
-    if uid != _state.get("selected_uid"):
+    if uid != _selected_uid():
         return
     # Force a re-fetch of the primary scalars table by clearing the cache flag.
     _detail_cache["primary_loaded"] = False
@@ -7699,7 +9490,7 @@ def _live_on_primary_extended(uid: str) -> None:
 
 
 def _live_on_frame_extended(uid: str, field: str, n_total: int) -> None:
-    if uid != _state.get("selected_uid"):
+    if uid != _selected_uid():
         return
     # Drop the cached dataset so the next fetch sees the new frames.
     _detail_cache["primary_dataset"] = None
@@ -7805,14 +9596,30 @@ w_btn_live.param.watch(_on_live_toggle, "value")
 
 def _on_update(_event=None):
     """Refresh search results and reload the selected scan if it has more data."""
+    prev_uids = _selected_uids()
+    prev_primary = prev_uids[0] if prev_uids else None
+
     # 1) Re-run the current search to pick up new scans
     try:
         _do_search(_state["page"])
     except Exception as exc:
         log.warning("Update search failed: %s", exc)
 
-    # 2) Check if the currently selected scan has grown (more data points)
-    uid = _state.get("selected_uid")
+    # 2) If the highlighted rows now point to different scans (newer scans
+    # were pushed in and shifted the rows), reload the detail tabs against
+    # the new selection — same effect as the user clicking those rows.
+    try:
+        sel = w_table.selection
+        df = w_table.value
+        new_uids = _uids_from_selection(sel, df)
+        if new_uids and new_uids != prev_uids:
+            _on_row_select(None)
+            return
+    except Exception:
+        log.exception("Update: row-uid resync failed")
+
+    # 3) Same primary as before — check if the currently selected scan has grown
+    uid = prev_primary
     if not uid:
         return
 
@@ -8063,7 +9870,7 @@ def _on_cycle_change(*_events):
         return
 
     # Reset detail pane and clear table to avoid stale state
-    _state["selected_uid"] = None
+    _set_selected_uids(None)
     w_table.selection = []
     _reset_detail()
 
@@ -8105,7 +9912,7 @@ def _on_proposal_select(*_events):
 
     # Reset detail pane and clear table selection BEFORE search to avoid
     # Bokeh document-lock errors from the _on_row_select cascade.
-    _state["selected_uid"] = None
+    _set_selected_uids(None)
     w_table.selection = []
     _reset_detail()
 
@@ -8209,7 +10016,7 @@ def _on_project_select(*_events):
 
     # Reset detail pane and clear table selection BEFORE search to avoid
     # Bokeh document-lock errors from the _on_row_select cascade.
-    _state["selected_uid"] = None
+    _set_selected_uids(None)
     w_table.selection = []
     _reset_detail()
 
@@ -8253,14 +10060,17 @@ left_panel = pn.Column(
     sizing_mode="stretch_height",
     scroll=True,
     stylesheets=[
-        ":host { font-size: 9px; }",
+        # Stick the scan-list column to the viewport so it remains visible
+        # while the user scrolls the right-hand image / process tabs.
+        ":host { position: sticky; top: 0; max-height: 100vh; "
+        "align-self: flex-start; font-size: 9px; }",
     ],
 )
 
 w_detail_tabs = pn.Tabs(
     (
         "Metadata",
-        pn.Column(w_meta_json, sizing_mode="stretch_both"),
+        w_meta_container,
     ),
     (
         "Primary",
@@ -8275,7 +10085,11 @@ w_detail_tabs = pn.Tabs(
     ),
     (
         "Baseline / Config",
-        pn.Column(w_baseline_status, w_baseline_table, sizing_mode="stretch_both"),
+        pn.Column(
+            pn.Row(w_baseline_status, w_baseline_diff_only, sizing_mode="stretch_width"),
+            w_baseline_table,
+            sizing_mode="stretch_both",
+        ),
     ),
     (
         "Explore",
@@ -8314,7 +10128,8 @@ w_detail_tabs = pn.Tabs(
                 collapsed=False, sizing_mode="stretch_width",
             ),
             # Image takes the full remaining width / height below
-            pn.Column(w_image_thumb, sizing_mode="stretch_both", min_height=500),
+            w_image_multi_hint,
+            w_image_container,
             sizing_mode="stretch_both",
         ),
     ),
@@ -8432,7 +10247,7 @@ w_btn_update_scan = pn.widgets.Button(
 
 def _on_update_scan(_event=None):
     """Re-check the selected scan for new data points and reload if grown."""
-    uid = _state.get("selected_uid")
+    uid = _selected_uid()
     if not uid:
         return
     try:
@@ -8779,7 +10594,11 @@ collection_card = pn.Card(
             "Compare",
             pn.Row(
                 pn.Column(
-                    pn.Row(w_btn_coll_remove, w_coll_label),
+                    pn.Row(
+                        w_btn_coll_pin, w_btn_coll_unpin,
+                        w_btn_coll_remove, w_btn_coll_clear_unpinned,
+                    ),
+                    pn.Row(w_coll_pinned_only, w_coll_label),
                     w_coll_table,
                     sizing_mode="stretch_width",
                     min_width=300,
