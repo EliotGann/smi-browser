@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "smi-tiled-browser"
 description = "Interactive browser for SMI beamline data on the NSLS-II Tiled catalog"
 channels = ["conda-forge"]
@@ -17,15 +17,28 @@ pyfai = ">=2024.9"
 tiled = "*"
 bluesky-tiled-plugins = "*"
 httpx = "*"
+pytest = "*"
 
 [pypi-dependencies]
-# Local editable install of PyHyperScattering from the feature branch.
-# To switch to a released version:  pyhyperscattering = ">=0.2"
+# Local editable install of smi-tiled (the SMI-focused successor to the
+# PyHyperScattering SMI branch).  Eventually distributed together with
+# smi-browser; until then keep it editable so changes flow through.
+# To switch to a released version:  smi-tiled = ">=0.1"
 # To pin to a GitHub fork:
-#   pyhyperscattering = { git = "https://github.com/YOURFORK/PyHyperScattering.git", branch = "feature/smi-tiled-loader" }
-pyhyperscattering = { path = "../PyHyperScattering", editable = true }
+#   smi-tiled = { git = "https://github.com/EliotGann/smi-tiled.git", branch = "main", extras = ["tiled"] }
+smi-tiled = { path = "../smi-tiled", editable = true, extras = ["tiled"] }
 
-[tasks]
-serve = "panel serve smi_app.py --show --autoreload"
-check = "python -c \"import tiled_browser; import smi_browser; print('OK')\""
-test = "python -m pytest tests/ -q"
+# PYTHONNOUSERSITE=1 keeps the pixi env from being shadowed by stale
+# packages in ~/.local/lib/python3.11/site-packages (e.g. an old pydantic
+# that's ABI-incompatible with the pixi-installed pydantic_core).
+[tasks.serve]
+cmd = "panel serve smi_app.py --show --autoreload"
+env = { PYTHONNOUSERSITE = "1" }
+
+[tasks.check]
+cmd = "python -c \"import tiled_browser; import smi_browser; print('OK')\""
+env = { PYTHONNOUSERSITE = "1" }
+
+[tasks.test]
+cmd = "python -m pytest tests/ -q"
+env = { PYTHONNOUSERSITE = "1" }

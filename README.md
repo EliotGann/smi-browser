@@ -6,8 +6,7 @@ at NSLS-II, served from the [Tiled](https://blueskyproject.io/tiled/) catalog.
 
 Built with [Panel](https://panel.holoviz.org/) and
 [Bokeh](https://docs.bokeh.org/) for interactive visualization, and
-[PyHyperScattering](https://pyhyperscattering.readthedocs.io/) for
-data reduction.
+[smi-tiled](https://github.com/EliotGann/smi-tiled) for data reduction.
 
 ## Features
 
@@ -20,7 +19,7 @@ data reduction.
 - **Explore** — Side-by-side linked 1D plot and 2D detector image with a
   synced frame cursor.
 - **Process** — Transmission and grazing-incidence reduction via
-  PyHyperScattering (`reduce_smi_combined`, `reduce_smi_gi`).
+  smi-tiled (`reduce_smi_combined`, `reduce_smi_gi`).
   Produces 2D q-chi / qxy-qz maps and merged I(q) curves.
 - **Scan Collection** — Add processed scans for side-by-side I(q) comparison.
 
@@ -30,8 +29,8 @@ data reduction.
 
 - [pixi](https://pixi.sh/) package manager
 - A local editable clone of
-  [PyHyperScattering](https://github.com/NSLS-II/PyHyperScattering)
-  at the path referenced in `pixi.toml` (adjust if needed)
+  [smi-tiled](https://github.com/EliotGann/smi-tiled)
+  at the path referenced in `pixi.toml` (defaults to `../smi-tiled`)
 
 ### Install & run
 
@@ -67,7 +66,7 @@ smi-browser/
 ```
 
 > Default detector masks (`pil2M_mask_polygons.json`, `900KW_mask_polygons.json`)
-> are now bundled with PyHyperScattering and loaded automatically; the Process
+> are now bundled with smi-tiled and loaded automatically; the Process
 > tab "Masks" expander shows the default name in its placeholder. Use the
 > Explore tab's *Mask overlay* card to view, edit (PolyDraw / PolyEdit), or
 > save a custom mask, then click *Use in Process* to apply it.

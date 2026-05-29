@@ -1,7 +1,7 @@
 """Tests for batch_processor.BatchProcessor.
 
 Exercises the queue/worker state machine without touching tiled or
-PyHyperScattering.  ``process_fn`` is replaced with a controllable fake
+smi-tiled.  ``process_fn`` is replaced with a controllable fake
 that lets us release jobs one at a time, drive errors, and inspect the
 snapshot the UI would receive.
 """

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from PyHyperScattering import smi_defaults as smid
+from smi_tiled import defaults as smid
 
 
 def detector_for_field(field: str) -> str | None:
@@ -12,7 +12,7 @@ def detector_for_field(field: str) -> str | None:
 
 
 def orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
-    """Re-orient detector frames for display via the canonical PyHyper transform."""
+    """Re-orient detector frames for display via the canonical smi-tiled transform."""
     detector = detector_for_field(field)
     if detector is None:
         return arr

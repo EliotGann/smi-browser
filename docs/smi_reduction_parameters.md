@@ -1,7 +1,8 @@
 # SMI SAXS + WAXS Reduction Parameters Reference
 
 All parameters available for `reduce_smi_combined()` and `reduce_smi_gi()` in
-`PyHyperScattering.SMISWAXSIntegrator`, organized for GUI integration.
+`smi_tiled.integrator` (re-exported at the `smi_tiled` top level), organized
+for GUI integration.
 
 ---
 
@@ -219,7 +220,7 @@ challenge is knowing which go as **top-level kwargs**, which go inside
 inside **`saxs_kwargs={}`**. Here's the definitive mapping:
 
 ```python
-from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+from smi_tiled import reduce_smi_combined
 
 result = reduce_smi_combined(
     # ─── TOP-LEVEL: Connection ───────────────────────────────────────

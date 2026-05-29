@@ -1,5 +1,5 @@
 """
-smi_app.py — SMI Tiled Browser with PyHyperScattering integration.
+smi_app.py — SMI Tiled Browser with smi-tiled integration.
 
 Launch with:
     pixi run panel serve smi_app.py --show
@@ -10,7 +10,7 @@ Features
 - Metadata-only browse: sample_name, plan_name, institution, n_steps,
   detectors (SAXS / WAXS), exit_status — no array I/O during search
 - Click a row → lazy detail tabs (metadata, primary scalars, baseline, images)
-- Process tab runs PyHyperScattering reduce_smi_combined with tunable params
+- Process tab runs smi-tiled reduce_smi_combined with tunable params
 - Scan Collection: gather processed results, detect varying parameters,
   compare I(q) overlays, stack into xarray Datasets for parameter sweeps
 
@@ -89,12 +89,12 @@ from smi_browser.ui import collection as _coll_mod
 
 PAGE_SIZE = 25
 
-# Canonical defaults & helpers are owned by PyHyperScattering.smi_defaults.
-# Importing it triggers PyHyperScattering/__init__.py once (which pulls in
+# Canonical defaults & helpers are owned by smi_tiled.defaults.
+# Importing it triggers smi_tiled/__init__.py once (which pulls in
 # the heavy integrators), but we need LOADER_DEFAULTS at widget-construct
 # time anyway, so eat the cost here rather than mirroring constants.
-from PyHyperScattering import smi_defaults as smid
-from PyHyperScattering.SMISWAXSIntegrator import (
+from smi_tiled import defaults as smid
+from smi_tiled import (
     clear_geometry_cache,
     geometry_cache_info,
 )
@@ -108,7 +108,7 @@ DEFAULT_WAXS_MASK_NAME = smid.DEFAULT_WAXS_MASK_NAME
 SAXS_DETECTOR_NAMES = smid.SAXS_DETECTOR_NAMES
 WAXS_DETECTOR_NAMES = smid.WAXS_DETECTOR_NAMES
 
-# Loader-side calibrated defaults (frozen dataclass exposed by PyHyper).
+# Loader-side calibrated defaults (frozen dataclass exposed by smi-tiled).
 _LD = smid.LOADER_DEFAULTS
 DEFAULT_SAXS_ROW_DELTA = _LD.saxs_row_delta_px
 DEFAULT_SAXS_COL_DELTA = _LD.saxs_col_delta_px
@@ -116,13 +116,13 @@ DEFAULT_WAXS_ROW_DELTA = _LD.waxs_row_delta_px
 DEFAULT_WAXS_COL_DELTA = _LD.waxs_col_delta_px
 DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 
-# Processing defaults  (UI-side; these mirror the upstream PyHyper defaults
+# Processing defaults  (UI-side; these mirror the upstream smi-tiled defaults
 # so the widgets show meaningful numbers even before any override.  When a
 # widget value still equals its default, _on_process passes None so the
 # upstream loader supplies its own calibrated default.)
-DEFAULT_N_Q = 2000          # PyHyper default is 1000; smi-browser used 2000
+DEFAULT_N_Q = 2000          # smi-tiled default is 1000; smi-browser used 2000
 DEFAULT_N_CHI = 360
-DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
+DEFAULT_SAXS_MASK = ""      # empty → use bundled default from smi-tiled
 DEFAULT_WAXS_MASK = ""
 DEFAULT_DEZINGER = 3000.0
 DEFAULT_DEZINGER_KERNEL = 5
@@ -464,7 +464,7 @@ def _detector_for_field(field: str) -> str | None:
 
 
 def _orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
-    """Re-orient detector frames for display via the canonical PyHyper transform."""
+    """Re-orient detector frames for display via the canonical smi-tiled transform."""
     detector = _detector_for_field(field)
     if detector is None:
         return arr
@@ -474,10 +474,10 @@ def _orient_frame(arr: np.ndarray, field: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Polygon mask helpers (overlay + edit on the Explore image preview)
 #
-# All schema parsing and orientation math lives in PyHyperScattering's
-# smi_defaults module.  The browser keeps only the thin projection between
-# the *normalized* mask dict (PyHyper's canonical shape) and Bokeh's
-# (xs, ys, names, kinds) ColumnDataSource columns.
+# All schema parsing and orientation math lives in smi_tiled.defaults.
+# The browser keeps only the thin projection between the *normalized* mask
+# dict (smi-tiled's canonical shape) and Bokeh's (xs, ys, names, kinds)
+# ColumnDataSource columns.
 # ---------------------------------------------------------------------------
 
 
@@ -685,7 +685,7 @@ def _thumbnail_figure(arr, title):
     p.js_on_event("tap", tap_cb)
     p.js_on_event("doubletap", tap_cb)
 
-    # ----- Dynamic-mask overlay (rasterised PyHyper mask, optional) -------
+    # ----- Dynamic-mask overlay (rasterised smi-tiled mask, optional) -----
     # Render as an RGBA image; alpha=0 for valid pixels, semi-transparent
     # red for invalid pixels.  Populated by _render_dynamic_mask().
     # image_rgba requires a 2D uint32 array (or a uint8 (h,w,4) view as uint32).
@@ -1325,7 +1325,7 @@ w_mask_path = pn.widgets.TextInput(
 )
 w_btn_mask_reload = pn.widgets.Button(
     name="↻ Reload default", button_type="light", width=130,
-    description="Reload the bundled PyHyper default mask for this detector.",
+    description="Reload the bundled smi-tiled default mask for this detector.",
 )
 w_btn_mask_save = pn.widgets.Button(
     name="💾 Save", button_type="primary", width=80,
@@ -2898,7 +2898,7 @@ def _on_mask_show(event):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic mask overlay (rasterised PyHyper mask, per-frame)
+# Dynamic mask overlay (rasterised smi-tiled mask, per-frame)
 # ---------------------------------------------------------------------------
 
 
@@ -2933,7 +2933,7 @@ def _render_dynamic_mask(idx: int | None = None):
         return
 
     try:
-        from PyHyperScattering.SMISWAXSIntegrator import mask_for_frame
+        from smi_tiled import mask_for_frame
         mask = mask_for_frame(
             run, idx, detector,
             raw_shape=raw_shape,
@@ -3004,7 +3004,7 @@ def _on_mask_edit(event):
             "polygons**: click the PolyEdit icon (square-with-handles) "
             "in the toolbar, tap a grey or cyan polygon, then drag its "
             "vertices. The **dynamic mask is not editable here** — it "
-            "is recomputed per-frame by PyHyper from the live beamstop "
+            "is recomputed per-frame by smi-tiled from the live beamstop "
             "position, so its shape can only be changed indirectly "
             "(e.g. by adjusting beam-centre Δ in the Process tab). "
             "Open the browser console (F12) to see `[mask-debug]` tap "
@@ -3019,7 +3019,7 @@ def _on_mask_edit(event):
 
 
 def _on_mask_reload(_event):
-    """Reload the bundled PyHyper default mask for the current detector."""
+    """Reload the bundled smi-tiled default mask for the current detector."""
     detector = _current_detector_kind()
     if detector is None:
         # Non-scattering detector (camera/monitor) — no mask applies.
@@ -3498,7 +3498,7 @@ w_card_masks = pn.Card(
     _card_restore_buttons["masks"],
     pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
     pn.pane.Markdown(
-        "*Leave blank to use the bundled PyHyperScattering defaults.  "
+        "*Leave blank to use the bundled smi-tiled defaults.  "
         "Use the **Explore → mask editor** to draw, edit, and save masks "
         "interactively, then click **↪ Use in Process** to set the path here.*",
     ),
@@ -3616,7 +3616,7 @@ w_card_waxs_cal = pn.Card(
     ),
     pn.pane.Markdown(
         "*Override WAXSCalibration defaults.  Only changed values are sent — "
-        "leave unchanged to use PyHyper's calibration.  In GI mode these are "
+        "leave unchanged to use smi-tiled's calibration.  In GI mode these are "
         "passed as `waxs_cal_overrides`.*",
     ),
     title="Advanced WAXS calibration",
@@ -3633,6 +3633,541 @@ w_card_waxs_mask_adv = pn.Card(
     title="Advanced WAXS masking",
     collapsed=True, sizing_mode="stretch_width",
 )
+
+
+# ---------------------------------------------------------------------------
+# Calibrate — AgBh ring fit → beam-centre / distance deltas
+# ---------------------------------------------------------------------------
+#
+# Two cards (SAXS, WAXS) live inside the Process → Results sub-tab next to
+# Cross sections.  Workflow:
+#   1. Run Process → q-χ plot.
+#   2. (Optional) Click twice on the q-χ plot to set q_min/q_max.
+#   3. Click "Fit ring".  Per-χ Gaussian peaks → linear sinusoid solve.
+#   4. Δrow / Δcol / Δdist are displayed.  Click "Apply" to add to the
+#      Process-tab geometry-correction widgets, then re-Process.
+#
+# The math lives in :mod:`smi_browser.calibrate`.  This block owns only
+# widget wiring and the overlay on the q-χ figure.
+
+from smi_browser.calibrate import (
+    AGBH_Q1_NM,
+    agbh_q,
+    fit_beam_offset_qspace,
+    fit_ring_peaks,
+    nearest_agbh_order,
+    q_offset_to_pixel_delta,
+)
+
+
+def _make_calibrate_widgets(
+    detector: str,
+    default_dist_mm: float,
+    *,
+    expose_distance: bool,
+    default_ring_order: int,
+):
+    """Build the widget set for one detector's calibrate panel.
+
+    Returns a dict with keys: ``ring, q_min, q_max, chi_min, chi_max,
+    snr, bg_order, energy, dist, pixel, fit_btn, apply_btn, reset_btn,
+    pick_btn, status, result``.
+    """
+    label = detector.upper()
+    q_default = agbh_q(default_ring_order)
+    ring = pn.widgets.IntInput(
+        name="AgBh ring order", value=default_ring_order,
+        start=1, end=9, width=110,
+        description="Which AgBh order to fit (1-9).",
+    )
+    q_min = pn.widgets.FloatInput(
+        name="q min (nm⁻¹)", value=round(q_default - 0.15, 3),
+        step=0.01, width=110,
+    )
+    q_max = pn.widgets.FloatInput(
+        name="q max (nm⁻¹)", value=round(q_default + 0.15, 3),
+        step=0.01, width=110,
+    )
+    chi_min = pn.widgets.FloatInput(
+        name="χ min (°)", value=-180.0, step=5.0, width=100,
+    )
+    chi_max = pn.widgets.FloatInput(
+        name="χ max (°)", value=180.0, step=5.0, width=100,
+    )
+    snr = pn.widgets.FloatInput(
+        name="min SNR", value=3.0, step=0.5, start=0.0, width=90,
+        description="Drop χ slices with peak/baseline-rms below this.",
+    )
+    bg_order = pn.widgets.IntInput(
+        name="bg poly order", value=1, start=0, end=3, width=110,
+        description="Polynomial order for the baseline beneath the Gaussian.",
+    )
+    energy = pn.widgets.FloatInput(
+        name="Energy (keV)", value=DEFAULT_WAXS_ENERGY_KEV,
+        step=0.01, width=110,
+    )
+    dist = pn.widgets.FloatInput(
+        name="Distance (mm)", value=default_dist_mm, step=1.0, width=120,
+    )
+    pixel = pn.widgets.FloatInput(
+        name="Pixel size (mm)", value=0.172, step=0.001, width=120,
+    )
+    fit_btn = pn.widgets.Button(
+        name=f"Fit {label} ring", button_type="primary", width=140,
+    )
+    apply_btn = pn.widgets.Button(
+        name="↪ Apply to Process", button_type="success", width=160,
+        disabled=True,
+    )
+    reset_btn = pn.widgets.Button(
+        name="Reset Δ", button_type="warning", width=100,
+    )
+    pick_btn = pn.widgets.Toggle(
+        name="🎯 Pick q range (2 clicks)", value=False,
+        button_type="default", width=200,
+    )
+    status = pn.pane.Markdown(
+        "*Run Process, then click "
+        f"**Fit {label} ring** to recover Δrow / Δcol"
+        f"{' / Δdist' if expose_distance else ''}.*",
+    )
+    result = pn.pane.Markdown("")
+
+    return {
+        "detector": detector,
+        "expose_distance": expose_distance,
+        "ring": ring,
+        "q_min": q_min,
+        "q_max": q_max,
+        "chi_min": chi_min,
+        "chi_max": chi_max,
+        "snr": snr,
+        "bg_order": bg_order,
+        "energy": energy,
+        "dist": dist,
+        "pixel": pixel,
+        "fit_btn": fit_btn,
+        "apply_btn": apply_btn,
+        "reset_btn": reset_btn,
+        "pick_btn": pick_btn,
+        "status": status,
+        "result": result,
+        # Filled in by _on_calibrate_fit:
+        "last_fit_px": None,
+    }
+
+
+# SAXS uses 1807 mm = 2000 mm loader default + (-193) mm delta as a
+# reasonable starting guess.  User overrides via the Distance field below.
+_SAXS_DEFAULT_FIT_DIST_MM = 2000.0 + DEFAULT_SAXS_DIST_DELTA
+_CAL_SAXS = _make_calibrate_widgets(
+    "saxs", default_dist_mm=_SAXS_DEFAULT_FIT_DIST_MM,
+    expose_distance=True, default_ring_order=5,
+)
+_CAL_WAXS = _make_calibrate_widgets(
+    "waxs", default_dist_mm=DEFAULT_WAXS_SAMPLE_DIST_MM,
+    expose_distance=False, default_ring_order=3,
+)
+
+# Currently-active picker (only one detector at a time).  See
+# _on_calibrate_pick_toggle below.
+_calibrate_picker_state: dict[str, Any] = {"detector": None, "first_q": None}
+
+# Cached Bokeh CDS for the overlays (peak markers + sinusoid + q-pick lines)
+# Renderer references are stored on the figure so _attach_calibrate_to_figure
+# can rebuild them each time a fresh q-χ figure is drawn.
+_calibrate_overlay: dict[str, Any] = {
+    "fig": None,
+    "peaks_source": None,
+    "fit_curve_source": None,
+    "peaks_renderer": None,
+    "curve_renderer": None,
+    "pick_spans": [],
+}
+
+
+def _calibrate_geometry_for(slot) -> tuple[float, float, float]:
+    """Return (wavelength_nm, distance_mm, pixel_mm) read from widgets."""
+    energy_kev = float(slot["energy"].value or DEFAULT_WAXS_ENERGY_KEV)
+    if energy_kev <= 0:
+        energy_kev = DEFAULT_WAXS_ENERGY_KEV
+    wavelength_nm = 1.23984198 / energy_kev
+    dist_mm = float(slot["dist"].value or 0.0)
+    pixel_mm = float(slot["pixel"].value or 0.172)
+    return wavelength_nm, dist_mm, pixel_mm
+
+
+def _on_calibrate_ring_change(slot):
+    """When the ring-order widget moves, auto-update default q window."""
+    def _cb(event):
+        n = int(event.new)
+        q_centre = agbh_q(n)
+        # Only re-centre if window currently looks "default-ish".
+        cur_centre = (slot["q_min"].value + slot["q_max"].value) / 2.0
+        cur_width = slot["q_max"].value - slot["q_min"].value
+        if cur_width <= 0 or abs(cur_centre - agbh_q(max(1, n - 0))) > cur_width:
+            half = max(cur_width / 2.0, 0.10)
+            slot["q_min"].value = round(q_centre - half, 3)
+            slot["q_max"].value = round(q_centre + half, 3)
+    return _cb
+
+
+_CAL_SAXS["ring"].param.watch(_on_calibrate_ring_change(_CAL_SAXS), "value")
+_CAL_WAXS["ring"].param.watch(_on_calibrate_ring_change(_CAL_WAXS), "value")
+
+
+def _current_qchi_for_detector(detector: str):
+    """Return the merged_qchi xr.Dataset for the active reduction, or None.
+
+    For Phase 1 we fit on the *merged* q-χ map.  This is fine for SAXS-only
+    or WAXS-only scans (single-detector contribution) and is approximate
+    when both are present (each ring lives entirely on one detector, so
+    the merged map carries it cleanly).
+    """
+    result = _proc_result_cache.get("result")
+    if result is None:
+        return None
+    qchi = getattr(result, "merged_qchi", None)
+    if qchi is None:
+        return None
+    # If the detector wasn't present in this scan, the per-detector slot
+    # in result.saxs/result.waxs will be None.
+    if detector == "saxs" and getattr(result, "saxs", None) is None:
+        return None
+    if detector == "waxs" and getattr(result, "waxs", None) is None:
+        return None
+    return qchi
+
+
+def _format_fit_result(fit, expose_distance: bool) -> str:
+    """Markdown summary for the result pane."""
+    parts = [
+        f"**Δrow = {fit.drow_px:+.2f} px**",
+        f"**Δcol = {fit.dcol_px:+.2f} px**",
+    ]
+    if expose_distance and fit.ddist_mm is not None:
+        parts.append(f"**Δdist = {fit.ddist_mm:+.2f} mm**")
+    parts.append(f"q₀ = {fit.q0:.4f} nm⁻¹")
+    if fit.ring_q_expected is not None:
+        parts.append(f"q_expected = {fit.ring_q_expected:.4f} nm⁻¹")
+    parts.append(f"rms = {fit.rms:.4f} nm⁻¹")
+    parts.append(f"n = {fit.n} χ slices")
+    return "  \n".join(parts)
+
+
+def _on_calibrate_fit(slot):
+    """Run fit_ring_peaks + fit_beam_offset_qspace on the current q-χ."""
+    def _cb(_event):
+        detector = slot["detector"]
+        qchi = _current_qchi_for_detector(detector)
+        if qchi is None:
+            slot["status"].object = (
+                f"*No {detector.upper()} q-χ map in cache — Process a scan first.*"
+            )
+            slot["result"].object = ""
+            slot["apply_btn"].disabled = True
+            return
+
+        try:
+            pf = fit_ring_peaks(
+                qchi,
+                q_min=float(slot["q_min"].value),
+                q_max=float(slot["q_max"].value),
+                chi_min=float(slot["chi_min"].value),
+                chi_max=float(slot["chi_max"].value),
+                bg_order=int(slot["bg_order"].value),
+                snr_threshold=float(slot["snr"].value),
+            )
+        except Exception as exc:
+            slot["status"].object = f"*Peak fit failed: {exc}*"
+            slot["result"].object = ""
+            slot["apply_btn"].disabled = True
+            return
+
+        if pf.n_accepted < 8:
+            slot["status"].object = (
+                f"*Only {pf.n_accepted}/{pf.n_total} χ slices passed the SNR "
+                f"threshold ({slot['snr'].value:.1f}). Widen the q window, "
+                f"lower the SNR threshold, or pick a brighter ring.*"
+            )
+            slot["result"].object = ""
+            slot["apply_btn"].disabled = True
+            return
+
+        ring_q = agbh_q(int(slot["ring"].value))
+        try:
+            fit_q = fit_beam_offset_qspace(
+                pf.chi_deg, pf.q_peak, ring_q_expected=ring_q,
+            )
+            lam_nm, dist_mm, px_mm = _calibrate_geometry_for(slot)
+            fit_px = q_offset_to_pixel_delta(
+                fit_q,
+                wavelength_nm=lam_nm,
+                distance_mm=dist_mm,
+                pixel_mm=px_mm,
+                chi_convention=(
+                    "smi_waxs" if slot["detector"] == "waxs" else "smi_saxs"
+                ),
+            )
+        except Exception as exc:
+            slot["status"].object = f"*Sinusoid solve failed: {exc}*"
+            slot["result"].object = ""
+            slot["apply_btn"].disabled = True
+            return
+
+        slot["last_fit_px"] = fit_px
+        slot["status"].object = (
+            f"*Fit OK — {pf.n_accepted}/{pf.n_total} χ slices.  "
+            f"Click **↪ Apply to Process** to add the Δ values to the "
+            f"Process-tab widgets, then re-Process.*"
+        )
+        slot["result"].object = _format_fit_result(
+            fit_px, expose_distance=slot["expose_distance"],
+        )
+        slot["apply_btn"].disabled = False
+        _draw_calibrate_overlay(slot["detector"], pf, fit_q, fit_px)
+    return _cb
+
+
+def _on_calibrate_apply(slot):
+    """Add the fitted deltas to the corresponding Process-tab widgets."""
+    def _cb(_event):
+        fit_px = slot.get("last_fit_px")
+        if fit_px is None:
+            return
+        if slot["detector"] == "saxs":
+            w_proc_saxs_row_delta.value = float(
+                w_proc_saxs_row_delta.value + fit_px.drow_px
+            )
+            w_proc_saxs_col_delta.value = float(
+                w_proc_saxs_col_delta.value + fit_px.dcol_px
+            )
+            if slot["expose_distance"] and fit_px.ddist_mm is not None:
+                w_proc_dist_delta.value = float(
+                    w_proc_dist_delta.value + fit_px.ddist_mm
+                )
+        else:
+            w_proc_waxs_row_delta.value = float(
+                w_proc_waxs_row_delta.value + fit_px.drow_px
+            )
+            w_proc_waxs_col_delta.value = float(
+                w_proc_waxs_col_delta.value + fit_px.dcol_px
+            )
+        slot["status"].object = (
+            f"*Δ applied to Process widgets — click **⚙ Process** to "
+            f"re-reduce, then fit again to verify convergence.*"
+        )
+        slot["apply_btn"].disabled = True
+        slot["last_fit_px"] = None
+    return _cb
+
+
+def _on_calibrate_reset(slot):
+    """Zero the Process-tab Δ widgets for this detector."""
+    def _cb(_event):
+        if slot["detector"] == "saxs":
+            w_proc_saxs_row_delta.value = DEFAULT_SAXS_ROW_DELTA
+            w_proc_saxs_col_delta.value = DEFAULT_SAXS_COL_DELTA
+            w_proc_dist_delta.value = DEFAULT_SAXS_DIST_DELTA
+        else:
+            w_proc_waxs_row_delta.value = DEFAULT_WAXS_ROW_DELTA
+            w_proc_waxs_col_delta.value = 0.0
+        slot["status"].object = (
+            f"*{slot['detector'].upper()} Δ widgets reset to defaults.*"
+        )
+        slot["result"].object = ""
+        slot["apply_btn"].disabled = True
+        slot["last_fit_px"] = None
+    return _cb
+
+
+def _on_calibrate_pick_toggle(slot):
+    """Activate the 2-click q-range picker for this detector.
+
+    Only one detector's picker can be active at a time — toggling one on
+    deactivates the other.
+    """
+    def _cb(event):
+        if event.new:
+            other = _CAL_WAXS if slot["detector"] == "saxs" else _CAL_SAXS
+            if other["pick_btn"].value:
+                other["pick_btn"].value = False
+            _calibrate_picker_state["detector"] = slot["detector"]
+            _calibrate_picker_state["first_q"] = None
+            slot["status"].object = (
+                "*Picker armed — click the q-χ plot once for q_min, "
+                "again for q_max.*"
+            )
+        else:
+            if _calibrate_picker_state["detector"] == slot["detector"]:
+                _calibrate_picker_state["detector"] = None
+                _calibrate_picker_state["first_q"] = None
+    return _cb
+
+
+def _on_qchi_tap(event):
+    """Tap handler installed on the q-χ figure to drive the picker."""
+    state = _calibrate_picker_state
+    det = state.get("detector")
+    if det is None:
+        return
+    slot = _CAL_SAXS if det == "saxs" else _CAL_WAXS
+    q_clicked = float(event.x)
+    if state["first_q"] is None:
+        state["first_q"] = q_clicked
+        # Light up a single vertical line so the user sees they registered.
+        _draw_pick_lines([q_clicked])
+        slot["status"].object = (
+            f"*First click: q={q_clicked:.3f} nm⁻¹.  Click again to set q_max.*"
+        )
+        return
+    q_low, q_high = sorted([state["first_q"], q_clicked])
+    state["first_q"] = None
+    slot["q_min"].value = round(q_low, 3)
+    slot["q_max"].value = round(q_high, 3)
+    # Auto-snap ring order.
+    n = nearest_agbh_order((q_low + q_high) / 2.0)
+    slot["ring"].value = n
+    slot["pick_btn"].value = False  # arms off
+    _draw_pick_lines([q_low, q_high])
+    slot["status"].object = (
+        f"*Picked q ∈ [{q_low:.3f}, {q_high:.3f}] nm⁻¹.  "
+        f"Auto-snapped to AgBh ring {n} (expected q={agbh_q(n):.3f}).  "
+        f"Click **Fit {det.upper()} ring** to fit.*"
+    )
+
+
+def _attach_calibrate_to_figure(p):
+    """Wire the q-χ figure with tap callback + empty overlay renderers.
+
+    The q-pick guides are vertical Spans (no source / no y-axis binding),
+    added/removed on the fly by :func:`_draw_pick_lines`.
+    """
+    from bokeh.models import ColumnDataSource
+
+    peaks_src = ColumnDataSource(data={"q": [], "chi": []})
+    curve_src = ColumnDataSource(data={"q": [], "chi": []})
+
+    peaks_renderer = p.scatter(
+        x="q", y="chi", source=peaks_src,
+        size=4, color="#ff8c00", line_color="#5a2e00",
+        line_width=0.5, alpha=0.85,
+        legend_label="ring peaks",
+    )
+    curve_renderer = p.line(
+        x="q", y="chi", source=curve_src,
+        color="#1f78ff", line_width=2,
+        legend_label="sinusoid fit",
+    )
+    if p.legend:
+        p.legend.click_policy = "hide"
+        p.legend.location = "bottom_right"
+        p.legend.background_fill_alpha = 0.7
+    # Initially hide overlays — they're populated by _draw_calibrate_overlay.
+    peaks_renderer.visible = False
+    curve_renderer.visible = False
+
+    _calibrate_overlay.update(
+        fig=p,
+        peaks_source=peaks_src,
+        fit_curve_source=curve_src,
+        peaks_renderer=peaks_renderer,
+        curve_renderer=curve_renderer,
+        pick_spans=[],
+    )
+    p.on_event("tap", _on_qchi_tap)
+
+
+def _draw_calibrate_overlay(detector, peak_fit, fit_q, fit_px):
+    """Update the peak-marker scatter + sinusoid curve on the q-χ figure."""
+    src_p = _calibrate_overlay.get("peaks_source")
+    src_c = _calibrate_overlay.get("fit_curve_source")
+    if src_p is None or src_c is None:
+        return
+    src_p.data = {"q": list(map(float, peak_fit.q_peak)),
+                  "chi": list(map(float, peak_fit.chi_deg))}
+    # Dense sinusoid for the fit line.
+    chi_dense = np.linspace(-180.0, 180.0, 721)
+    chi_rad = np.deg2rad(chi_dense)
+    q_curve = fit_q.q0 + fit_q.A_r * np.sin(chi_rad) + fit_q.A_c * np.cos(chi_rad)
+    src_c.data = {"q": q_curve.tolist(), "chi": chi_dense.tolist()}
+    pr = _calibrate_overlay.get("peaks_renderer")
+    cr = _calibrate_overlay.get("curve_renderer")
+    if pr is not None:
+        pr.visible = True
+    if cr is not None:
+        cr.visible = True
+
+
+def _draw_pick_lines(q_values):
+    """Refresh the vertical Span markers for the q-pick guides."""
+    from bokeh.models import Span
+
+    fig = _calibrate_overlay.get("fig")
+    if fig is None:
+        return
+    # Remove old spans.
+    for s in _calibrate_overlay.get("pick_spans", []):
+        try:
+            fig.center.remove(s)
+        except ValueError:
+            pass
+    new_spans = []
+    for q in q_values:
+        s = Span(
+            location=float(q), dimension="height",
+            line_color="#22aa33", line_dash="dashed", line_width=2,
+        )
+        fig.add_layout(s)
+        new_spans.append(s)
+    _calibrate_overlay["pick_spans"] = new_spans
+
+
+# Wire up callbacks now that all helpers are defined.
+for _slot in (_CAL_SAXS, _CAL_WAXS):
+    _slot["fit_btn"].on_click(_on_calibrate_fit(_slot))
+    _slot["apply_btn"].on_click(_on_calibrate_apply(_slot))
+    _slot["reset_btn"].on_click(_on_calibrate_reset(_slot))
+    _slot["pick_btn"].param.watch(_on_calibrate_pick_toggle(_slot), "value")
+
+
+def _build_calibrate_panel(slot):
+    """Lay out one detector's calibrate panel for inclusion in pn.Tabs."""
+    label = slot["detector"].upper()
+    geo_row = pn.Row(
+        slot["energy"], slot["dist"], slot["pixel"],
+    )
+    fit_row_1 = pn.Row(slot["ring"], slot["q_min"], slot["q_max"])
+    fit_row_2 = pn.Row(slot["chi_min"], slot["chi_max"], slot["snr"], slot["bg_order"])
+    btn_row = pn.Row(slot["pick_btn"], slot["fit_btn"],
+                     slot["apply_btn"], slot["reset_btn"])
+    expose = slot["expose_distance"]
+    extra_md = "" if expose else (
+        "  \n*WAXS panels are non-coplanar; the single-ring sinusoid catches "
+        "the average beam-centre offset only.  Watch the RMS — high residuals "
+        "suggest per-panel position errors which this fit can't correct.*"
+    )
+    return pn.Column(
+        pn.pane.Markdown(
+            f"**{label} AgBh ring calibration.**  Choose a ring (or click "
+            f"twice on the q-χ map above), then **Fit {label} ring** to "
+            f"recover the beam-centre offset"
+            + (" and distance error" if expose else "")
+            + ".  **Apply** adds the deltas to the Process-tab widgets — "
+            "re-Process and re-fit to verify."
+            + extra_md,
+        ),
+        pn.pane.Markdown("**Detector geometry** *(used to convert q-shift → "
+                         "pixels and distance)*"),
+        geo_row,
+        pn.pane.Markdown("**Fit window**"),
+        fit_row_1,
+        fit_row_2,
+        btn_row,
+        slot["status"],
+        slot["result"],
+        sizing_mode="stretch_width",
+    )
 
 
 def _on_geometry_change(event):
@@ -4423,6 +4958,7 @@ def _plot_2d_transmission(result, frame_idx=None):
     p.yaxis.axis_label = "χ (°)"
     _attach_cuts_to_figure(p, q, chi, cuts_image,
                            x_label="q (nm⁻¹)", y_label="χ (°)", title=title)
+    _attach_calibrate_to_figure(p)
     return p
 
 
@@ -4548,7 +5084,7 @@ def _build_proc_iq_plot():
     uid = _selected_uid() or ""
 
     if mode == "per-frame" and hasattr(result, "per_frame_iq") and result.per_frame_iq is not None:
-        # Per-frame I(q) from PyHyper (preferred path)
+        # Per-frame I(q) from smi-tiled (preferred path)
         pf_iq = result.per_frame_iq
         q = pf_iq["q"].values
         frame_labels = _get_frame_labels()
@@ -6892,7 +7428,7 @@ def _refresh_collection():
 # Batch processing — queue many scans from the current search results
 # ---------------------------------------------------------------------------
 #
-# A BatchProcessor (see batch_processor.py) runs PyHyperScattering reductions
+# A BatchProcessor (see batch_processor.py) runs smi-tiled reductions
 # on a background worker thread, leaving the UI interactive.  Status updates
 # are routed back onto the Bokeh document thread via add_next_tick_callback,
 # which is the only safe way to mutate widgets from a non-UI thread.
@@ -7151,7 +7687,7 @@ def _build_proc_params(uid: str) -> tuple:
     waxs_mask_path = _normalize_mask_path(w_proc_waxs_mask.value)
 
     if geometry == "grazing":
-        from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_gi
+        from smi_tiled import reduce_smi_gi
 
         gi_params: dict[str, Any] = dict(
             uid=uid,
@@ -7187,7 +7723,7 @@ def _build_proc_params(uid: str) -> tuple:
             gi_params["image_cache_path"] = str(_cp)
         return reduce_smi_gi, gi_params, geometry
 
-    from PyHyperScattering.SMISWAXSIntegrator import reduce_smi_combined
+    from smi_tiled import reduce_smi_combined
 
     params: dict[str, Any] = dict(
         uid=uid,
@@ -9077,7 +9613,7 @@ _live: dict[str, Any] = {
 #
 # After a successful login, the tokens get cached on disk via the standard
 # tiled token cache, so the cached tokens are also picked up by any
-# subprocess / fresh ``from_uri`` (including the one that PyHyperScattering
+# subprocess / fresh ``from_uri`` (including the one that smi-tiled
 # creates internally inside ``reduce_smi_combined``).  We also clear our
 # module-level ``_cat`` so the next access re-builds the catalog with the
 # refreshed credentials.
@@ -10159,22 +10695,46 @@ w_detail_tabs = pn.Tabs(
                         pn.Row(w_proc_iq_mode, w_proc_iq_label),
                         w_proc_frame_slider,
                         w_proc_2d_plot,
-                        # Cross sections — interactive overlay on the 2D plot above.
+                        # Advanced -- tools that read from the 2D plot above
+                        # (cross sections, AgBh calibration).
                         pn.Card(
-                            pn.pane.Markdown(
-                                "*Click **+ Horizontal cut** or **+ Vertical cut** to "
-                                "drop a dashed slice rectangle on the 2D plot above. "
-                                "Drag it to move; drag a corner/edge to resize the "
-                                "slice width. Hold shift+drag on empty space to draw "
-                                "a new box; click a box and press Backspace to delete. "
-                                "Cuts persist across scans \u2014 they are re-applied to "
-                                "every newly processed result.*",
+                            pn.Tabs(
+                                (
+                                    "Cross sections",
+                                    pn.Column(
+                                        pn.pane.Markdown(
+                                            "*Click **+ Horizontal cut** or "
+                                            "**+ Vertical cut** to drop a dashed "
+                                            "slice rectangle on the 2D plot above. "
+                                            "Drag it to move; drag a corner/edge "
+                                            "to resize the slice width. Hold "
+                                            "shift+drag on empty space to draw a "
+                                            "new box; click a box and press "
+                                            "Backspace to delete. Cuts persist "
+                                            "across scans -- they are "
+                                            "re-applied to every newly processed "
+                                            "result.*",
+                                        ),
+                                        pn.Row(w_btn_add_hcut, w_btn_add_vcut,
+                                               w_btn_clear_cuts,
+                                               w_cuts_log_x, w_cuts_log_y,
+                                               w_plot_style),
+                                        w_cuts_table,
+                                        w_proc_cuts_plot,
+                                        sizing_mode="stretch_width",
+                                    ),
+                                ),
+                                (
+                                    "Calibrate SAXS",
+                                    _build_calibrate_panel(_CAL_SAXS),
+                                ),
+                                (
+                                    "Calibrate WAXS",
+                                    _build_calibrate_panel(_CAL_WAXS),
+                                ),
+                                sizing_mode="stretch_width",
                             ),
-                            pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts,
-                                   w_cuts_log_x, w_cuts_log_y, w_plot_style),
-                            w_cuts_table,
-                            w_proc_cuts_plot,
-                            title="\u2702 Cross sections",
+                            title="Advanced",
                             collapsed=False, sizing_mode="stretch_width",
                         ),
                         w_proc_iq_plot,

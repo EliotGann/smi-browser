@@ -37,7 +37,7 @@ Two monkey-patches are applied at startup and must remain near the top of `smi_a
 | Module | Responsibility |
 |---|---|
 | `state.py` | `AppState` — single dataclass holding all mutable app state; UI modules receive it by argument, no module globals |
-| `config.py` | Constants and defaults, mostly re-exported from `PyHyperScattering.smi_defaults` |
+| `config.py` | Constants and defaults, mostly re-exported from `smi_tiled.defaults` |
 | `processing.py` | `build_proc_params()` — pure param builder; returns `(reduce_fn_name, kwargs)` for `reduce_smi_combined` or `reduce_smi_gi` |
 | `cache.py` | `ScanCache` — per-UID HDF5 disk cache for scalars, raw image stacks, and reduction outputs; thread-safe with per-file locks and LRU eviction |
 | `export.py` | Writes PNG figures and HDF5 files to proposal working directories (uses `nsls2api.py` for path resolution) |
@@ -60,7 +60,7 @@ Two monkey-patches are applied at startup and must remain near the top of `smi_a
 
 ### Data reduction
 
-All reduction goes through `PyHyperScattering` (local editable install, see `pixi.toml`). `processing.build_proc_params()` constructs the kwargs and returns the function name (`reduce_smi_combined` or `reduce_smi_gi`). The caller imports the actual callable. Calibrated defaults (beam-centre deltas, mask filenames, detector names) flow from `PyHyperScattering.smi_defaults` → `smi_browser/config.py`.
+All reduction goes through `smi-tiled` (local editable install at `../smi-tiled`, see `pixi.toml`). `processing.build_proc_params()` constructs the kwargs and returns the function name (`reduce_smi_combined` or `reduce_smi_gi`). The caller imports the actual callable from `smi_tiled` (both are top-level re-exports). Calibrated defaults (beam-centre deltas, mask filenames, detector names) flow from `smi_tiled.defaults` → `smi_browser/config.py`.
 
 ### Disk cache
 

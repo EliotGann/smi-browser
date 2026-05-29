@@ -1,14 +1,13 @@
 """Configuration constants and defaults for the SMI Browser.
 
-All beamline-calibrated values are imported from PyHyperScattering's
-``smi_defaults`` module so that a single upstream change propagates
-everywhere.
+All beamline-calibrated values are imported from ``smi_tiled.defaults`` so
+that a single upstream change propagates everywhere.
 """
 from __future__ import annotations
 
 import pandas as pd
 
-from PyHyperScattering import smi_defaults as smid
+from smi_tiled import defaults as smid
 
 # ---------------------------------------------------------------------------
 # Tiled connection
@@ -27,7 +26,7 @@ SAXS_DETECTOR_NAMES = smid.SAXS_DETECTOR_NAMES
 WAXS_DETECTOR_NAMES = smid.WAXS_DETECTOR_NAMES
 
 # ---------------------------------------------------------------------------
-# Loader-side calibrated defaults (frozen dataclass exposed by PyHyper)
+# Loader-side calibrated defaults (frozen dataclass exposed by smi-tiled)
 # ---------------------------------------------------------------------------
 
 _LD = smid.LOADER_DEFAULTS
@@ -38,7 +37,7 @@ DEFAULT_WAXS_COL_DELTA = _LD.waxs_col_delta_px
 DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 
 # ---------------------------------------------------------------------------
-# Processing defaults  (UI-side; mirror upstream PyHyper defaults so widgets
+# Processing defaults  (UI-side; mirror upstream smi-tiled defaults so widgets
 # show meaningful numbers even before any override.  When a widget value
 # still equals its default, _on_process passes None so the upstream loader
 # supplies its own calibrated default.)
@@ -46,9 +45,9 @@ DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 
 PAGE_SIZE = 25
 
-DEFAULT_N_Q = 2000          # PyHyper default is 1000; smi-browser used 2000
+DEFAULT_N_Q = 2000          # smi-tiled default is 1000; smi-browser used 2000
 DEFAULT_N_CHI = 360
-DEFAULT_SAXS_MASK = ""      # empty → use bundled default from PyHyper
+DEFAULT_SAXS_MASK = ""      # empty → use bundled default from smi-tiled
 DEFAULT_WAXS_MASK = ""
 DEFAULT_DEZINGER = 3000.0
 DEFAULT_INCIDENT_ANGLE = 0.0

@@ -1,7 +1,7 @@
-"""Polygon mask projection helpers for Bokeh overlay ↔ PyHyper mask dicts."""
+"""Polygon mask projection helpers for Bokeh overlay ↔ smi-tiled mask dicts."""
 from __future__ import annotations
 
-from PyHyperScattering import smi_defaults as smid
+from smi_tiled import defaults as smid
 
 
 def classify_detector_field(field: str) -> str | None:
