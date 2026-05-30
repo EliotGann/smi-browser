@@ -1261,6 +1261,47 @@ w_primary_fit_btn = pn.widgets.Button(
 )
 w_primary_fit_result = pn.pane.Markdown("", sizing_mode="stretch_width")
 
+# ---- 2D-plot sub-tab widgets -----------------------------------------
+# Auto-image when the (X, Y) columns happen to form a regular grid,
+# falling back to a colour-mapped scatter otherwise.  Defaults are
+# seeded from ``start.motors`` / ``start.hints.dimensions`` on each new
+# scan load by ``_load_primary``.
+from smi_browser.figures.primary_2d import AVAILABLE_CMAPS, DEFAULT_CMAP
+
+w_primary_2d_x = pn.widgets.Select(
+    name="X axis", options=[], width=180,
+    description="Column for the horizontal axis. Defaults to the inner "
+                "(fast) scanned motor from start.motors.",
+)
+w_primary_2d_y = pn.widgets.Select(
+    name="Y axis", options=[], width=180,
+    description="Column for the vertical axis. Defaults to the next-outer "
+                "scanned motor from start.motors.",
+)
+w_primary_2d_z = pn.widgets.Select(
+    name="Z (colour)", options=[], width=200,
+    description="Column mapped to colour. Defaults to an intensity-like "
+                "non-motor column (pin_diode, monitor, …).",
+)
+w_primary_2d_cmap = pn.widgets.Select(
+    name="Colormap", options=list(AVAILABLE_CMAPS), value=DEFAULT_CMAP, width=140,
+)
+w_primary_2d_log = pn.widgets.Checkbox(
+    name="log colour", value=False, width=110,
+)
+w_primary_2d_aspect = pn.widgets.Select(
+    name="Aspect", options=["fill", "equal"], value="fill", width=100,
+    description="'fill' stretches the plot to the available width; "
+                "'equal' keeps X and Y units isotropic.",
+)
+w_primary_2d_plot = pn.pane.Bokeh(
+    object=None, sizing_mode="stretch_width", height=470,
+)
+w_primary_2d_status = pn.pane.Markdown(
+    "*Load a scan and pick X / Y / Z — auto-detects grid vs scatter.*",
+    sizing_mode="stretch_width",
+)
+
 w_baseline_table = pn.widgets.Tabulator(
     value=pd.DataFrame(columns=["source", "field", "before", "after"]),
     show_index=False, sizing_mode="stretch_both",
@@ -5410,6 +5451,8 @@ def _reset_detail(preserve_figure=False):
     w_primary_status.object = "*Click tab to load.*"
     # Don't clear x/y options/values — they persist across scans
     w_primary_plot.object = None
+    w_primary_2d_plot.object = None
+    w_primary_2d_status.object = "*Load a scan to see the 2D plot.*"
     w_baseline_table.value = pd.DataFrame(columns=["source", "field", "before", "after"])
     w_baseline_status.object = "*Click tab to load.*"
     if not preserve_figure:
@@ -5696,6 +5739,11 @@ def _load_primary():
     _detail_cache["primary_info"] = info
     _detail_cache["primary_dataset"] = ds
     _detail_cache["primary_loaded"] = True
+    # 2D-plot defaults (uses start.motors / start.hints.dimensions if
+    # present) — populate the X/Y/Z dropdowns and trigger the initial
+    # render.
+    start_md = (run.metadata.get("start") if run is not None else None) or {}
+    _populate_primary_2d_defaults(df, start_md)
     # Update export frame-label options
     _refresh_export_labels()
     _refresh_export_resolved_path()
@@ -6577,6 +6625,103 @@ def _on_primary_sort_btn(_event=None):
 
 
 w_primary_sort_btn.on_click(_on_primary_sort_btn)
+
+
+# ---- 2D plot wiring --------------------------------------------------
+
+from smi_browser.figures.primary_2d import build_primary_2d
+from smi_browser.models.grid import pick_default_axes
+
+
+def _populate_primary_2d_defaults(df, start_md):
+    """Seed the X / Y / Z dropdowns from the current scan's start metadata.
+
+    Always called after ``_load_primary`` has filled ``w_primary_table``.
+    Preserves the user's prior selection if those columns still exist in
+    the new dataframe (so flipping between scans of the same kind doesn't
+    reset their picks).
+    """
+    if df is None or df.empty:
+        for w in (w_primary_2d_x, w_primary_2d_y, w_primary_2d_z):
+            w.options = []
+            w.value = None
+        w_primary_2d_status.object = "*No primary data — pick a scan first.*"
+        return
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    prev_x = w_primary_2d_x.value
+    prev_y = w_primary_2d_y.value
+    prev_z = w_primary_2d_z.value
+    default_x, default_y, default_z = pick_default_axes(df, start_md)
+
+    def _chosen(prev, default):
+        if prev in numeric_cols:
+            return prev
+        return default if default in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+
+    # Suppress watchers while we batch-update so we trigger only ONE
+    # redraw at the end.
+    _primary_2d_guard["active"] = True
+    try:
+        for w, prev, default in (
+            (w_primary_2d_x, prev_x, default_x),
+            (w_primary_2d_y, prev_y, default_y),
+            (w_primary_2d_z, prev_z, default_z),
+        ):
+            w.options = numeric_cols
+            w.value = _chosen(prev, default)
+    finally:
+        _primary_2d_guard["active"] = False
+    _update_primary_2d()
+
+
+_primary_2d_guard = {"active": False}
+
+
+def _update_primary_2d(*_events):
+    """Rebuild the 2D plot from the current widget selections."""
+    if _primary_2d_guard["active"]:
+        return
+    df = w_primary_table.value
+    if df is None or df.empty:
+        w_primary_2d_plot.object = None
+        w_primary_2d_status.object = "*Load a scan to see the 2D plot.*"
+        return
+    x_col = w_primary_2d_x.value
+    y_col = w_primary_2d_y.value
+    z_col = w_primary_2d_z.value
+    if not (x_col and y_col and z_col):
+        w_primary_2d_plot.object = None
+        w_primary_2d_status.object = "*Pick X, Y, and Z columns.*"
+        return
+    if x_col == y_col:
+        w_primary_2d_plot.object = None
+        w_primary_2d_status.object = "*X and Y must be different columns.*"
+        return
+    missing = [c for c in (x_col, y_col, z_col) if c not in df.columns]
+    if missing:
+        w_primary_2d_plot.object = None
+        w_primary_2d_status.object = f"*Columns no longer in table: {missing}.*"
+        return
+    try:
+        out = build_primary_2d(
+            df[x_col].values, df[y_col].values, df[z_col].values,
+            x_label=x_col, y_label=y_col, z_label=z_col,
+            cmap=w_primary_2d_cmap.value,
+            log_color=bool(w_primary_2d_log.value),
+            aspect=w_primary_2d_aspect.value,
+        )
+    except Exception as exc:
+        log.warning("Primary 2D plot failed: %s", exc)
+        w_primary_2d_plot.object = None
+        w_primary_2d_status.object = f"*Plot failed: {exc}*"
+        return
+    w_primary_2d_plot.object = out.figure
+    w_primary_2d_status.object = out.status
+
+
+for _w in (w_primary_2d_x, w_primary_2d_y, w_primary_2d_z,
+           w_primary_2d_cmap, w_primary_2d_log, w_primary_2d_aspect):
+    _w.param.watch(_update_primary_2d, "value")
 
 
 def _fit_gaussian(x, y):
@@ -10613,10 +10758,31 @@ w_detail_tabs = pn.Tabs(
         pn.Column(
             pn.Row(w_primary_status, w_primary_spinner),
             w_primary_table,
-            pn.Row(w_primary_x, w_primary_y),
-            pn.Row(w_primary_sort_btn, w_primary_fit, w_primary_fit_btn),
-            w_primary_plot,
-            w_primary_fit_result,
+            pn.Tabs(
+                (
+                    "1D plot",
+                    pn.Column(
+                        pn.Row(w_primary_x, w_primary_y),
+                        pn.Row(w_primary_sort_btn, w_primary_fit,
+                               w_primary_fit_btn),
+                        w_primary_plot,
+                        w_primary_fit_result,
+                        sizing_mode="stretch_width",
+                    ),
+                ),
+                (
+                    "2D plot",
+                    pn.Column(
+                        pn.Row(w_primary_2d_x, w_primary_2d_y, w_primary_2d_z),
+                        pn.Row(w_primary_2d_cmap, w_primary_2d_log,
+                               w_primary_2d_aspect),
+                        w_primary_2d_status,
+                        w_primary_2d_plot,
+                        sizing_mode="stretch_width",
+                    ),
+                ),
+                sizing_mode="stretch_width",
+            ),
         ),
     ),
     (
