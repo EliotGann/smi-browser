@@ -96,6 +96,61 @@ def test_reduction_roundtrip_with_params(isolated_cache_dir):
     assert str(blob["params"]["geometry"]) == "transmission"
 
 
+def test_lazy_per_frame_fetch_only_loads_requested(isolated_cache_dir):
+    from smi_browser.cache import get_or_fetch_image_frame
+
+    calls = []
+
+    def fetch_one(i):
+        calls.append(i)
+        return np.full((3, 4), i, dtype="int32")
+
+    uid, field, n = "lazy", "det_image", 100
+    f = get_or_fetch_image_frame(uid, field, 42, fetch_one_fn=fetch_one, n_frames=n)
+    assert f[0, 0] == 42 and calls == [42]
+
+    # Re-view is served from disk — no refetch.
+    calls.clear()
+    f = get_or_fetch_image_frame(uid, field, 42, fetch_one_fn=fetch_one, n_frames=n)
+    assert f[0, 0] == 42 and calls == []
+
+    # A different (unfilled) frame fetches only that frame.
+    calls.clear()
+    f = get_or_fetch_image_frame(uid, field, 88, fetch_one_fn=fetch_one, n_frames=n)
+    assert f[0, 0] == 88 and calls == [88]
+
+    # Dataset is pre-sized for all frames but only the two viewed are filled.
+    import h5py
+    with h5py.File(ScanCache(uid).path, "r") as h:
+        assert h[f"images/{field}"].shape == (n, 3, 4)
+        assert int(h[f"images_filled/{field}"][...].sum()) == 2
+
+
+def test_lazy_unknown_length_serves_uncached(isolated_cache_dir):
+    from smi_browser.cache import get_or_fetch_image_frame
+    calls = []
+
+    def fetch_one(i):
+        calls.append(i)
+        return np.full((2, 2), i, dtype="int32")
+
+    # n_frames unknown → single frame served, nothing written to disk.
+    f = get_or_fetch_image_frame("u2", "det", 5, fetch_one_fn=fetch_one, n_frames=0)
+    assert f[0, 0] == 5 and calls == [5]
+    assert not ScanCache("u2").has_image_field("det")
+
+
+def test_legacy_full_stack_still_served(isolated_cache_dir):
+    """A full-stack write (no fill mask) serves every frame as filled."""
+    from smi_browser.cache import get_or_fetch_image_frame
+    uid, field = "legacy", "det_image"
+    stack = np.arange(5 * 2 * 2, dtype="int32").reshape(5, 2, 2)
+    ScanCache(uid).write_image_stack(field, stack)
+    # No fetch_one_fn needed — frame comes straight from the cached stack.
+    f = get_or_fetch_image_frame(uid, field, 3, fetch_one_fn=lambda i: None, n_frames=5)
+    np.testing.assert_array_equal(f, stack[3])
+
+
 def test_read_reduction_datasets_subset(isolated_cache_dir):
     c = ScanCache("uid-subset")
     c.write_reduction({

@@ -462,6 +462,8 @@ def get_or_fetch_image_stack(uid: str, field: str, fetch_fn) -> np.ndarray | Non
     cached = cache.read_image_stack(field)
     if cached is not None:
         return cached
+    from . import memlog
+    memlog.report(f"img_stack:fetch_start {field}")
     try:
         arr = fetch_fn()
     except Exception:
@@ -469,6 +471,7 @@ def get_or_fetch_image_stack(uid: str, field: str, fetch_fn) -> np.ndarray | Non
         return None
     if arr is None:
         return None
+    memlog.report(f"img_stack:fetched {field}", {"stack": arr})
     try:
         cache.write_image_stack(field, arr)
     except Exception:
@@ -480,39 +483,68 @@ def get_or_fetch_image_frame(
     uid: str,
     field: str,
     frame_idx: int,
-    fetch_stack_fn,
+    fetch_stack_fn=None,
+    *,
+    fetch_one_fn=None,
+    n_frames: int | None = None,
 ) -> np.ndarray | None:
-    """Return a single frame from the cached image stack, fetching on miss.
+    """Return a single image frame, caching frames *individually* on miss.
 
-    On a cache miss the *full* stack is fetched via ``fetch_stack_fn()`` and
-    persisted so subsequent frame requests are served from disk.
+    Preferred (memory-bounded) usage: pass ``fetch_one_fn`` (``idx -> 2-D
+    frame``) and ``n_frames``.  Only the requested frame is read and written
+    into a pre-sized, per-frame-chunked HDF5 dataset, with a companion
+    ``images_filled/<field>`` mask so repeat views read straight from disk —
+    the full stack is never held in RAM.
 
-    ``fetch_stack_fn`` is a zero-arg callable returning the full 3-D stack
-    (or None).
+    Legacy usage: pass ``fetch_stack_fn`` (zero-arg → full 3-D stack).  This
+    materialises the entire stack in RAM (a large transient for long scans)
+    and is kept only for callers that genuinely need the whole stack.
     """
     import h5py
 
     cache = ScanCache(uid)
+    dset_name = f"images/{field}"
+    fill_name = f"images_filled/{field}"
 
-    # Fast path: read just the requested frame slice from the h5 dataset.
-    # If the requested index is beyond the cached stack (the scan has grown
-    # since it was cached, e.g. during live mode), fall through to refetch
-    # rather than letting h5py raise IndexError.
+    # Fast path: read just the requested frame from disk.  When a fill mask is
+    # present (lazy per-frame cache) the frame is only valid if marked filled;
+    # a legacy full-stack write has no mask, so every frame is valid.
     if cache.path.exists():
         with cache._lock:
             try:
                 with h5py.File(cache.path, "r") as f:
-                    ds = f.get(f"images/{field}")
-                    if ds is not None:
-                        if ds.ndim >= 3:
-                            if frame_idx < ds.shape[0]:
+                    ds = f.get(dset_name)
+                    if ds is not None and ds.ndim >= 3:
+                        if frame_idx < ds.shape[0]:
+                            fl = f.get(fill_name)
+                            if fl is None or (frame_idx < fl.shape[0]
+                                              and fl[frame_idx]):
                                 return ds[frame_idx]
-                        else:
-                            return ds[...]
+                    elif ds is not None:
+                        return ds[...]
             except (OSError, IndexError, ValueError, KeyError):
                 pass
 
-    # Cache miss — fetch the full stack, write it, then return the frame
+    # --- Cache miss ---
+    if fetch_one_fn is not None:
+        if n_frames:
+            return _cache_one_frame(cache, field, int(frame_idx),
+                                    int(n_frames), fetch_one_fn)
+        # Unknown length — serve a single uncached frame (still bounded RAM).
+        try:
+            fr = fetch_one_fn(frame_idx)
+        except Exception:
+            log.exception("cache: fetch_one_fn failed for %s/%s[%d]",
+                          uid, field, frame_idx)
+            return None
+        return None if fr is None else np.asarray(fr)
+
+    if fetch_stack_fn is None:
+        return None
+
+    # Legacy whole-stack path (materialises the full stack in RAM).
+    from . import memlog
+    memlog.report(f"img_stack:fetch_start {field}")
     try:
         stack = fetch_stack_fn()
     except Exception:
@@ -521,11 +553,50 @@ def get_or_fetch_image_frame(
     if stack is None:
         return None
     stack = np.asarray(stack)
+    memlog.report(f"img_stack:fetched {field}", {"stack": stack})
     try:
         cache.write_image_stack(field, stack)
     except Exception:
         log.exception("cache: write_image_stack failed for %s/%s", uid, field)
-    # Return requested frame
     if stack.ndim >= 3:
         return stack[frame_idx]
     return stack
+
+
+def _cache_one_frame(cache, field, frame_idx, n_frames, fetch_one_fn):
+    """Fetch one frame and store it in a per-frame-chunked, partially-filled
+    HDF5 dataset — never holding more than a single frame in RAM."""
+    import h5py
+
+    try:
+        frame = fetch_one_fn(frame_idx)
+    except Exception:
+        log.exception("cache: fetch_one_fn failed for %s[%d]", field, frame_idx)
+        return None
+    if frame is None:
+        return None
+    frame = np.asarray(frame)
+    dset_name = f"images/{field}"
+    fill_name = f"images_filled/{field}"
+    with cache._lock:
+        try:
+            with h5py.File(cache.path, "a") as f:
+                ds = f.get(dset_name)
+                if ds is None:
+                    ds = f.create_dataset(
+                        dset_name, shape=(n_frames,) + frame.shape,
+                        dtype=frame.dtype, chunks=(1,) + frame.shape,
+                        compression="gzip", compression_opts=2,
+                    )
+                fl = f.get(fill_name)
+                if fl is None:
+                    fl = f.create_dataset(fill_name, shape=(ds.shape[0],),
+                                          dtype="u1")
+                if 0 <= frame_idx < ds.shape[0] and frame.shape == ds.shape[1:]:
+                    ds[frame_idx] = frame
+                    fl[frame_idx] = 1
+        except (OSError, ValueError, TypeError):
+            log.exception("cache: per-frame write failed for %s[%d]",
+                          field, frame_idx)
+    _maybe_evict()
+    return frame

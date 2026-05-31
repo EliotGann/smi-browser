@@ -49,12 +49,44 @@ import tiled_browser as tb
 from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 from smi_browser import nsls2api
+from smi_browser import memlog
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
     prune_lock_table,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _result_nbytes(result) -> int:
+    """Resident bytes held by a reduction result's eager arrays (lazy → 0)."""
+    if result is None:
+        return 0
+    return sum(memlog.nbytes(getattr(result, attr, None))
+               for attr in ("merged_qchi", "merged_iq", "per_frame_iq"))
+
+
+def _mem_report(tag: str) -> None:
+    """Log RSS + a breakdown of the big in-memory holders (opt-in)."""
+    if not memlog.enabled():
+        return
+    try:
+        coll_bytes = 0
+        try:
+            coll_bytes = sum(_result_nbytes(r)
+                             for r in _collection._results.values())
+        except Exception:
+            pass
+        memlog.report(tag, {
+            "primary_df": w_primary_table.value,
+            "peakmap_iq": _peakmap_cache.get("iq"),
+            "perframe_qchi_lru": _per_frame_qchi_lru,
+            "proc_result": _result_nbytes(_proc_result_cache.get("result")),
+            "collection": coll_bytes,
+            "img_frame": _image_cache.get("source"),
+        })
+    except Exception:
+        log.debug("mem report failed", exc_info=True)
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -1929,7 +1961,9 @@ def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray 
     if uid and not _live.get("active"):
         arr = get_or_fetch_image_frame(
             uid, field, frame_idx,
-            lambda: tb.fetch_all_frames(run, "primary", field),
+            fetch_one_fn=lambda i: tb.fetch_frame(run, "primary", field,
+                                                  frame_idx=i),
+            n_frames=_image_cache.get("n_frames") or 0,
         )
     else:
         arr = tb.fetch_frame(run, "primary", field, frame_idx=frame_idx, _dataset=ds)
@@ -2750,7 +2784,9 @@ def _fetch_and_build_multiview_multi(field: str) -> None:
             try:
                 arr = get_or_fetch_image_frame(
                     uid, field, i,
-                    lambda r=run: tb.fetch_all_frames(r, "primary", field),
+                    fetch_one_fn=lambda j, r=run: tb.fetch_frame(
+                        r, "primary", field, frame_idx=j),
+                    n_frames=n_per_scan.get(uid, 0),
                 )
             except Exception:
                 log.exception("multiview-multi: fetch failed %s [%d]",
@@ -2859,7 +2895,9 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
         if uid and not live:
             arr = get_or_fetch_image_frame(
                 uid, field, i,
-                lambda: tb.fetch_all_frames(run, "primary", field),
+                fetch_one_fn=lambda j: tb.fetch_frame(run, "primary", field,
+                                                      frame_idx=j),
+                n_frames=total_frames,
             )
         else:
             arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
@@ -5249,6 +5287,7 @@ def _peakmap_load(uid: "str | None", force: bool = False):
     _refresh_heatmap()
     _update_z_peak_options()
     _update_peak_map()
+    _mem_report("peakmap:load")
 
 
 def _default_peak_range() -> tuple[float, float]:
@@ -5452,6 +5491,7 @@ def _on_peak_fit(event=None):
                 w_peak_status.object = (
                     f"**Fit complete** — {len(peaks)} peak(s) across "
                     f"{n_frames} frames.")
+            _mem_report("peakmap:fit")
         _marshal(_finish)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -6693,7 +6733,9 @@ def _render_explore_multi_grid(field: str | None = None,
 
         arr = get_or_fetch_image_frame(
             uid, field, idx,
-            lambda r=run: tb.fetch_all_frames(r, "primary", field),
+            fetch_one_fn=lambda j, r=run: tb.fetch_frame(
+                r, "primary", field, frame_idx=j),
+            n_frames=n_total,
         )
         if arr is not None:
             arr = _coerce_to_2d_frame(arr)
@@ -8175,6 +8217,7 @@ def _on_process_multi(uids: list[str]) -> None:
         w_btn_process.disabled = False
         w_proc_spinner.value = False
         w_proc_spinner.visible = False
+        _mem_report("process:done")
 
 
 def _on_process(event):
@@ -8188,6 +8231,7 @@ def _on_process(event):
 
     uid = uids[0]
     geometry = w_proc_geometry.value
+    _mem_report("process:start")
     w_proc_status.object = f"*Processing `{uid[:12]}…` ({geometry})*"
     w_proc_spinner.value = True
     w_proc_spinner.visible = True
@@ -8355,6 +8399,7 @@ def _on_process(event):
         w_btn_process.disabled = False
         w_proc_spinner.value = False
         w_proc_spinner.visible = False
+        _mem_report("process:done")
 
 
 def _on_add_to_collection(event):
