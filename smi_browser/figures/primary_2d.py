@@ -174,11 +174,12 @@ def build_primary_2d(
             dw=x1 - x0, dh=y1 - y0,
             color_mapper=mapper,
         )
-        # Hover: show cell index + value.  Bokeh's image hover gives us
-        # x/y in data coords; we map them to nearest cell ourselves.
+        # Hover: image glyphs expose the cursor's data coords as $x/$y (there
+        # are no "x"/"y" CDS columns to reference via @), and the value under
+        # the cursor as @image.
         p.add_tools(HoverTool(renderers=[renderer], tooltips=[
-            (x_label, "@x{0.000}"),
-            (y_label, "@y{0.000}"),
+            (x_label, "$x{0.000}"),
+            (y_label, "$y{0.000}"),
             (z_label, "@image{0.000e}"),
         ]))
         bar = ColorBar(color_mapper=mapper, label_standoff=8, width=12,
@@ -198,9 +199,11 @@ def build_primary_2d(
 
     # Only keep finite triples for scatter.
     finite = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(z_arr)
+    seq_all = np.arange(x_arr.size)
     xf = x_arr[finite]
     yf = y_arr[finite]
     zf = z_arr[finite]
+    seqf = seq_all[finite]
     if xf.size == 0:
         return Primary2DPlot(figure=None,
                              status="*All points were non-finite.*",
@@ -208,7 +211,8 @@ def build_primary_2d(
 
     p = bk_figure(**fig_kw)
     mapper = _build_mapper(zf, cmap, log_color)
-    src = ColumnDataSource(data={"x": xf, "y": yf, "z": zf})
+    # "seq" is the original row / event index → the matching image frame.
+    src = ColumnDataSource(data={"x": xf, "y": yf, "z": zf, "seq": seqf})
     renderer = p.scatter(
         x="x", y="y", source=src,
         size=6,
@@ -216,6 +220,7 @@ def build_primary_2d(
         line_color=None, fill_alpha=0.85,
     )
     p.add_tools(HoverTool(renderers=[renderer], tooltips=[
+        ("seq", "@seq"),
         (x_label, "@x{0.000}"),
         (y_label, "@y{0.000}"),
         (z_label, "@z{0.000e}"),

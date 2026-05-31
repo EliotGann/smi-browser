@@ -5,13 +5,15 @@ import numpy as np
 
 
 def grid_dims(n: int) -> tuple[int, int]:
-    """Pick (rows, cols) so cols/rows ≈ 2 (approx 2:1 grid aspect)."""
+    """Pick (rows, cols) for a near-square, space-filling grid.
+
+    Columns = ceil(sqrt(n)) so the layout forms a tight rectangle (e.g. 64
+    frames → 8×8) rather than a wide ragged block with a half-empty last row.
+    """
     if n <= 0:
         return 1, 1
-    rows = max(1, int(round(np.sqrt(n / 2.0))))
-    cols = int(np.ceil(n / rows))
-    while rows * cols < n:
-        cols += 1
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
     return rows, cols
 
 

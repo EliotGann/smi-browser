@@ -96,6 +96,24 @@ def test_reduction_roundtrip_with_params(isolated_cache_dir):
     assert str(blob["params"]["geometry"]) == "transmission"
 
 
+def test_read_reduction_datasets_subset(isolated_cache_dir):
+    c = ScanCache("uid-subset")
+    c.write_reduction({
+        "pf_iq_I": np.zeros((4, 6)),
+        "pf_iq_q": np.arange(6.0),
+        "qchi_intensity": np.ones((6, 3)),  # large array we should NOT load
+    }, {"n_q": 6})
+    got = c.read_reduction_datasets(["pf_iq_I", "pf_iq_q"])
+    assert set(got) == {"pf_iq_I", "pf_iq_q"}
+    assert got["pf_iq_I"].shape == (4, 6)
+    # Missing keys are simply absent; no error.
+    assert c.read_reduction_datasets(["nope"]) == {}
+
+
+def test_read_reduction_datasets_no_reduction(isolated_cache_dir):
+    assert ScanCache("uid-empty").read_reduction_datasets(["pf_iq_I"]) is None
+
+
 def test_reduction_overwrites(isolated_cache_dir):
     c = ScanCache("uid-red2")
     c.write_reduction({"x": np.array([1.0, 2.0])}, {"n_q": 10})

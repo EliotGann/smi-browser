@@ -266,6 +266,32 @@ def _save_linecuts(
 # HDF5 dataset export
 # ---------------------------------------------------------------------------
 
+def _write_qchi_frames_streamed(grp, frames_ds) -> None:
+    """Write a per-frame q-chi ``(frame, q, chi)`` stack to HDF5 frame-by-frame.
+
+    ``frames_ds['intensity']`` may be a lazy dask/zarr array (large scans), so
+    we compute and write one frame at a time into a per-frame-chunked dataset
+    instead of materialising the whole multi-GB stack via ``.values``.
+    """
+    n = int(frames_ds.sizes.get("frame", 0))
+    grp.attrs["n_frames"] = n
+    if n == 0:
+        return
+    intensity = frames_ds["intensity"]
+    sample = np.asarray(intensity.isel(frame=0).values)
+    dset = grp.create_dataset(
+        "intensity", shape=(n,) + sample.shape, dtype=sample.dtype,
+        chunks=(1,) + sample.shape, compression="gzip", compression_opts=4,
+    )
+    dset[0] = sample
+    for i in range(1, n):
+        dset[i] = np.asarray(intensity.isel(frame=i).values)
+    if "q" in frames_ds.coords:
+        grp.create_dataset("q", data=frames_ds["q"].values)
+    if "chi" in frames_ds.coords:
+        grp.create_dataset("chi", data=frames_ds["chi"].values)
+
+
 def _save_dataset_h5(
     result,
     gi_result,
@@ -449,27 +475,11 @@ def _save_dataset_h5(
                 if "chi" in qchi.coords:
                     pf_qchi_grp.create_dataset("chi", data=qchi["chi"].values)
                 if saxs_qchi_frames is not None:
-                    sg = pf_qchi_grp.create_group("saxs")
-                    sg.attrs["n_frames"] = saxs_qchi_frames.sizes.get("frame", 1)
-                    sg.create_dataset(
-                        "intensity", data=saxs_qchi_frames["intensity"].values,
-                        compression="gzip", compression_opts=4,
-                    )
-                    if "q" in saxs_qchi_frames.coords:
-                        sg.create_dataset("q", data=saxs_qchi_frames["q"].values)
-                    if "chi" in saxs_qchi_frames.coords:
-                        sg.create_dataset("chi", data=saxs_qchi_frames["chi"].values)
+                    _write_qchi_frames_streamed(
+                        pf_qchi_grp.create_group("saxs"), saxs_qchi_frames)
                 if waxs_qchi_frames is not None:
-                    wg = pf_qchi_grp.create_group("waxs")
-                    wg.attrs["n_frames"] = waxs_qchi_frames.sizes.get("frame", 1)
-                    wg.create_dataset(
-                        "intensity", data=waxs_qchi_frames["intensity"].values,
-                        compression="gzip", compression_opts=4,
-                    )
-                    if "q" in waxs_qchi_frames.coords:
-                        wg.create_dataset("q", data=waxs_qchi_frames["q"].values)
-                    if "chi" in waxs_qchi_frames.coords:
-                        wg.create_dataset("chi", data=waxs_qchi_frames["chi"].values)
+                    _write_qchi_frames_streamed(
+                        pf_qchi_grp.create_group("waxs"), waxs_qchi_frames)
                 if frame_labels:
                     pf_qchi_grp.create_dataset(
                         "frame_labels",

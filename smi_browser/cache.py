@@ -27,7 +27,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
+_warned_fallback = False
+
+
 def cache_root() -> Path:
     """Return the directory holding per-scan cache files.
 
@@ -45,6 +48,7 @@ def cache_root() -> Path:
     ``${TMPDIR:-/tmp}/smi_browser_cache`` if that directory is writable,
     otherwise ``~/.local/share/smi_browser_cache`` as a user-owned fallback.
     """
+    global _warned_fallback
     env = os.environ.get("SMI_BROWSER_CACHE_DIR")
     if env:
         root = Path(env).expanduser()
@@ -63,11 +67,15 @@ def cache_root() -> Path:
     # a user-owned location so writes don't fail silently.
     fallback = Path.home() / ".local" / "share" / "smi_browser_cache"
     fallback.mkdir(parents=True, exist_ok=True)
-    log.warning(
-        "cache: %s is not writable; using %s instead. "
-        "Set SMI_BROWSER_CACHE_DIR to override.",
-        tmp_root, fallback,
-    )
+    # Warn once per process — cache_root() runs on every ScanCache (once per
+    # frame), which would otherwise flood the log during live mode.
+    if not _warned_fallback:
+        _warned_fallback = True
+        log.warning(
+            "cache: %s is not writable; using %s instead. "
+            "Set SMI_BROWSER_CACHE_DIR to override.",
+            tmp_root, fallback,
+        )
     return fallback
 
 
@@ -289,6 +297,29 @@ class ScanCache:
                 log.warning("ScanCache.read_reduction: %s", exc)
                 return None
 
+    def read_reduction_datasets(
+        self, keys: Sequence[str],
+    ) -> dict[str, np.ndarray] | None:
+        """Read only the named ``reduction`` datasets, opening the file once.
+
+        Unlike :meth:`read_reduction`, this never materialises large arrays the
+        caller does not ask for (e.g. ``qchi_intensity``).  Missing datasets are
+        simply absent from the returned dict; ``None`` means no reduction group.
+        """
+        import h5py
+        if not self.path.exists():
+            return None
+        with self._lock:
+            try:
+                with h5py.File(self.path, "r") as f:
+                    if "reduction" not in f:
+                        return None
+                    g = f["reduction"]
+                    return {k: g[k][...] for k in keys if k in g}
+            except OSError as exc:
+                log.warning("ScanCache.read_reduction_datasets: %s", exc)
+                return None
+
     def write_reduction(self, arrays: dict[str, np.ndarray],
                         params: dict[str, Any] | None = None) -> None:
         """Persist reduction outputs, overwriting any previous run."""
@@ -463,7 +494,10 @@ def get_or_fetch_image_frame(
 
     cache = ScanCache(uid)
 
-    # Fast path: read just the requested frame slice from the h5 dataset
+    # Fast path: read just the requested frame slice from the h5 dataset.
+    # If the requested index is beyond the cached stack (the scan has grown
+    # since it was cached, e.g. during live mode), fall through to refetch
+    # rather than letting h5py raise IndexError.
     if cache.path.exists():
         with cache._lock:
             try:
@@ -471,10 +505,11 @@ def get_or_fetch_image_frame(
                     ds = f.get(f"images/{field}")
                     if ds is not None:
                         if ds.ndim >= 3:
-                            return ds[frame_idx]
+                            if frame_idx < ds.shape[0]:
+                                return ds[frame_idx]
                         else:
                             return ds[...]
-            except OSError:
+            except (OSError, IndexError, ValueError, KeyError):
                 pass
 
     # Cache miss — fetch the full stack, write it, then return the frame

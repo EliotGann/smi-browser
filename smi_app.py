@@ -33,6 +33,7 @@ import gc
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 import matplotlib
@@ -428,7 +429,23 @@ def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
             data[key] = padded
         else:
             data[key] = arr
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+
+    # Tiled often returns the primary "internal" table in a SHUFFLED row order
+    # (the document store does not preserve acquisition order).  The image
+    # stream and the per-frame reduction outputs are in acquisition order, so
+    # any scalar-vs-frame pairing (spatial maps, peak-fit maps, tap-to-frame)
+    # comes out scrambled unless we restore that order here.  Sort by seq_num
+    # (canonical acquisition counter), falling back to time.
+    for _sort_key in ("seq_num", "time"):
+        if _sort_key in df.columns:
+            col = pd.to_numeric(df[_sort_key], errors="coerce")
+            if col.notna().all():
+                order = np.argsort(col.to_numpy(), kind="mergesort")
+                if not np.array_equal(order, np.arange(len(order))):
+                    df = df.iloc[order].reset_index(drop=True)
+                break
+    return df
 
 
 def _scalar_stream_to_frame(run, stream: str, *, uid: str | None = None,
@@ -1332,6 +1349,10 @@ w_image_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=Fal
 w_image_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, sizing_mode="stretch_width",
 )
+# Exact-entry box: type any frame number; scroll wheel / spin arrows step by 1.
+w_image_frame_input = pn.widgets.IntInput(
+    name="#", value=0, start=0, end=1, step=1, width=100,
+)
 w_image_field = pn.widgets.Select(
     name="Detector", options=[], width=200,
 )
@@ -1349,6 +1370,24 @@ def _sync_explore_plot_visibility(*_):
 w_explore_plot.param.watch(_sync_explore_plot_visibility, "object")
 w_explore_x = pn.widgets.Select(name="X", options=[], width=120)
 w_explore_y = pn.widgets.MultiChoice(name="Y", options=[], width=300, max_items=6)
+
+# 2D plot for the Explore tab (mirrors the Primary-tab 2D plot, with the same
+# tap-to-jump-to-frame interaction).
+w_explore_2d_x = pn.widgets.Select(name="X axis", options=[], width=150)
+w_explore_2d_y = pn.widgets.Select(name="Y axis", options=[], width=150)
+w_explore_2d_z = pn.widgets.Select(name="Z (colour)", options=[], width=170)
+w_explore_2d_cmap = pn.widgets.Select(
+    name="Colormap", options=list(AVAILABLE_CMAPS), value=DEFAULT_CMAP, width=130,
+)
+w_explore_2d_log = pn.widgets.Checkbox(name="log colour", value=False, width=100)
+w_explore_2d_aspect = pn.widgets.Select(
+    name="Aspect", options=["fill", "equal"], value="fill", width=90,
+)
+w_explore_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=300)
+w_explore_2d_status = pn.pane.Markdown(
+    "*Pick X / Y / Z — tap a point to jump the image to that frame.*",
+    sizing_mode="stretch_width",
+)
 
 # Mask overlay / edit controls (Explore tab)
 w_mask_show = pn.widgets.Checkbox(
@@ -1420,6 +1459,7 @@ w_align_stats = pn.pane.Markdown(
 w_align_profile = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=180)
 
 _image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
+                "cur_idx": -1,  # frame index currently displayed (echo guard)
                 "figure": None, "source": None, "mapper": None,
                 "mask_source": None, "mask_renderer": None,
                 "draw_tool": None, "edit_tool": None,
@@ -1878,9 +1918,15 @@ w_align_width.param.watch(lambda *_: _update_line_analysis(), "value")
 
 
 def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray | None:
-    """Fetch a single image frame, using the disk cache when a uid is known."""
+    """Fetch a single image frame, using the disk cache when a uid is known.
+
+    During live mode the watched scan is still growing, so the disk cache
+    (which stores the *full* stack) would force a re-read of every frame on
+    each new-frame event — heavy work on the Bokeh document thread that
+    freezes the UI.  Read just the requested frame straight from tiled instead.
+    """
     uid = _selected_uid()
-    if uid:
+    if uid and not _live.get("active"):
         arr = get_or_fetch_image_frame(
             uid, field, frame_idx,
             lambda: tb.fetch_all_frames(run, "primary", field),
@@ -1930,46 +1976,128 @@ def _coerce_to_2d_frame(arr) -> np.ndarray | None:
     return a
 
 
-def _render_image_frame(field, idx):
-    """Fetch, orient, and render a single image frame (preserves zoom/pan)."""
-    run = _ensure_run()
-    if run is None:
-        return
-    ds = _image_cache.get("dataset")
-    frame = _cached_fetch_frame(run, field, idx, ds)
+def _downsample_for_display(arr, max_dim: int = 400):
+    """Stride-decimate a frame so its largest dimension is ≤ ``max_dim``.
+
+    Grid thumbnails are tiny on screen, so sending full-resolution detector
+    frames (often >1k×1k) to the browser is wasteful.  Decimation cuts the
+    serialized payload by ``step²`` and speeds up rendering substantially.
+    """
+    a = np.asarray(arr)
+    if a.ndim < 2:
+        return a
+    h, w = a.shape[:2]
+    step = int(np.ceil(max(h, w) / max_dim))
+    if step <= 1:
+        return a
+    return a[::step, ::step] if a.ndim == 2 else a[::step, ::step, ...]
+
+
+def _render_image_frame(field, idx, prefetched=None):
+    """Fetch, orient, and render a single image frame (preserves zoom/pan).
+
+    ``prefetched`` may be a raw (pre-orientation) 2-D frame already fetched off
+    the document thread (live mode), letting us skip the blocking read here.
+    """
+    if prefetched is not None:
+        frame = prefetched
+    else:
+        run = _ensure_run()
+        if run is None:
+            return
+        ds = _image_cache.get("dataset")
+        frame = _cached_fetch_frame(run, field, idx, ds)
     if frame is not None:
         # Capture raw detector shape *before* orientation so the polygon
         # transform knows the original (rows, cols).
         _image_cache["raw_shape"] = tuple(frame.shape)
         frame = _orient_frame(frame, field)
         _update_image_in_place(frame, f"primary/{field} frame {idx}")
+        _image_cache["cur_idx"] = idx
         w_image_status.object = f"**primary/{field}** — frame {idx}"
         # Refresh the dynamic mask overlay if enabled
         if w_mask_dynamic.value:
             _render_dynamic_mask(idx)
 
 
-def _on_image_slider(event):
-    """Render the selected frame when slider changes, sync explore cursor."""
+def _set_explore_frame(idx, *, render=True):
+    """Set the displayed frame index, syncing slider + input box, then render.
+
+    The slider and the exact-entry box are kept in lock-step via a re-entrancy
+    guard so neither widget's update retriggers the other into a render loop.
+    ``cur_idx`` records the displayed frame so the asynchronous
+    ``value_throttled`` echo of *this* programmatic set can be ignored (it runs
+    outside the Bokeh document lock and would crash on a model mutation).
+    """
     field = _image_cache.get("field")
     if not field:
         return
+    n = _image_cache.get("n_frames", 1) or 1
+    idx = max(0, min(int(idx), n - 1))
+    if _image_cache.get("frame_sync"):
+        return
+    _image_cache["cur_idx"] = idx
+    _image_cache["frame_sync"] = True
+    try:
+        if w_image_slider.value != idx:
+            w_image_slider.value = idx
+        if w_image_frame_input.value != idx:
+            w_image_frame_input.value = idx
+    finally:
+        _image_cache["frame_sync"] = False
+    if not render:
+        return
     if len(_selected_uids()) > 1:
-        # Multi-grid: re-render the grid at the new frame index (clamped
-        # per-scan inside the renderer).
         try:
-            _render_explore_multi_grid(field=field, frame_idx=int(event.new))
+            _render_explore_multi_grid(field=field, frame_idx=idx)
         except Exception:
             log.exception("explore multi-grid frame refresh failed")
         return
-    _render_image_frame(field, event.new)
-    _update_explore_cursor(event.new)
+    _render_image_frame(field, idx)
+    _update_explore_cursor(idx)
+
+
+def _schedule_frame_render(idx):
+    """Render frame ``idx`` on the next document tick (holds the doc lock).
+
+    ``value_throttled`` watchers may fire from a context that doesn't hold the
+    document lock; deferring the render via ``add_next_tick_callback`` ensures
+    the ColumnDataSource mutation happens under the lock.
+    """
+    doc = _live.get("doc") or pn.state.curdoc
+    if doc is not None:
+        try:
+            doc.add_next_tick_callback(lambda: _set_explore_frame(idx))
+            return
+        except Exception:
+            pass
+    _set_explore_frame(idx)
+
+
+def _on_image_slider(event):
+    """Render on slider release (value_throttled), syncing the input box."""
+    if _image_cache.get("frame_sync"):
+        return
+    # Ignore the async echo of a programmatic set (already displayed); only a
+    # genuine user scrub lands on a new index.
+    if int(event.new) == _image_cache.get("cur_idx"):
+        return
+    _schedule_frame_render(int(event.new))
+
+
+def _on_image_frame_input(event):
+    """Render when an exact frame number is typed / scrolled in the box."""
+    if _image_cache.get("frame_sync"):
+        return
+    if int(event.new) == _image_cache.get("cur_idx"):
+        return
+    _schedule_frame_render(int(event.new))
 
 
 def _on_image_field(event):
-    """Switch detector field and reset slider."""
+    """Switch detector field, keeping the current frame index when possible."""
     field = event.new
-    if not field:
+    if not field or _image_cache.get("loading"):
         return
     _image_cache["field"] = field
     # Reset persistent figure so a new one is created for the new detector
@@ -1978,23 +2106,26 @@ def _on_image_field(event):
     _image_cache["source"] = None
     _image_cache["mapper"] = None
     _image_cache["fig_image_shape"] = None
+    # Preserve the frame index across detector switches, clamped to the new
+    # detector's frame count.
+    prev_idx = int(w_image_slider.value)
     info = _detail_cache.get("primary_info")
     if info:
         shape = info["fields"].get(field, ())
         n = shape[0] if len(shape) >= 3 else 1
         _image_cache["n_frames"] = n
-        w_image_slider.value = 0
-        w_image_slider.end = max(0, n - 1)
-    if len(_selected_uids()) > 1:
-        try:
-            _render_explore_multi_grid(field=field, frame_idx=0)
-        except Exception:
-            log.exception("explore multi-grid field switch failed")
-        return
-    _render_image_frame(field, 0)
+        new_end = max(0, n - 1)
+        w_image_slider.end = new_end
+        w_image_frame_input.end = new_end
+    idx = min(prev_idx, _image_cache.get("n_frames", 1) - 1)
+    _set_explore_frame(max(0, idx))
 
 
-w_image_slider.param.watch(_on_image_slider, "value")
+# Render on release (value_throttled) rather than during the drag so live
+# scrubbing of large frames stays responsive.  The exact-entry box renders
+# immediately on commit (Enter / blur / scroll / spin).
+w_image_slider.param.watch(_on_image_slider, "value_throttled")
+w_image_frame_input.param.watch(_on_image_frame_input, "value")
 w_image_field.param.watch(_on_image_field, "value")
 
 
@@ -2026,9 +2157,12 @@ w_mv_label = pn.widgets.Select(
 w_mv_grid = pn.Column(sizing_mode="stretch_both", min_height=500)
 
 # Pagination controls for scans with more frames than MV_MAX_FRAMES
+w_mv_first = pn.widgets.Button(name="\u23EE", width=44, button_type="default", disabled=True)
 w_mv_prev = pn.widgets.Button(name="\u25C0 Prev", width=80, button_type="default", disabled=True)
+w_mv_page_input = pn.widgets.IntInput(name="Page", value=1, start=1, end=1, step=1, width=90)
 w_mv_next = pn.widgets.Button(name="Next \u25B6", width=80, button_type="default", disabled=True)
-w_mv_page_status = pn.pane.Markdown("", width=180)
+w_mv_last = pn.widgets.Button(name="\u23ED", width=44, button_type="default", disabled=True)
+w_mv_page_status = pn.pane.Markdown("", width=120)
 
 _multiview_cache: dict = {
     "uid": None, "field": None, "n_frames": 0,
@@ -2348,7 +2482,7 @@ def _render_multiview_multi_gridbox(frames: list[np.ndarray],
     """
     from bokeh.plotting import figure as bk_figure
     from bokeh.models import (
-        ColorBar, ColumnDataSource, LinearColorMapper, LogColorMapper,
+        ColumnDataSource, LinearColorMapper, LogColorMapper,
     )
     from smi_browser.figures.multiview import grid_dims
 
@@ -2369,7 +2503,7 @@ def _render_multiview_multi_gridbox(frames: list[np.ndarray],
     for a, lbl in zip(frames, labels):
         a = np.asarray(a)
         if _is_rgb_frame(a):
-            displays.append(a)
+            displays.append(_downsample_for_display(a))
             is_rgb_list.append(True)
             keep_labels.append(lbl)
             continue
@@ -2379,6 +2513,7 @@ def _render_multiview_multi_gridbox(frames: list[np.ndarray],
                 a = a[0]
         if a.ndim < 2:
             continue
+        a = _downsample_for_display(a)
         displays.append(np.where(np.isfinite(a), a, 0).astype(np.float32))
         is_rgb_list.append(False)
         keep_labels.append(lbl)
@@ -2463,13 +2598,6 @@ def _render_multiview_multi_gridbox(frames: list[np.ndarray],
     renderers = []
     new_ranges: dict[tuple[int, int], tuple] = {}
     n = len(displays)
-    # Attach the colorbar to the last scalar tile so the legend is visible
-    # without duplicating it.
-    last_scalar_idx = -1
-    for j in range(n - 1, -1, -1):
-        if not is_rgb_list[j]:
-            last_scalar_idx = j
-            break
     for i, (disp, label, is_rgb) in enumerate(
         zip(displays, keep_labels, is_rgb_list)
     ):
@@ -2507,11 +2635,6 @@ def _render_multiview_multi_gridbox(frames: list[np.ndarray],
                                              dw=[w], dh=[h]))
             r = p.image(image="image", x="x", y="y", dw="dw", dh="dh",
                         color_mapper=mapper, source=src)
-            if i == last_scalar_idx:
-                p.add_layout(
-                    ColorBar(color_mapper=mapper, label_standoff=6, width=10),
-                    "right",
-                )
         p.xaxis.visible = False
         p.yaxis.visible = False
         p.title.text_font_size = "9pt"
@@ -2728,8 +2851,12 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
     ds = _detail_cache.get("primary_dataset")
     frames = []
     uid = _selected_uid()
+    # During live mode the scan is still growing; the disk cache fetches the
+    # *full* stack on a miss (gigabytes for a long scan) just to show one page.
+    # Read the page's frames directly instead — bounded by MV_MAX_FRAMES.
+    live = _live.get("active")
     for i in range(start, end):
-        if uid:
+        if uid and not live:
             arr = get_or_fetch_image_frame(
                 uid, field, i,
                 lambda: tb.fetch_all_frames(run, "primary", field),
@@ -2758,13 +2885,24 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
             int(np.sum(np.isfinite(sample) & (sample > 0))), sample.size,
         )
 
-    # Update pagination buttons
-    w_mv_prev.disabled = (page <= 0)
-    w_mv_next.disabled = (end >= total_frames)
-    if page_count > 1:
-        w_mv_page_status.object = f"Page **{page + 1}** / {page_count}"
-    else:
-        w_mv_page_status.object = ""
+    # Update pagination controls
+    at_start = page <= 0
+    at_end = end >= total_frames
+    w_mv_first.disabled = at_start
+    w_mv_prev.disabled = at_start
+    w_mv_next.disabled = at_end
+    w_mv_last.disabled = at_end
+    # Sync the page-number box (guarded so it doesn't re-trigger a load).
+    _multiview_cache["page_sync"] = True
+    try:
+        w_mv_page_input.end = page_count
+        if w_mv_page_input.value != page + 1:
+            w_mv_page_input.value = page + 1
+    finally:
+        _multiview_cache["page_sync"] = False
+    w_mv_page_status.object = (
+        f"/ **{page_count}**" if page_count > 1 else ""
+    )
 
     try:
         _render_multiview_multi_gridbox(frames, None, field)
@@ -2870,8 +3008,43 @@ def _on_mv_next(_event=None):
         _fetch_and_build_multiview(field, page=page + 1)
 
 
+def _mv_page_count() -> int:
+    total = _multiview_cache.get("total_frames", 0)
+    return max(1, int(np.ceil(total / MV_MAX_FRAMES)))
+
+
+def _on_mv_first(_event=None):
+    """Jump to the first page."""
+    field = _multiview_cache.get("field")
+    if field and _multiview_cache.get("page", 0) != 0:
+        _fetch_and_build_multiview(field, page=0)
+
+
+def _on_mv_last(_event=None):
+    """Jump to the last page."""
+    field = _multiview_cache.get("field")
+    last = _mv_page_count() - 1
+    if field and _multiview_cache.get("page", 0) != last:
+        _fetch_and_build_multiview(field, page=last)
+
+
+def _on_mv_page_input(event):
+    """Jump to the page number typed / scrolled in the box (1-based)."""
+    if _multiview_cache.get("page_sync"):
+        return
+    field = _multiview_cache.get("field")
+    if not field:
+        return
+    page = max(0, min(int(event.new) - 1, _mv_page_count() - 1))
+    if page != _multiview_cache.get("page", 0):
+        _fetch_and_build_multiview(field, page=page)
+
+
+w_mv_first.on_click(_on_mv_first)
 w_mv_prev.on_click(_on_mv_prev)
 w_mv_next.on_click(_on_mv_next)
+w_mv_last.on_click(_on_mv_last)
+w_mv_page_input.param.watch(_on_mv_page_input, "value")
 
 
 # ---------------------------------------------------------------------------
@@ -3188,13 +3361,13 @@ w_gi_grid_row = pn.Row(w_proc_nqxy, w_proc_nqz)
 # --- Masks ---
 w_proc_saxs_mask = pn.widgets.TextInput(
     name="SAXS mask",
-    value=DEFAULT_SAXS_MASK,
+    value="/home/xf12id/saxs_14.5m_pin.json",  # TEMP test default
     placeholder=f"(default: {DEFAULT_SAXS_MASK_NAME})",
     width=320,
 )
 w_proc_waxs_mask = pn.widgets.TextInput(
     name="WAXS mask",
-    value="~/smi/waxs_hotspots.json",
+    value="/home/xf12id/waxs_hot_spots.json",  # TEMP test default
     placeholder=f"(default: {DEFAULT_WAXS_MASK_NAME})",
     width=320,
 )
@@ -3223,13 +3396,13 @@ w_proc_dist_delta = pn.widgets.FloatInput(
     name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.00, width=110,
 )
 w_proc_waxs_row_delta = pn.widgets.FloatInput(
-    name="WAXS Δrow", value=DEFAULT_WAXS_ROW_DELTA, step=0.50, width=80,
+    name="WAXS Δrow", value=0.5, step=0.50, width=80,  # TEMP test default
 )
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
-    name="WAXS Δcol", value=0, step=0.50, width=80,
+    name="WAXS Δcol", value=-3.5, step=0.50, width=80,  # TEMP test default
 )
 w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
-    name="WAXS col/arc°", value=DEFAULT_WAXS_BEAM_COL_PER_ARC_DEG,
+    name="WAXS col/arc°", value=-0.16,  # TEMP test default
     step=0.01, width=100,
 )
 w_saxs_geom_section = pn.Column(
@@ -3252,7 +3425,7 @@ w_proc_pixel_splitting = pn.widgets.IntInput(
 
 # --- Intensity corrections ---
 w_proc_solid_angle = pn.widgets.Checkbox(
-    name="Solid-angle correction", value=DEFAULT_SOLID_ANGLE, width=180,
+    name="Solid-angle correction", value=True, width=180,  # TEMP test default
 )
 
 # --- GI-specific ---
@@ -4273,7 +4446,7 @@ _processing_guard = {"active": False}
 # ---------------------------------------------------------------------------
 
 w_cache_enabled = pn.widgets.Checkbox(
-    name="Cache geometry between reductions", value=True, width=250,
+    name="Cache geometry between reductions", value=False, width=250,  # TEMP test default
 )
 w_cache_info = pn.pane.Markdown("*Click Refresh to view geometry cache status.*")
 w_btn_cache_refresh = pn.widgets.Button(
@@ -4482,11 +4655,9 @@ def _get_all_frame_images():
                 img = np.where(np.isfinite(img_raw), img_raw, np.nan).astype(np.float64)
                 frames.append((q, chi, img))
             return frames
-        # Fallback: use q_chi_frames from saxs/waxs result
-        pf = _get_per_frame_qchi(trans)
-        if pf is not None:
-            q, chi, frames_3d = pf
-            return [(q, chi, frames_3d[i]) for i in range(frames_3d.shape[0])]
+        # Fallback: per-frame q-chi from the lazy saxs/waxs q_chi_frames stacks.
+        # Computed one frame at a time so peak memory stays at a single map.
+        return [(q, chi, img) for _fi, q, chi, img in _iter_per_frame_qchi(trans)]
     return []
 
 
@@ -4828,115 +4999,622 @@ w_coll_compare_plot = _coll_ns.compare_plot
 
 
 # ---------------------------------------------------------------------------
+# Widgets + logic — Peak Map (per-frame I(q) peak fits → 1D/2D map)
+# ---------------------------------------------------------------------------
+#
+# This feature maps a peak-fit parameter (amplitude / centre / FWHM / area),
+# extracted from every frame's 1D I(q) curve, against user-chosen per-frame
+# axes.  It is deliberately memory-conscious: only the 1D ``pf_iq_I`` stack and
+# the per-frame scalars are loaded (never the 2D q-chi or raw image stacks),
+# fits run on a background thread, and results are cached per (uid, peak) so
+# re-selecting the displayed parameter never refits.
+
+from smi_browser.figures.peakmap import (
+    build_iq_heatmap, build_peak_map, band_source_data)
+from smi_browser.models.peakfit import PeakDef, FIT_PARAMS, fit_peak_across_frames
+
+_PEAK_NONE_Y = "— none (1D) —"
+_PEAK_FRAME_AXIS = "frame"
+_PEAK_MAP_TAB_TITLE = "Peak Map"
+
+#: 1-D arrays for the currently-loaded scan (no 2D/raw data ever held here).
+_peakmap_cache: dict[str, Any] = {"uid": None, "q": None, "iq": None,
+                                  "scalars": {}}
+#: ColumnDataSource backing the heatmap peak bands (updated in place).
+_peak_band_source = {"src": None}
+#: (uid, peak.key()) -> fit-result dict.  Persists across parameter changes.
+_peak_fit_cache: dict[tuple, dict] = {}
+_peak_fit_cancel = threading.Event()
+_peak_fit_state: dict[str, Any] = {"doc": None}
+_peak_guard = {"active": False}
+
+w_peak_table = pn.widgets.Tabulator(
+    value=pd.DataFrame(columns=["name", "q_min", "q_max", "model", "baseline"]),
+    show_index=False, sizing_mode="stretch_width", height=180,
+    configuration={"layout": "fitColumns", "rowHeight": 24},
+    editors={
+        "name": {"type": "input"},
+        "q_min": {"type": "number", "step": 0.01},
+        "q_max": {"type": "number", "step": 0.01},
+        "model": {"type": "list", "values": ["gaussian", "lorentzian"]},
+        "baseline": {"type": "list", "values": ["linear", "none"]},
+    },
+)
+w_btn_peak_add = pn.widgets.Button(name="+ Peak", button_type="default", width=90)
+w_btn_peak_remove = pn.widgets.Button(name="− Remove", button_type="default", width=100)
+w_btn_peak_fit = pn.widgets.Button(name="Fit peaks", button_type="primary", width=110)
+w_btn_peak_cancel = pn.widgets.Button(name="Cancel", button_type="warning",
+                                      width=90, disabled=True)
+w_peak_spinner = pn.indicators.LoadingSpinner(value=False, size=28, visible=False)
+w_peak_status = pn.pane.Markdown(
+    "*Process a multi-frame scan, then open this tab to fit peaks across its "
+    "per-frame I(q) curves.*")
+
+w_peak_z_peak = pn.widgets.Select(name="Peak", options=[], width=160)
+w_peak_z_param = pn.widgets.Select(name="Parameter", options=list(FIT_PARAMS),
+                                   value="area", width=140)
+w_peak_map_x = pn.widgets.Select(name="X axis", options=[], width=170)
+w_peak_map_y = pn.widgets.Select(name="Y axis", options=[_PEAK_NONE_Y], width=170)
+w_peak_map_cmap = pn.widgets.Select(name="Colormap", options=list(AVAILABLE_CMAPS),
+                                    value=DEFAULT_CMAP, width=130)
+w_peak_map_log = pn.widgets.Checkbox(name="log colour", value=False, width=100)
+w_peak_map_aspect = pn.widgets.Select(name="Aspect", options=["fill", "equal"],
+                                      value="fill", width=90)
+w_peak_heatmap = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=340)
+w_peak_map_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=470)
+w_peak_map_status = pn.pane.Markdown("")
+
+
+def _peak_defs_from_table() -> list[PeakDef]:
+    """Parse the peaks Tabulator into validated ``PeakDef`` objects."""
+    df = w_peak_table.value
+    peaks: list[PeakDef] = []
+    if df is None or df.empty:
+        return peaks
+    for _, row in df.iterrows():
+        try:
+            qmin = float(row["q_min"])
+            qmax = float(row["q_max"])
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(qmin) or not np.isfinite(qmax) or qmax <= qmin:
+            continue
+        name = str(row.get("name") or f"p{len(peaks) + 1}")
+        model = str(row.get("model") or "gaussian")
+        baseline = str(row.get("baseline") or "linear")
+        peaks.append(PeakDef(name=name, q_min=qmin, q_max=qmax,
+                             model=model, baseline=baseline))
+    return peaks
+
+
+def _axis_values(name: str) -> "np.ndarray | None":
+    """Per-frame values for an axis selector (``frame`` index or a scalar).
+
+    Prefers the primary scalars table (the same source the 2D explore map
+    uses), falling back to the cached primary scalars.
+    """
+    iq = _peakmap_cache.get("iq")
+    if iq is None:
+        return None
+    n = iq.shape[0]
+    if name == _PEAK_FRAME_AXIS:
+        return np.arange(n, dtype=float)
+    df = w_primary_table.value
+    if df is not None and name in getattr(df, "columns", []):
+        vals = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+        if vals.shape[0] == n:
+            return vals
+    vals = _peakmap_cache.get("scalars", {}).get(name)
+    if vals is None:
+        return None
+    vals = np.asarray(vals, dtype=float)
+    return vals if vals.shape[0] == n else None
+
+
+def _refresh_heatmap():
+    """Rebuild the per-frame I(q) heatmap (only needed on a data change)."""
+    q = _peakmap_cache.get("q")
+    iq = _peakmap_cache.get("iq")
+    if q is None or iq is None:
+        w_peak_heatmap.object = None
+        _peak_band_source["src"] = None
+        return
+    fig, src = build_iq_heatmap(q, iq, peaks=_peak_defs_from_table())
+    _peak_band_source["src"] = src
+    try:
+        from bokeh.events import SelectionGeometry
+        fig.on_event(SelectionGeometry, _on_heatmap_select)
+    except Exception:
+        log.exception("peakmap: could not attach box-select handler")
+    w_peak_heatmap.object = fig
+
+
+def _update_heatmap_bands():
+    """Update the peak-range bands in place — no figure rebuild, so the zoom
+    and the active box-select tool are preserved as the user adds peaks."""
+    src = _peak_band_source.get("src")
+    iq = _peakmap_cache.get("iq")
+    if src is None or iq is None:
+        _refresh_heatmap()
+        return
+    src.data = band_source_data(_peak_defs_from_table(), iq.shape[0])
+
+
+def _update_z_peak_options():
+    """Sync the peak selector options with the table, preserving selection."""
+    names = [p.name for p in _peak_defs_from_table()]
+    cur = w_peak_z_peak.value
+    if list(w_peak_z_peak.options) != names:
+        w_peak_z_peak.options = names
+    if names and cur not in names:
+        w_peak_z_peak.value = names[0]
+
+
+def _peakmap_load(uid: "str | None", force: bool = False):
+    """Lazily load the 1D per-frame data + scalars for ``uid`` from cache."""
+    if uid is None:
+        _peakmap_cache.update(uid=None, q=None, iq=None, scalars={})
+        w_peak_heatmap.object = None
+        w_peak_map_plot.object = None
+        w_peak_status.object = "*No scan selected.*"
+        return
+    if _peakmap_cache.get("uid") == uid and not force:
+        return
+
+    cache = ScanCache(uid)
+    red = cache.read_reduction_datasets(["pf_iq_I", "pf_iq_q"]) or {}
+    iq = red.get("pf_iq_I")
+    q = red.get("pf_iq_q")
+    if iq is None or q is None or np.asarray(iq).ndim != 2:
+        _peakmap_cache.update(uid=uid, q=None, iq=None, scalars={})
+        w_peak_heatmap.object = None
+        w_peak_map_plot.object = None
+        w_peak_map_status.object = ""
+        w_peak_status.object = (
+            "*This scan has no cached per-frame I(q) (`pf_iq_I`). Process a "
+            "multi-frame scan in transmission mode first.*")
+        return
+
+    iq = np.asarray(iq, dtype=float)
+    q = np.asarray(q, dtype=float)
+    n_frames = iq.shape[0]
+    scalars_raw = cache.read_scalars("primary") or {}
+    # The cached primary scalars are in tiled's shuffled order; restore
+    # acquisition order (seq_num, fallback time) so this fallback axis source
+    # stays aligned with the per-frame reduction outputs.
+    seq_order = None
+    for _k in ("seq_num", "time"):
+        sv = scalars_raw.get(_k)
+        if sv is None:
+            continue
+        sv = np.asarray(sv)
+        if (sv.ndim == 1 and sv.shape[0] == n_frames
+                and np.issubdtype(sv.dtype, np.number) and np.isfinite(sv).all()):
+            seq_order = np.argsort(sv, kind="mergesort")
+            break
+    scalars = {}
+    for k, v in scalars_raw.items():
+        if k.startswith("ts_"):
+            continue
+        arr = np.asarray(v)
+        # Only numeric, per-frame columns can be plotted as an axis — skip
+        # string/bytes columns (e.g. b'+- 120 uA') outright.
+        if arr.ndim != 1 or arr.shape[0] != n_frames:
+            continue
+        if not np.issubdtype(arr.dtype, np.number):
+            continue
+        arr = arr.astype(float)
+        scalars[k] = arr[seq_order] if seq_order is not None else arr
+    _peakmap_cache.update(uid=uid, q=q, iq=iq, scalars=scalars)
+
+    # Axis selectors mirror the 2D explore map: primary scalar columns with
+    # defaults taken from the start-document motor hints (innermost = X,
+    # next-outer = Y).  Default to a 2D map when two motors are available.
+    _load_primary()  # idempotent; ensures w_primary_table is populated
+    df = w_primary_table.value
+    run = _ensure_run()
+    start_md = (run.metadata.get("start") if run is not None else None) or {}
+    if df is not None and not df.empty:
+        numeric_cols = [c for c in df.columns
+                        if pd.api.types.is_numeric_dtype(df[c])]
+    else:
+        numeric_cols = sorted(scalars.keys())
+    default_x = default_y = None
+    if df is not None and not df.empty:
+        try:
+            default_x, default_y, _ = pick_default_axes(df, start_md)
+        except Exception:
+            log.exception("peakmap: pick_default_axes failed")
+
+    x_opts = [_PEAK_FRAME_AXIS] + numeric_cols
+    y_opts = [_PEAK_NONE_Y, _PEAK_FRAME_AXIS] + numeric_cols
+    _peak_guard["active"] = True
+    try:
+        prev_x, prev_y = w_peak_map_x.value, w_peak_map_y.value
+        w_peak_map_x.options = x_opts
+        w_peak_map_y.options = y_opts
+        w_peak_map_x.value = prev_x if prev_x in x_opts else (
+            default_x if default_x in numeric_cols
+            else (numeric_cols[0] if numeric_cols else _PEAK_FRAME_AXIS))
+        chosen_x = w_peak_map_x.value
+        w_peak_map_y.value = prev_y if prev_y in y_opts else (
+            default_y if (default_y in numeric_cols and default_y != chosen_x)
+            else _PEAK_NONE_Y)
+    finally:
+        _peak_guard["active"] = False
+
+    w_peak_status.object = (
+        f"*Loaded `{uid[:12]}…`: {n_frames} frames × {q.size} q-points, "
+        f"{len(numeric_cols)} per-frame scalars. Add peaks and **Fit**.*")
+    _refresh_heatmap()
+    _update_z_peak_options()
+    _update_peak_map()
+
+
+def _default_peak_range() -> tuple[float, float]:
+    q = _peakmap_cache.get("q")
+    if q is None or q.size < 3:
+        return (0.0, 1.0)
+    lo = float(q[q.size // 3])
+    hi = float(q[2 * q.size // 3])
+    return (lo, hi)
+
+
+def _append_peak_row(q_min: float, q_max: float):
+    df = w_peak_table.value
+    df = df.copy() if df is not None else pd.DataFrame(
+        columns=["name", "q_min", "q_max", "model", "baseline"])
+    new_row = {
+        "name": f"p{len(df) + 1}",
+        "q_min": round(float(q_min), 4),
+        "q_max": round(float(q_max), 4),
+        "model": "gaussian",
+        "baseline": "linear",
+    }
+    _peak_guard["active"] = True
+    try:
+        w_peak_table.value = pd.concat(
+            [df, pd.DataFrame([new_row])], ignore_index=True)
+    finally:
+        _peak_guard["active"] = False
+    _update_heatmap_bands()
+    _update_z_peak_options()
+
+
+def _on_peak_add(event=None):
+    lo, hi = _default_peak_range()
+    _append_peak_row(lo, hi)
+
+
+def _on_peak_remove(event=None):
+    df = w_peak_table.value
+    if df is None or df.empty:
+        return
+    sel = list(w_peak_table.selection or [])
+    keep = [i for i in range(len(df)) if i not in sel] if sel else list(range(len(df) - 1))
+    _peak_guard["active"] = True
+    try:
+        w_peak_table.value = df.iloc[keep].reset_index(drop=True)
+        w_peak_table.selection = []
+    finally:
+        _peak_guard["active"] = False
+    _update_heatmap_bands()
+    _update_z_peak_options()
+
+
+def _on_heatmap_select(event):
+    """Box-select on the heatmap → add a peak spanning the dragged q range."""
+    geom = getattr(event, "geometry", None) or {}
+    x0, x1 = geom.get("x0"), geom.get("x1")
+    if x0 is None or x1 is None:
+        return
+    lo, hi = sorted((float(x0), float(x1)))
+    if hi - lo <= 0:
+        return
+    _append_peak_row(lo, hi)
+
+
+def _on_peak_table_change(event=None):
+    if _peak_guard["active"]:
+        return
+    _update_heatmap_bands()
+    _update_z_peak_options()
+
+
+def _selected_peak_def() -> "PeakDef | None":
+    name = w_peak_z_peak.value
+    for p in _peak_defs_from_table():
+        if p.name == name:
+            return p
+    return None
+
+
+def _update_peak_map(event=None):
+    """Render the output map from cached fit results (no refitting)."""
+    if _peak_guard["active"]:
+        return
+    uid = _peakmap_cache.get("uid")
+    pk = _selected_peak_def()
+    if uid is None or pk is None:
+        w_peak_map_plot.object = None
+        w_peak_map_status.object = ""
+        return
+    res = _peak_fit_cache.get((uid, pk.key()))
+    if res is None:
+        w_peak_map_plot.object = None
+        w_peak_map_status.object = (
+            f"*Peak `{pk.name}` not fitted yet (or its range/model changed). "
+            f"Click **Fit peaks**.*")
+        return
+    param = w_peak_z_param.value
+    z = res.get(param)
+    if z is None:
+        w_peak_map_plot.object = None
+        return
+    x_name = w_peak_map_x.value
+    y_name = w_peak_map_y.value
+    x = _axis_values(x_name)
+    if x is None:
+        w_peak_map_status.object = "*Chosen X axis is unavailable.*"
+        return
+    y = None if y_name == _PEAK_NONE_Y else _axis_values(y_name)
+    z_label = f"{pk.name}.{param}"
+    fig, status = build_peak_map(
+        x, y, z,
+        x_label=x_name, y_label=(y_name if y is not None else ""),
+        z_label=z_label,
+        cmap=w_peak_map_cmap.value, log_color=bool(w_peak_map_log.value),
+        aspect=w_peak_map_aspect.value,
+    )
+    w_peak_map_plot.object = fig
+    n_ok = int(np.isfinite(z).sum())
+    w_peak_map_status.object = f"{status}  ·  {n_ok}/{z.size} frames fitted"
+
+
+def _on_peak_cancel(event=None):
+    _peak_fit_cancel.set()
+    w_peak_status.object = "*Cancelling…*"
+
+
+def _on_peak_fit(event=None):
+    uid = _peakmap_cache.get("uid")
+    q = _peakmap_cache.get("q")
+    iq = _peakmap_cache.get("iq")
+    if uid is None or q is None or iq is None:
+        w_peak_status.object = (
+            "*No per-frame I(q) loaded — open a processed multi-frame scan.*")
+        return
+    peaks = _peak_defs_from_table()
+    if not peaks:
+        w_peak_status.object = (
+            "*Add at least one peak (the **+ Peak** button, or drag a range on "
+            "the heatmap).*")
+        return
+
+    _peak_fit_cancel.clear()
+    _peak_fit_state["doc"] = pn.state.curdoc
+    w_peak_spinner.value = True
+    w_peak_spinner.visible = True
+    w_btn_peak_fit.disabled = True
+    w_btn_peak_cancel.disabled = False
+
+    n_frames = iq.shape[0]
+    total = n_frames * len(peaks)
+    counter = {"done": 0}
+
+    def _marshal(fn):
+        doc = _peak_fit_state.get("doc")
+        if doc is not None:
+            try:
+                doc.add_next_tick_callback(fn)
+                return
+            except Exception:
+                log.exception("peakmap: add_next_tick_callback failed")
+        fn()
+
+    def _set_status(msg):
+        _marshal(lambda: setattr(w_peak_status, "object", msg))
+
+    def _worker():
+        cancelled = False
+        try:
+            for pk in peaks:
+                key = (uid, pk.key())
+                base = counter["done"]
+                if key in _peak_fit_cache:
+                    counter["done"] = base + n_frames
+                    continue
+
+                def _prog(d, _t, _base=base):
+                    _set_status(f"*Fitting… {min(_base + d, total)}/{total} frames*")
+
+                res = fit_peak_across_frames(
+                    q, iq, pk, cancel=_peak_fit_cancel, progress=_prog)
+                if _peak_fit_cancel.is_set():
+                    cancelled = True
+                    break
+                _peak_fit_cache[key] = res
+                counter["done"] = base + n_frames
+        except Exception as exc:
+            log.exception("peak fit failed")
+            _set_status(f"**Error:** `{exc}`")
+
+        def _finish():
+            w_peak_spinner.value = False
+            w_peak_spinner.visible = False
+            w_btn_peak_fit.disabled = False
+            w_btn_peak_cancel.disabled = True
+            _update_z_peak_options()
+            _update_peak_map()
+            if cancelled:
+                w_peak_status.object = "*Fit cancelled.*"
+            else:
+                w_peak_status.object = (
+                    f"**Fit complete** — {len(peaks)} peak(s) across "
+                    f"{n_frames} frames.")
+        _marshal(_finish)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+w_btn_peak_add.on_click(_on_peak_add)
+w_btn_peak_remove.on_click(_on_peak_remove)
+w_btn_peak_fit.on_click(_on_peak_fit)
+w_btn_peak_cancel.on_click(_on_peak_cancel)
+w_peak_table.param.watch(_on_peak_table_change, "value")
+for _w in (w_peak_z_peak, w_peak_z_param, w_peak_map_x, w_peak_map_y,
+           w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect):
+    _w.param.watch(_update_peak_map, "value")
+
+peak_map_panel = pn.Column(
+    pn.pane.Markdown(
+        "**Peak Map** — fit peaks across every frame's 1D I(q), then map a fit "
+        "parameter against any per-frame axis (1-D when *Y axis* is *none*)."),
+    pn.Row(w_btn_peak_add, w_btn_peak_remove, w_btn_peak_fit,
+           w_btn_peak_cancel, w_peak_spinner),
+    w_peak_table,
+    w_peak_status,
+    w_peak_heatmap,
+    pn.Row(w_peak_z_peak, w_peak_z_param, w_peak_map_x, w_peak_map_y),
+    pn.Row(w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect),
+    w_peak_map_status,
+    w_peak_map_plot,
+    sizing_mode="stretch_width",
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers — 2D result plotting
 # ---------------------------------------------------------------------------
 
 # Cache for per-frame q-chi regridding (expensive scipy interpolation)
-_per_frame_qchi_cache: dict[str, Any] = {"uid": None, "data": None}
+#: Small LRU of *individual* regridded per-frame q-chi maps.  The per-frame
+#: ``q_chi_frames`` stacks from ``reduce_smi_combined`` are now lazy (dask/zarr,
+#: one (q, chi) map per chunk) for large scans, so we compute only the frame the
+#: user is viewing and keep a handful around for snappy slider scrubbing — never
+#: the whole (n_frames, n_chi, n_q) stack.  Each entry is one (n_chi, n_q) map.
+_per_frame_qchi_lru: "OrderedDict[tuple, tuple]" = OrderedDict()
+_PER_FRAME_QCHI_LRU_MAX = 16
 
 
-def _get_per_frame_qchi(result):
-    """Extract per-frame q-chi data from result.saxs/waxs['q_chi_frames'].
+def _qchi_frame_count(result) -> int:
+    """Number of per-frame q-chi maps — metadata only, never triggers compute."""
+    n = 0
+    for det in (getattr(result, "saxs", None), getattr(result, "waxs", None)):
+        frames = det.get("q_chi_frames") if det else None
+        if frames is not None:
+            try:
+                n = max(n, int(frames.sizes.get("frame", 0)))
+            except Exception:
+                pass
+    return n
 
-    Returns (q, chi, frames_3d) where frames_3d has shape (n_frames, n_chi, n_q),
-    or None if no per-frame data is available.  Results are cached by UID.
+
+def _qchi_merge_grid(result):
+    """The merged (q, chi) display grid, or ``(None, None)``."""
+    qchi = getattr(result, "merged_qchi", None)
+    if qchi is None:
+        return None, None
+    q_grid = qchi["q"].values if "q" in qchi.coords else None
+    chi_grid = qchi["chi"].values if "chi" in qchi.coords else None
+    return q_grid, chi_grid
+
+
+def _regrid_qchi_frame(src_q, src_chi, data, q_grid, chi_grid):
+    """Regrid a single frame's (q, chi) data onto the merged grid -> (n_q, n_chi)."""
+    from scipy.interpolate import RegularGridInterpolator
+    finite_data = np.where(np.isfinite(data), data, 0.0)
+    interp = RegularGridInterpolator(
+        (src_q, src_chi), finite_data,
+        method="nearest", bounds_error=False, fill_value=np.nan,
+    )
+    tq, tc = np.meshgrid(q_grid, chi_grid, indexing="ij")
+    return interp((tq, tc))
+
+
+def _get_per_frame_qchi_frame(result, frame_idx):
+    """Regrid + merge ONE per-frame q-chi map on demand.
+
+    Reads only ``frame_idx`` from the lazy ``q_chi_frames`` stacks (one zarr
+    chunk per detector), so memory stays bounded regardless of scan length.
+    Returns ``(q_grid, chi_grid, img[n_chi, n_q])`` or ``None``.
     """
+    frame_idx = int(frame_idx)
     uid = getattr(result, "uid", None)
-    if uid and _per_frame_qchi_cache["uid"] == uid and _per_frame_qchi_cache["data"] is not None:
-        return _per_frame_qchi_cache["data"]
+    key = (uid, frame_idx)
+    if uid is not None:
+        cached = _per_frame_qchi_lru.get(key)
+        if cached is not None:
+            _per_frame_qchi_lru.move_to_end(key)
+            return cached
+
     saxs = getattr(result, "saxs", None)
     waxs = getattr(result, "waxs", None)
     saxs_frames = saxs.get("q_chi_frames") if saxs else None
     waxs_frames = waxs.get("q_chi_frames") if waxs else None
-
     if saxs_frames is None and waxs_frames is None:
         return None
 
-    # Use the merged_qchi grid for q/chi (same grid used during processing)
-    qchi = result.merged_qchi
-    if qchi is None:
-        return None
-    q_grid = qchi["q"].values if "q" in qchi.coords else None
-    chi_grid = qchi["chi"].values if "chi" in qchi.coords else None
+    q_grid, chi_grid = _qchi_merge_grid(result)
     if q_grid is None or chi_grid is None:
         return None
 
-    n_q = len(q_grid)
-    n_chi = len(chi_grid)
+    s_I = s_N = w_I = w_N = None
+    if saxs_frames is not None and frame_idx < saxs_frames.sizes.get("frame", 0):
+        sq = np.asarray(saxs_frames["q"].values, dtype=float)
+        schi = np.asarray(saxs_frames["chi"].values, dtype=float)
+        s_I_raw = saxs_frames["intensity"].isel(frame=frame_idx).values.astype(float)
+        s_N_raw = saxs_frames["counts"].isel(frame=frame_idx).values.astype(float)
+        s_I = _regrid_qchi_frame(sq, schi, s_I_raw, q_grid, chi_grid)
+        s_N = _regrid_qchi_frame(sq, schi, np.where(np.isfinite(s_N_raw), s_N_raw, 0.0),
+                                 q_grid, chi_grid)
 
-    # Determine number of frames
-    if saxs_frames is not None and waxs_frames is not None:
-        n_frames = max(saxs_frames.sizes.get("frame", 1),
-                       waxs_frames.sizes.get("frame", 1))
-    elif saxs_frames is not None:
-        n_frames = saxs_frames.sizes.get("frame", 1)
+    if waxs_frames is not None and frame_idx < waxs_frames.sizes.get("frame", 0):
+        wq = np.asarray(waxs_frames["q"].values, dtype=float)
+        wchi = np.asarray(waxs_frames["chi"].values, dtype=float)
+        w_I_raw = waxs_frames["intensity"].isel(frame=frame_idx).values.astype(float)
+        w_N_raw = waxs_frames["counts"].isel(frame=frame_idx).values.astype(float)
+        w_I = _regrid_qchi_frame(wq, wchi, w_I_raw, q_grid, chi_grid)
+        w_N = _regrid_qchi_frame(wq, wchi, np.where(np.isfinite(w_N_raw), w_N_raw, 0.0),
+                                 q_grid, chi_grid)
+
+    # Count-weighted merge (same logic as merge_q_chi_weighted).
+    if s_I is not None and w_I is not None:
+        total_N = s_N + w_N
+        with np.errstate(divide="ignore", invalid="ignore"):
+            merged = np.where(
+                total_N > 0,
+                (np.nan_to_num(s_I, nan=0.0) * s_N
+                 + np.nan_to_num(w_I, nan=0.0) * w_N) / total_N,
+                np.nan,
+            )
+    elif s_I is not None:
+        merged = s_I
+    elif w_I is not None:
+        merged = w_I
     else:
-        n_frames = waxs_frames.sizes.get("frame", 1)
-
-    if n_frames <= 1:
         return None
 
-    from scipy.interpolate import RegularGridInterpolator
-
-    def _regrid_frame(src_q, src_chi, data):
-        """Regrid a single frame (q, chi) -> (n_q, n_chi) on the merged grid."""
-        finite_data = np.where(np.isfinite(data), data, 0.0)
-        interp = RegularGridInterpolator(
-            (src_q, src_chi), finite_data,
-            method="nearest", bounds_error=False, fill_value=np.nan,
-        )
-        tq, tc = np.meshgrid(q_grid, chi_grid, indexing="ij")
-        return interp((tq, tc))
-
-    frames_3d = np.full((n_frames, n_chi, n_q), np.nan, dtype=np.float64)
-
-    for fi in range(n_frames):
-        s_I = None
-        s_N = None
-        w_I = None
-        w_N = None
-
-        if saxs_frames is not None and fi < saxs_frames.sizes.get("frame", 0):
-            sq = np.asarray(saxs_frames["q"].values, dtype=float)
-            schi = np.asarray(saxs_frames["chi"].values, dtype=float)
-            s_I_raw = saxs_frames["intensity"].isel(frame=fi).values.astype(float)
-            s_N_raw = saxs_frames["counts"].isel(frame=fi).values.astype(float)
-            s_I = _regrid_frame(sq, schi, s_I_raw)
-            s_N = _regrid_frame(sq, schi, np.where(np.isfinite(s_N_raw), s_N_raw, 0.0))
-
-        if waxs_frames is not None and fi < waxs_frames.sizes.get("frame", 0):
-            wq = np.asarray(waxs_frames["q"].values, dtype=float)
-            wchi = np.asarray(waxs_frames["chi"].values, dtype=float)
-            w_I_raw = waxs_frames["intensity"].isel(frame=fi).values.astype(float)
-            w_N_raw = waxs_frames["counts"].isel(frame=fi).values.astype(float)
-            w_I = _regrid_frame(wq, wchi, w_I_raw)
-            w_N = _regrid_frame(wq, wchi, np.where(np.isfinite(w_N_raw), w_N_raw, 0.0))
-
-        # Count-weighted merge (same logic as merge_q_chi_weighted)
-        if s_I is not None and w_I is not None:
-            total_N = s_N + w_N
-            with np.errstate(divide="ignore", invalid="ignore"):
-                merged = np.where(
-                    total_N > 0,
-                    (np.nan_to_num(s_I, nan=0.0) * s_N
-                     + np.nan_to_num(w_I, nan=0.0) * w_N) / total_N,
-                    np.nan,
-                )
-        elif s_I is not None:
-            merged = s_I
-        elif w_I is not None:
-            merged = w_I
-        else:
-            continue
-
-        # merged is (n_q, n_chi) — transpose to (n_chi, n_q)
-        frames_3d[fi] = merged.T
-
-    out = (q_grid, chi_grid, frames_3d)
-    if uid:
-        _per_frame_qchi_cache["uid"] = uid
-        _per_frame_qchi_cache["data"] = out
+    out = (q_grid, chi_grid, merged.T)  # (n_chi, n_q)
+    if uid is not None:
+        _per_frame_qchi_lru[key] = out
+        _per_frame_qchi_lru.move_to_end(key)
+        while len(_per_frame_qchi_lru) > _PER_FRAME_QCHI_LRU_MAX:
+            _per_frame_qchi_lru.popitem(last=False)
     return out
+
+
+def _iter_per_frame_qchi(result):
+    """Yield ``(frame_idx, q, chi, img)`` for every per-frame q-chi map.
+
+    Computes one frame at a time (bounded memory) — used only by features that
+    genuinely need every frame (e.g. per-frame cross sections).
+    """
+    n = _qchi_frame_count(result)
+    for fi in range(n):
+        out = _get_per_frame_qchi_frame(result, fi)
+        if out is not None:
+            yield (fi,) + out
 
 
 def _plot_2d_transmission(result, frame_idx=None):
@@ -4953,10 +5631,9 @@ def _plot_2d_transmission(result, frame_idx=None):
             q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
             chi = qchi["chi"].values if "chi" in qchi.coords else np.arange(img.shape[0])
         else:
-            pf = _get_per_frame_qchi(result)
+            pf = _get_per_frame_qchi_frame(result, frame_idx)
             if pf is not None:
-                q, chi, frames_3d = pf
-                img = frames_3d[frame_idx]  # already (n_chi, n_q)
+                q, chi, img = pf  # img already (n_chi, n_q)
             else:
                 img = qchi["intensity"].values
                 q = qchi["q"].values if "q" in qchi.coords else np.arange(img.shape[-1])
@@ -5302,8 +5979,7 @@ def _on_proc_iq_mode_change(event):
             if has_qchi_frames:
                 n_fr = qchi.sizes["frame"]
             else:
-                pf = _get_per_frame_qchi(result)
-                n_fr = pf[2].shape[0] if pf is not None else 0
+                n_fr = _qchi_frame_count(result)
             if n_fr > 1:
                 w_proc_frame_slider.end = max(0, n_fr - 1)
                 w_proc_frame_slider.visible = True
@@ -5453,6 +6129,8 @@ def _reset_detail(preserve_figure=False):
     w_primary_plot.object = None
     w_primary_2d_plot.object = None
     w_primary_2d_status.object = "*Load a scan to see the 2D plot.*"
+    w_explore_2d_plot.object = None
+    w_explore_2d_status.object = "*Pick X / Y / Z — tap a point to jump frames.*"
     w_baseline_table.value = pd.DataFrame(columns=["source", "field", "before", "after"])
     w_baseline_status.object = "*Click tab to load.*"
     if not preserve_figure:
@@ -5473,9 +6151,11 @@ def _reset_detail(preserve_figure=False):
     # can fail with _pending_writes errors when the document lock context
     # doesn't match (e.g. cascading from param.watch callbacks).
     _image_cache.update(field=None, n_frames=0, dataset=None, fields=[],
-                        raw_shape=None)
+                        raw_shape=None, cur_idx=0)
     w_image_slider.value = 0
     w_image_slider.end = 1
+    w_image_frame_input.value = 0
+    w_image_frame_input.end = 1
     # Don't clear image_field options — preserve detector selection
     w_explore_plot.object = None
     # Grid (multi-view) tab — drop the figure so a new scan rebuilds fresh
@@ -6243,11 +6923,13 @@ def _load_images():
             field = prev_field
         else:
             field = image_fields[0]
-        # If the value is unchanged, _on_image_field won't fire — we still
-        # need to refresh the displayed image for the new scan, so call it
-        # explicitly below regardless.
-        value_changed = w_image_field.value != field
-        w_image_field.value = field
+        # Set the detector for the new scan without triggering the
+        # frame-preserving _on_image_field handler (we reset to frame 0 here).
+        _image_cache["loading"] = True
+        try:
+            w_image_field.value = field
+        finally:
+            _image_cache["loading"] = False
 
         shape = info["fields"].get(field, ())
         n_frames = shape[0] if len(shape) >= 3 else 1
@@ -6258,10 +6940,12 @@ def _load_images():
         _image_cache["dataset"] = ds
         _image_cache["fields"] = image_fields
 
-        # Configure slider — set value before end to avoid spurious
-        # callbacks when the old value exceeds the new range.
-        w_image_slider.value = 0
-        w_image_slider.end = max(0, n_frames - 1)
+        # Configure frame controls — reset to frame 0 for the freshly loaded
+        # scan and sync both the slider and the exact-entry box.
+        new_end = max(0, n_frames - 1)
+        w_image_slider.end = new_end
+        w_image_frame_input.end = new_end
+        _set_explore_frame(0, render=False)
 
         # Show first frame
         frame = _cached_fetch_frame(run, field, 0, ds)
@@ -6413,6 +7097,49 @@ def _refresh_detail_title() -> None:
     w_detail_title.object = f"### {sid} — {sample} [{det}]{extra}"
 
 
+def _invalidate_disk_cache(uid: str, groups: tuple[str, ...] = ("primary", "images")) -> None:
+    """Drop cached groups so a growing scan is re-fetched.
+
+    ``groups`` defaults to both scalars and image stacks.  Pass
+    ``("primary",)`` to refresh only the (small) scalar table while leaving
+    the (large) image stack in place — it self-extends via the out-of-range
+    guard in :func:`get_or_fetch_image_frame`.
+    """
+    from smi_browser.cache import ScanCache
+    import h5py
+    cache = ScanCache(uid)
+    if not cache.exists():
+        return
+    try:
+        with cache._lock:
+            with h5py.File(cache.path, "a") as f:
+                for grp in groups:
+                    if grp in f:
+                        del f[grp]
+    except Exception:
+        log.exception("cache invalidation failed for %s", uid[:8])
+
+
+def _current_primary_len(run) -> int:
+    """Current number of primary points, working for running scans too.
+
+    Prefer the stop document; fall back to the live stream structure
+    (leading dim of any field == points/frames) when no stop doc exists yet.
+    """
+    stop = run.metadata.get("stop") or {}
+    ne = stop.get("num_events")
+    if isinstance(ne, dict) and ne.get("primary"):
+        return int(ne["primary"])
+    if isinstance(ne, (int, float)) and ne:
+        return int(ne)
+    try:
+        info = tb.stream_info_for(run, "primary")
+        lengths = [shp[0] for shp in info["fields"].values() if shp]
+        return max(lengths) if lengths else 0
+    except Exception:
+        return 0
+
+
 def _load_active_tab(active):
     """Load data for the given tab index."""
     if active == 1:
@@ -6433,8 +7160,21 @@ def _load_active_tab(active):
 
 
 def _on_detail_tab(event):
-    if not _selected_uid():
+    uid = _selected_uid()
+    if not uid:
         return
+    # In live mode, re-fetch current data when switching tabs so Grid / Primary
+    # reflect the growing scan (the Explore image viewer updates on its own).
+    # Dropping the cached run node forces a fresh structure read (so frame
+    # counts grow); only the small scalar table is dropped from disk — the
+    # image stack self-extends via the out-of-range guard, avoiding a full
+    # re-read.
+    if _live.get("active"):
+        _detail_cache.update(
+            run=None, primary_loaded=False, baseline_loaded=False,
+            images_loaded=False, primary_info=None, primary_dataset=None,
+        )
+        _invalidate_disk_cache(uid, groups=("primary",))
     try:
         _load_active_tab(event.new)
     except Exception as exc:
@@ -6642,15 +7382,13 @@ def _populate_primary_2d_defaults(df, start_md):
     reset their picks).
     """
     if df is None or df.empty:
-        for w in (w_primary_2d_x, w_primary_2d_y, w_primary_2d_z):
+        for w in (w_primary_2d_x, w_primary_2d_y, w_primary_2d_z,
+                  w_explore_2d_x, w_explore_2d_y, w_explore_2d_z):
             w.options = []
             w.value = None
         w_primary_2d_status.object = "*No primary data — pick a scan first.*"
         return
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    prev_x = w_primary_2d_x.value
-    prev_y = w_primary_2d_y.value
-    prev_z = w_primary_2d_z.value
     default_x, default_y, default_z = pick_default_axes(df, start_md)
 
     def _chosen(prev, default):
@@ -6658,20 +7396,25 @@ def _populate_primary_2d_defaults(df, start_md):
             return prev
         return default if default in numeric_cols else (numeric_cols[0] if numeric_cols else None)
 
-    # Suppress watchers while we batch-update so we trigger only ONE
-    # redraw at the end.
+    # Suppress watchers while we batch-update so we trigger only ONE redraw at
+    # the end, for both the Primary-tab and the Explore-tab 2D selectors.
     _primary_2d_guard["active"] = True
+    _explore_2d_guard["active"] = True
     try:
-        for w, prev, default in (
-            (w_primary_2d_x, prev_x, default_x),
-            (w_primary_2d_y, prev_y, default_y),
-            (w_primary_2d_z, prev_z, default_z),
+        for w, default in (
+            (w_primary_2d_x, default_x), (w_primary_2d_y, default_y),
+            (w_primary_2d_z, default_z),
+            (w_explore_2d_x, default_x), (w_explore_2d_y, default_y),
+            (w_explore_2d_z, default_z),
         ):
+            prev = w.value
             w.options = numeric_cols
             w.value = _chosen(prev, default)
     finally:
         _primary_2d_guard["active"] = False
+        _explore_2d_guard["active"] = False
     _update_primary_2d()
+    _update_explore_2d()
 
 
 _primary_2d_guard = {"active": False}
@@ -6715,8 +7458,69 @@ def _update_primary_2d(*_events):
         w_primary_2d_plot.object = None
         w_primary_2d_status.object = f"*Plot failed: {exc}*"
         return
+    # Attach the tap handler *before* handing the figure to the pane — Panel
+    # syncs the model (and its event subscriptions) to the browser on assign,
+    # so registering on_event afterwards never wires up the round-trip.
+    if out.figure is not None:
+        out.figure.on_event("tap", _on_primary_2d_tap)
     w_primary_2d_plot.object = out.figure
-    w_primary_2d_status.object = out.status
+    w_primary_2d_status.object = (
+        out.status + "  ·  *tap a point → open it in Explore*"
+        if out.figure is not None else out.status
+    )
+
+
+def _jump_to_2d_point(event, x_col, y_col):
+    """Tap on a 2D (x, y, z) plot → show that point's frame in Explore.
+
+    The point nearest the tap (in per-axis-normalised distance) maps to a
+    DataFrame row, whose position equals the image-frame index.  Shared by the
+    Primary-tab and Explore-tab 2D plots.
+    """
+    if event.x is None or event.y is None:
+        return
+    df = w_primary_table.value
+    if (df is None or df.empty
+            or x_col not in df.columns or y_col not in df.columns):
+        return
+    try:
+        xv = df[x_col].to_numpy(dtype=float)
+        yv = df[y_col].to_numpy(dtype=float)
+    except Exception:
+        return
+    sx = float(np.nanmax(xv) - np.nanmin(xv)) or 1.0
+    sy = float(np.nanmax(yv) - np.nanmin(yv)) or 1.0
+    d = ((xv - event.x) / sx) ** 2 + ((yv - event.y) / sy) ** 2
+    if not np.any(np.isfinite(d)):
+        return
+    idx = int(np.nanargmin(d))
+
+    def _jump():
+        w_detail_tabs.active = 3  # Explore (no-op if already there)
+        try:
+            _load_primary()
+            _load_images()
+        except Exception:
+            log.exception("2D tap: explore load failed")
+        _set_explore_frame(idx)
+        try:
+            pn.state.notifications.info(f"Showing frame {idx}")
+        except Exception:
+            pass
+
+    # Run under the document lock (tap callbacks may fire unlocked).
+    doc = _live.get("doc") or pn.state.curdoc
+    if doc is not None:
+        try:
+            doc.add_next_tick_callback(_jump)
+            return
+        except Exception:
+            pass
+    _jump()
+
+
+def _on_primary_2d_tap(event):
+    _jump_to_2d_point(event, w_primary_2d_x.value, w_primary_2d_y.value)
 
 
 for _w in (w_primary_2d_x, w_primary_2d_y, w_primary_2d_z,
@@ -7033,6 +7837,67 @@ w_explore_x.param.watch(_on_explore_xy, "value")
 w_explore_y.param.watch(_on_explore_xy, "value")
 
 
+_explore_2d_guard = {"active": False}
+
+
+def _update_explore_2d(*_events):
+    """Rebuild the Explore-tab 2D plot from its widget selections."""
+    if _explore_2d_guard["active"]:
+        return
+    df = w_primary_table.value
+    if df is None or df.empty:
+        w_explore_2d_plot.object = None
+        w_explore_2d_status.object = "*Load a scan to see the 2D plot.*"
+        return
+    x_col = w_explore_2d_x.value
+    y_col = w_explore_2d_y.value
+    z_col = w_explore_2d_z.value
+    if not (x_col and y_col and z_col):
+        w_explore_2d_plot.object = None
+        w_explore_2d_status.object = "*Pick X, Y, and Z columns.*"
+        return
+    if x_col == y_col:
+        w_explore_2d_plot.object = None
+        w_explore_2d_status.object = "*X and Y must be different columns.*"
+        return
+    missing = [c for c in (x_col, y_col, z_col) if c not in df.columns]
+    if missing:
+        w_explore_2d_plot.object = None
+        w_explore_2d_status.object = f"*Columns no longer in table: {missing}.*"
+        return
+    try:
+        out = build_primary_2d(
+            df[x_col].values, df[y_col].values, df[z_col].values,
+            x_label=x_col, y_label=y_col, z_label=z_col,
+            cmap=w_explore_2d_cmap.value,
+            log_color=bool(w_explore_2d_log.value),
+            aspect=w_explore_2d_aspect.value,
+            height=300,
+        )
+    except Exception as exc:
+        log.warning("Explore 2D plot failed: %s", exc)
+        w_explore_2d_plot.object = None
+        w_explore_2d_status.object = f"*Plot failed: {exc}*"
+        return
+    # Attach tap-to-jump before assigning to the pane (so Panel wires the
+    # client→server event round-trip).  Read the columns fresh at tap time.
+    if out.figure is not None:
+        out.figure.on_event(
+            "tap",
+            lambda e: _jump_to_2d_point(e, w_explore_2d_x.value, w_explore_2d_y.value),
+        )
+    w_explore_2d_plot.object = out.figure
+    w_explore_2d_status.object = (
+        out.status + "  ·  *tap a point → jump the image to that frame*"
+        if out.figure is not None else out.status
+    )
+
+
+for _w in (w_explore_2d_x, w_explore_2d_y, w_explore_2d_z,
+           w_explore_2d_cmap, w_explore_2d_log, w_explore_2d_aspect):
+    _w.param.watch(_update_explore_2d, "value")
+
+
 w_primary_x.param.watch(_update_primary_plot, "value")
 w_primary_y.param.watch(_update_primary_plot, "value")
 w_primary_table.param.watch(
@@ -7237,7 +8102,7 @@ def _on_process_multi(uids: list[str]) -> None:
     w_btn_process.disabled = True
     w_btn_add_collection.disabled = True
     _proc_result_cache.update(result=None, gi_result=None)
-    _per_frame_qchi_cache.update(uid=None, data=None)
+    _per_frame_qchi_lru.clear()
     _processing_guard["active"] = True
 
     processed: list[str] = []
@@ -7328,7 +8193,7 @@ def _on_process(event):
     w_proc_spinner.visible = True
     w_btn_process.disabled = True
     _proc_result_cache.update(result=None, gi_result=None)
-    _per_frame_qchi_cache.update(uid=None, data=None)
+    _per_frame_qchi_lru.clear()
     _processing_guard["active"] = True
 
     try:
@@ -7408,13 +8273,10 @@ def _on_process(event):
                 if has_qchi_frames:
                     n_fr = qchi.sizes["frame"]
                 else:
-                    # Check for per-frame data in saxs/waxs q_chi_frames
-                    pf_qchi = _get_per_frame_qchi(result)
-                    if pf_qchi is not None:
-                        n_fr = pf_qchi[2].shape[0]
-                        has_qchi_frames = True  # we have per-frame 2D data
-                    else:
-                        n_fr = 0
+                    # Per-frame 2D data lives in the lazy saxs/waxs q_chi_frames
+                    # stacks — count frames from metadata only (no compute).
+                    n_fr = _qchi_frame_count(result)
+                    has_qchi_frames = n_fr > 1
                 if has_qchi_frames and n_fr > 1:
                     w_proc_frame_slider.end = max(0, n_fr - 1)
                     w_proc_frame_slider.value = 0
@@ -9744,6 +10606,11 @@ _live: dict[str, Any] = {
     "saved": {},  # widget -> {param_name: prev_value}
     "doc": None,  # captured Bokeh document for cross-thread dispatch
     "frame_seq": 0,  # debounce counter for frame-extended events
+    "latest_frame": {},  # field -> latest n_total recorded by stream callbacks
+    "primary_dirty": False,  # primary table grew since last consumer pass
+    "stop_event": None,  # threading.Event to stop the consumer thread
+    "consumer": None,  # background consumer thread
+    "uid": None,  # captured watched uid (consumer reads, doc-thread sets)
 }
 
 # ---------------------------------------------------------------------------
@@ -10086,8 +10953,10 @@ def _live_switch_to(uid: str) -> None:
         if uid and _live["manager"] is not None:
             try:
                 run = _ensure_run()
-                if run is not None and _live["manager"].watched_uid != uid:
-                    _live["manager"].watch_run(uid, run)
+                if run is not None:
+                    _live["uid"] = uid
+                    if _live["manager"].watched_uid != uid:
+                        _live["manager"].watch_run(uid, run)
             except Exception as exc:
                 log.warning("live: re-watch failed: %s", exc)
         return
@@ -10131,6 +11000,12 @@ def _live_switch_to(uid: str) -> None:
     if mgr is not None:
         run = _ensure_run()
         if run is not None:
+            # Capture uid for the background consumer (which re-resolves the
+            # run itself and must not touch _selected_uid() from its thread).
+            _live["uid"] = uid
+            # New target: reset the per-field frame counters so the consumer
+            # doesn't try to read stale indices from the previous scan.
+            _live["latest_frame"] = {}
             try:
                 mgr.watch_run(uid, run)
             except Exception as exc:
@@ -10153,59 +11028,109 @@ def _live_on_new_run(uid: str) -> None:
     _live_switch_to(uid)
 
 
+# Streaming callbacks below are deliberately *trivial*: they only record the
+# latest state and return immediately.  A background consumer thread
+# (``_live_consumer_loop``) periodically reads that state, fetches the latest
+# frame off the document thread, and marshals a cheap in-place image update
+# back onto it.  This keeps all network I/O off the document thread so the UI
+# (notably the Stop button) stays responsive even when the stream fires
+# hundreds of events per second.
+
 def _live_on_primary_extended(uid: str) -> None:
     if uid != _selected_uid():
         return
-    # Force a re-fetch of the primary scalars table by clearing the cache flag.
-    _detail_cache["primary_loaded"] = False
-    try:
-        _load_primary()
-    except Exception:
-        log.exception("live: primary refresh failed")
-        return
-    # Rebuild explore plot so the line shows the latest points.
-    try:
-        _build_explore_plot()
-    except Exception:
-        log.exception("live: explore plot rebuild failed")
+    _live["primary_dirty"] = True
 
 
 def _live_on_frame_extended(uid: str, field: str, n_total: int) -> None:
-    if uid != _selected_uid():
+    if uid != _selected_uid() or n_total <= 0:
         return
-    # Drop the cached dataset so the next fetch sees the new frames.
-    _detail_cache["primary_dataset"] = None
-    _image_cache["dataset"] = None
-    if n_total <= 0:
+    _live.setdefault("latest_frame", {})[field] = n_total
+
+
+def _live_consume_once() -> None:
+    """One consumer iteration (background thread): fetch the latest frame and
+    schedule a lightweight document-thread update.  No Bokeh access here."""
+    if not _live.get("active"):
         return
-    # Debounce: bump the sequence counter so that if multiple frame events
-    # arrive rapidly, only the latest one actually triggers a re-render.
-    _live["frame_seq"] = _live.get("frame_seq", 0) + 1
-    my_seq = _live["frame_seq"]
-    # Extend slider range; auto-advance to the latest frame iff this field
-    # is the one currently displayed.
-    new_end = max(0, n_total - 1)
-    if w_image_slider.end != new_end:
-        w_image_slider.end = new_end
-    if field == _image_cache.get("field"):
-        # Skip render if a newer frame event has already been dispatched.
-        if _live.get("frame_seq", 0) != my_seq:
-            return
-        # Setting .value triggers _on_image_slider → re-renders + cursor sync.
-        if w_image_slider.value != new_end:
-            w_image_slider.value = new_end
-        else:
-            # Same index, but the underlying frame changed — force re-render.
+    uid = _live.get("uid")
+    field = _image_cache.get("field")
+    latest = _live.get("latest_frame") or {}
+
+    # Primary table / explore line plot — refresh only while that tab is shown;
+    # the actual widget writes happen on the document thread.
+    if _live.get("primary_dirty") and w_detail_tabs.active in (1, 3):
+        _live["primary_dirty"] = False
+
+        def _apply_primary():
+            if not _live.get("active"):
+                return
+            _detail_cache["primary_loaded"] = False
             try:
-                _render_image_frame(field, new_end)
+                _load_primary()
+                if w_detail_tabs.active == 3:
+                    _build_explore_plot()
             except Exception:
-                log.exception("live: frame re-render failed")
-    # If the Grid tab is currently active, refresh the multiview grid too.
-    if w_detail_tabs.active == 4:
+                log.exception("live: primary refresh failed")
+
+        _dispatch_to_doc(_apply_primary)
+
+    # Only the Explore tab shows the live image; skip the fetch otherwise
+    # (it reloads fresh on switch via _on_detail_tab / _load_images).
+    if w_detail_tabs.active != 3:
+        return
+    if not (uid and field) or field not in latest:
+        return
+    new_end = max(0, latest[field] - 1)
+    old_end = max(0, (_image_cache.get("n_frames", 1) or 1) - 1)
+    # Auto-advance only if the user is parked at the latest frame; if they've
+    # scrubbed back to inspect an earlier one, leave the view where it is.
+    following = int(w_image_slider.value) >= old_end
+
+    raw = None
+    if following:
         try:
-            _fetch_and_build_multiview(field)
+            # Re-resolve the run fresh so its structure reflects the current
+            # frame count — a node captured at live-start would slice against
+            # a stale shape and miss the newest frames.
+            run = _get_cat()[uid]
+            raw = _coerce_to_2d_frame(
+                tb.fetch_frame(run, "primary", field, frame_idx=new_end,
+                               _dataset=None)
+            )
         except Exception:
-            log.exception("live: multiview grid refresh failed")
+            log.warning("live: consumer frame fetch failed", exc_info=True)
+
+    def _apply_image(raw=raw, new_end=new_end, field=field, following=following):
+        if not _live.get("active") or _image_cache.get("field") != field:
+            return
+        _image_cache["n_frames"] = new_end + 1
+        if w_image_slider.end != new_end:
+            w_image_slider.end = new_end
+        if w_image_frame_input.end != new_end:
+            w_image_frame_input.end = new_end
+        if following and raw is not None:
+            _set_explore_frame(new_end, render=False)
+            try:
+                _render_image_frame(field, new_end, prefetched=raw)
+                _update_explore_cursor(new_end)
+            except Exception:
+                log.exception("live: image apply failed")
+
+    _dispatch_to_doc(_apply_image)
+
+
+def _live_consumer_loop() -> None:
+    """Background loop: consume buffered live updates ~1/s until stopped."""
+    stop = _live.get("stop_event")
+    if stop is None:
+        return
+    while not stop.is_set():
+        try:
+            _live_consume_once()
+        except Exception:
+            log.exception("live: consumer iteration failed")
+        stop.wait(1.0)
 
 
 def _live_on_error(stage: str, exc: Exception) -> None:
@@ -10224,10 +11149,19 @@ def _on_live_toggle(event) -> None:
 def _enter_live_mode() -> None:
     log.info("live: entering live mode")
     _live["active"] = True
+    _live["latest_frame"] = {}
+    _live["primary_dirty"] = False
     # Capture the Bokeh document on the UI thread so worker threads can
     # marshal updates back via add_next_tick_callback.  pn.state.curdoc
     # is thread-local; we cannot read it from inside streaming callbacks.
     _live["doc"] = pn.state.curdoc
+    # Background consumer drains buffered stream events ~1/s, fetching frames
+    # off the document thread (see _live_consumer_loop).
+    _live["stop_event"] = threading.Event()
+    _live["consumer"] = threading.Thread(
+        target=_live_consumer_loop, name="live-consumer", daemon=True,
+    )
+    _live["consumer"].start()
     w_btn_live.name = "■ Stop Live"
     _live_set_lockout(True)
     _live_set_banner("🔴 **LIVE** — connecting to tiled stream…")
@@ -10260,6 +11194,12 @@ def _exit_live_mode() -> None:
     log.info("live: exiting live mode")
     _live["active"] = False
     w_btn_live.name = "🔴 Go Live"
+    # Signal the consumer thread to stop (it's a daemon and re-checks the
+    # active flag, so we don't block the doc thread joining it).
+    ev = _live.get("stop_event")
+    if ev is not None:
+        ev.set()
+    _live["consumer"] = None
     mgr = _live["manager"]
     _live["manager"] = None
     if mgr is not None:
@@ -10307,12 +11247,7 @@ def _on_update(_event=None):
     try:
         # Re-fetch the run node from tiled (fresh metadata)
         run = _get_cat()[uid]
-        stop = run.metadata.get("stop", {})
-        num_events = stop.get("num_events", {})
-        if isinstance(num_events, dict):
-            new_n_steps = num_events.get("primary", 0)
-        else:
-            new_n_steps = int(num_events) if num_events else 0
+        new_n_steps = _current_primary_len(run)
 
         # Compare with what we previously had
         old_summary = _detail_cache.get("summary")
@@ -10335,20 +11270,8 @@ def _on_update(_event=None):
                 images_loaded=False,
                 primary_info=None, primary_dataset=None,
             )
-            # Invalidate the disk cache for scalars so they are re-fetched
-            from smi_browser.cache import ScanCache
-            cache = ScanCache(uid)
-            if cache.exists():
-                import h5py
-                try:
-                    with cache._lock:
-                        with h5py.File(cache.path, "a") as f:
-                            if "primary" in f:
-                                del f["primary"]
-                            if "images" in f:
-                                del f["images"]
-                except Exception:
-                    pass
+            # Invalidate the disk cache so fresh scalars + frames are re-fetched
+            _invalidate_disk_cache(uid)
 
             # Reload metadata and active tab
             _load_metadata(uid)
@@ -10748,6 +11671,107 @@ left_panel = pn.Column(
     ],
 )
 
+# Process sub-tabs.  Defined as a standalone object so the Peak Map sub-tab can
+# lazily load its (memory-heavy) per-frame data only when first activated.
+_proc_advanced_card = pn.Card(
+    pn.Tabs(
+        (
+            "Cross sections",
+            pn.Column(
+                pn.pane.Markdown(
+                    "*Click **+ Horizontal cut** or **+ Vertical cut** to drop "
+                    "a dashed slice rectangle on the 2D plot above. Drag it to "
+                    "move; drag a corner/edge to resize the slice width. Hold "
+                    "shift+drag on empty space to draw a new box; click a box "
+                    "and press Backspace to delete. Cuts persist across scans "
+                    "-- they are re-applied to every newly processed result.*",
+                ),
+                pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts,
+                       w_cuts_log_x, w_cuts_log_y, w_plot_style),
+                w_cuts_table,
+                w_proc_cuts_plot,
+                sizing_mode="stretch_width",
+            ),
+        ),
+        ("Calibrate SAXS", _build_calibrate_panel(_CAL_SAXS)),
+        ("Calibrate WAXS", _build_calibrate_panel(_CAL_WAXS)),
+        sizing_mode="stretch_width",
+    ),
+    title="Advanced",
+    collapsed=False, sizing_mode="stretch_width",
+)
+
+w_proc_inner_tabs = pn.Tabs(
+    (
+        "2D (q-chi)",
+        pn.Column(
+            w_proc_2d_plot,
+            _proc_advanced_card,
+            sizing_mode="stretch_width",
+        ),
+    ),
+    (
+        "1D (I(q))",
+        pn.Column(
+            w_proc_iq_plot,
+            sizing_mode="stretch_width",
+        ),
+    ),
+    (_PEAK_MAP_TAB_TITLE, peak_map_panel),
+    (
+        "Parameters",
+        pn.Column(
+            w_card_grid,
+            w_card_masks,
+            w_card_saxs_qrange,
+            w_card_geometry,
+            w_card_dezinger,
+            w_card_intensity,
+            w_card_gi,
+            w_card_backend,
+            w_card_dynamic_mask,
+            w_card_waxs_cal,
+            w_card_waxs_mask_adv,
+            sizing_mode="stretch_width",
+        ),
+    ),
+    (
+        "Cache",
+        pn.Column(
+            w_cache_enabled,
+            pn.Row(w_btn_cache_refresh, w_btn_cache_clear),
+            w_cache_info,
+            pn.pane.Markdown(
+                "*Geometry cache stores pre-computed integrator objects (poni "
+                "files, solid-angle corrections, etc.) to speed up repeated "
+                "reductions. Clear it if you change calibration parameters or "
+                "to free memory.*",
+            ),
+            sizing_mode="stretch_width",
+        ),
+    ),
+    ("Batch", batch_panel),
+    sizing_mode="stretch_width",
+)
+
+
+#: Fixed position of the Peak Map sub-tab in ``w_proc_inner_tabs``.
+_PEAK_MAP_TAB_IDX = 2
+
+
+def _on_proc_inner_tab(event=None):
+    """Lazily load the Peak Map data when its sub-tab is opened."""
+    try:
+        active = w_proc_inner_tabs.active
+    except Exception:
+        return
+    if active == _PEAK_MAP_TAB_IDX:
+        _peakmap_load(_selected_uid())
+
+
+w_proc_inner_tabs.param.watch(_on_proc_inner_tab, "active")
+
+
 w_detail_tabs = pn.Tabs(
     (
         "Metadata",
@@ -10797,10 +11821,26 @@ w_detail_tabs = pn.Tabs(
         "Explore",
         pn.Column(
             pn.Row(w_image_status, w_image_spinner),
-            pn.Row(w_image_field, w_image_slider, sizing_mode="stretch_width"),
-            pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
-            # Line plot stays compact at the top; auto-hidden when empty.
-            w_explore_plot_container,
+            pn.Row(w_image_field, w_image_slider, w_image_frame_input,
+                   sizing_mode="stretch_width"),
+            # Linked plot of the scalar table: 1D line plot or 2D map.  Tapping
+            # a 2D point jumps the image below to that frame.
+            pn.Tabs(
+                ("1D", pn.Column(
+                    pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
+                    w_explore_plot_container,
+                    sizing_mode="stretch_width",
+                )),
+                ("2D", pn.Column(
+                    pn.Row(w_explore_2d_x, w_explore_2d_y, w_explore_2d_z,
+                           w_explore_2d_cmap, w_explore_2d_log, w_explore_2d_aspect,
+                           sizing_mode="stretch_width"),
+                    w_explore_2d_status,
+                    w_explore_2d_plot,
+                    sizing_mode="stretch_width",
+                )),
+                sizing_mode="stretch_width",
+            ),
             # Plotting tools card — color scale, mask overlay, alignment.
             pn.Card(
                 pn.Card(
@@ -10840,7 +11880,9 @@ w_detail_tabs = pn.Tabs(
         pn.Column(
             pn.Row(w_mv_status, w_mv_spinner),
             pn.Row(w_mv_field, w_mv_cmap, w_mv_log, w_mv_label, sizing_mode="stretch_width"),
-            pn.Row(w_mv_range, w_mv_prev, w_mv_next, w_mv_page_status,
+            pn.Row(w_mv_range,
+                   w_mv_first, w_mv_prev, w_mv_page_input, w_mv_next, w_mv_last,
+                   w_mv_page_status,
                    sizing_mode="stretch_width"),
             pn.Column(w_mv_grid, sizing_mode="stretch_both", min_height=500),
             sizing_mode="stretch_both",
@@ -10853,95 +11895,12 @@ w_detail_tabs = pn.Tabs(
             pn.Row(w_proc_geometry, w_btn_process, w_btn_add_collection,
                    w_proc_spinner),
             w_proc_status,
-            # Advanced parameters grouped in a sub-tabs to save vertical space
-            pn.Tabs(
-                (
-                    "Results",
-                    pn.Column(
-                        pn.Row(w_proc_iq_mode, w_proc_iq_label),
-                        w_proc_frame_slider,
-                        w_proc_2d_plot,
-                        # Advanced -- tools that read from the 2D plot above
-                        # (cross sections, AgBh calibration).
-                        pn.Card(
-                            pn.Tabs(
-                                (
-                                    "Cross sections",
-                                    pn.Column(
-                                        pn.pane.Markdown(
-                                            "*Click **+ Horizontal cut** or "
-                                            "**+ Vertical cut** to drop a dashed "
-                                            "slice rectangle on the 2D plot above. "
-                                            "Drag it to move; drag a corner/edge "
-                                            "to resize the slice width. Hold "
-                                            "shift+drag on empty space to draw a "
-                                            "new box; click a box and press "
-                                            "Backspace to delete. Cuts persist "
-                                            "across scans -- they are "
-                                            "re-applied to every newly processed "
-                                            "result.*",
-                                        ),
-                                        pn.Row(w_btn_add_hcut, w_btn_add_vcut,
-                                               w_btn_clear_cuts,
-                                               w_cuts_log_x, w_cuts_log_y,
-                                               w_plot_style),
-                                        w_cuts_table,
-                                        w_proc_cuts_plot,
-                                        sizing_mode="stretch_width",
-                                    ),
-                                ),
-                                (
-                                    "Calibrate SAXS",
-                                    _build_calibrate_panel(_CAL_SAXS),
-                                ),
-                                (
-                                    "Calibrate WAXS",
-                                    _build_calibrate_panel(_CAL_WAXS),
-                                ),
-                                sizing_mode="stretch_width",
-                            ),
-                            title="Advanced",
-                            collapsed=False, sizing_mode="stretch_width",
-                        ),
-                        w_proc_iq_plot,
-                        sizing_mode="stretch_width",
-                    ),
-                ),
-                (
-                    "Parameters",
-                    pn.Column(
-                        w_card_grid,
-                        w_card_masks,
-                        w_card_saxs_qrange,
-                        w_card_geometry,
-                        w_card_dezinger,
-                        w_card_intensity,
-                        w_card_gi,
-                        w_card_backend,
-                        w_card_dynamic_mask,
-                        w_card_waxs_cal,
-                        w_card_waxs_mask_adv,
-                        sizing_mode="stretch_width",
-                    ),
-                ),
-                (
-                    "Cache",
-                    pn.Column(
-                        w_cache_enabled,
-                        pn.Row(w_btn_cache_refresh, w_btn_cache_clear),
-                        w_cache_info,
-                        pn.pane.Markdown(
-                            "*Geometry cache stores pre-computed integrator "
-                            "objects (poni files, solid-angle corrections, etc.) "
-                            "to speed up repeated reductions. Clear it if you "
-                            "change calibration parameters or to free memory.*",
-                        ),
-                        sizing_mode="stretch_width",
-                    ),
-                ),
-                ("Batch", batch_panel),
-                sizing_mode="stretch_width",
-            ),
+            # Per-frame controls apply to both the 2D q-chi and 1D I(q) views,
+            # so they live above the sub-tabs.
+            pn.Row(w_proc_iq_mode, w_proc_iq_label),
+            w_proc_frame_slider,
+            # 2D / 1D / Peak Map / Parameters / Cache / Batch (built above).
+            w_proc_inner_tabs,
         ),
     ),
     (
@@ -10978,12 +11937,7 @@ def _on_update_scan(_event=None):
         return
     try:
         run = _get_cat()[uid]
-        stop = run.metadata.get("stop", {})
-        num_events = stop.get("num_events", {})
-        if isinstance(num_events, dict):
-            new_n_steps = num_events.get("primary", 0)
-        else:
-            new_n_steps = int(num_events) if num_events else 0
+        new_n_steps = _current_primary_len(run)
 
         old_summary = _detail_cache.get("summary")
         old_n_steps = 0
@@ -11002,19 +11956,7 @@ def _on_update_scan(_event=None):
                 primary_info=None, primary_dataset=None,
             )
             # Invalidate disk cache for this scan
-            from smi_browser.cache import ScanCache
-            cache = ScanCache(uid)
-            if cache.exists():
-                import h5py
-                try:
-                    with cache._lock:
-                        with h5py.File(cache.path, "a") as f:
-                            if "primary" in f:
-                                del f["primary"]
-                            if "images" in f:
-                                del f["images"]
-                except Exception:
-                    pass
+            _invalidate_disk_cache(uid)
 
             _load_metadata(uid)
             active_tab = w_detail_tabs.active
