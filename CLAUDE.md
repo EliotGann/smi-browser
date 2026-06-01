@@ -39,14 +39,15 @@ Two monkey-patches are applied at startup and must remain near the top of `smi_a
 | `state.py` | `AppState` — single dataclass holding all mutable app state; UI modules receive it by argument, no module globals |
 | `config.py` | Constants and defaults, mostly re-exported from `smi_tiled.defaults` |
 | `processing.py` | `build_proc_params()` — pure param builder; returns `(reduce_fn_name, kwargs)` for `reduce_smi_combined` or `reduce_smi_gi` |
-| `cache.py` | `ScanCache` — per-UID HDF5 disk cache for scalars, raw image stacks, and reduction outputs; thread-safe with per-file locks and LRU eviction |
-| `export.py` | Writes PNG figures and HDF5 files to proposal working directories (uses `nsls2api.py` for path resolution) |
+| `cache.py` | `ScanCache` — per-UID HDF5 disk cache for scalars, raw image stacks, reduction outputs, and per-peak fit results (`/peakfit`); also persists the global peak-definition list (`peak_defs.json`). Thread-safe with per-file locks and LRU eviction |
+| `export.py` | Writes PNG figures and HDF5 files to proposal working directories. The HDF5 writer is **section-gated** (`h5_sections`): metadata / primary / baseline+config / processed I(q) on by default; raw images, processed q-χ, peak fits opt-in. Also emits per-peak result PNGs (uses `nsls2api.py` for path resolution) |
 | `nsls2api.py` | Unauthenticated REST calls to `api.nsls2.bnl.gov` for proposal/data-session lookup |
 | `_batch.py` | `BatchProcessor` — bounded thread-pool queue runner; decoupled from Panel/Bokeh for testability |
 | `_stream.py` | `LiveStreamManager` — wraps tiled's streaming subscription API; callbacks fire on a background thread and must be marshalled to Bokeh's document thread via a `dispatcher` |
 | `models/collection.py` | `ScanCollection` — holds processed results for I(q) comparison and xarray parameter-sweep stacking |
+| `models/peakfit.py` | `fit_peak_across_frames()` — per-frame Gaussian/Lorentzian peak fitting across a 1-D I(q) stack; bounded width + SNR/R² gating + per-peak link modes (independent / linked / tracked). Panel/Bokeh-free, unit-tested |
 | `models/summary.py` | `enhanced_summary()` — merges tiled metadata into a flat dict for display |
-| `data/scalars.py`, `data/frames.py`, `data/masks.py` | Pure helpers for scalar DataFrames, image orientation, and mask polygon conversion |
+| `data/scalars.py`, `data/frames.py`, `data/masks.py` | Pure helpers for scalar DataFrames, image orientation, and mask polygon conversion. `data/scalars.py` also derives **virtual axes** (`derive_virtual_columns` / `parse_label_number_tokens`) from structured per-frame string fields |
 | `figures/` | Bokeh figure builders (image viewer, multiview grid, I(q) cuts, 2D process map) |
 | `ui/` | Panel widget wiring for each tab (auth, batch, collection, live) |
 
@@ -65,6 +66,18 @@ All reduction goes through `smi-tiled` (local editable install at `../smi-tiled`
 ### Disk cache
 
 `ScanCache` stores per-scan HDF5 files under `$SMI_BROWSER_CACHE_DIR` (default `$TMPDIR/smi_browser_cache`). Capacity is capped at `$SMI_BROWSER_CACHE_MAX_GB` (default 50 GB) with LRU eviction. Image datasets use per-frame chunking for cheap random-access reads.
+
+Per-frame I(q) (`pf_iq_I` / `pf_iq_q`) is written into `/reduction` at reduction time, so the Peak Map tab and exports reuse it across restarts with no recompute. Peak-fit result maps are stored under `/peakfit/<hash>` (keyed by `PeakDef.key()`) and are **invalidated whenever `write_reduction` runs** (re-processing overwrites `pf_iq`). The drawn peak list itself persists globally in `peak_defs.json` under the cache root. **Caveat:** the default cache dir lives under `$TMPDIR`, which survives a browser restart but may be wiped on reboot — set `$SMI_BROWSER_CACHE_DIR` to a persistent path to keep cached results permanently.
+
+> **HDF5 byte strings:** string columns cached via h5py read back as `bytes`. `_scalars_to_dataframe` (in `smi_app.py`) decodes them to `str` so the Tabulator doesn't render `[object ArrayBuffer]` and so virtual-axis parsing works on the cached path as well as fresh-from-tiled.
+
+### Peak fitting & the Peak Map tab
+
+`models/peakfit.py` fits one peak per drawn q-range to every frame's 1-D I(q), producing `amplitude` / `center` / `fwhm` / `area` maps. Robustness rules: the fitted FWHM is bounded by the drawn range, and an SNR/R² gate rejects no-peak frames (reporting amplitude/area `0`, centre/FWHM `NaN`) rather than letting the fit run away. Each peak has a `link` mode — `independent`, `linked` (centre & width shared from a robust aggregate fit; only amplitude varies per frame, via a fast `lstsq`), or `tracked` (warm-start from the previous frame). Fits run on a background thread, are cached per `(uid, PeakDef.key())`, and the result map plots against any per-frame axis.
+
+### Virtual primary axes (filename-derived)
+
+Some quantities (e.g. grazing-incidence angle) are encoded only inside per-frame string fields like `target_file_name` (`..._ai0.50_wa9_degC100.0`). `data/scalars.py::derive_virtual_columns` parses every `label`+`number`(+`unit`) token from such columns into numeric `fn:`-prefixed columns (`fn:ai`, `fn:eV`, …; `NaN` where a token is absent). It is called once inside `smi_app.py::_scalars_to_dataframe`, so the derived axes flow automatically into every axis selector (Primary, Explore, Process 2D map, Peak Map) and into exports — no reduction needed.
 
 ### Threading model
 

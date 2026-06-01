@@ -107,3 +107,90 @@ def test_progress_reports_completion(synthetic):
     peak = PeakDef("p", q_min=3.0, q_max=7.0, model="gaussian", baseline="none")
     fit_peak_across_frames(q, iq, peak, progress=lambda d, t: seen.append((d, t)))
     assert seen[-1] == (iq.shape[0], iq.shape[0])
+
+
+# --- robustness: no-peak gating & width bounds -----------------------------
+
+def test_no_peak_frame_reports_zero():
+    """A flat/noisy frame with no peak gates to amplitude/area 0, centre NaN."""
+    rng = np.random.default_rng(0)
+    q = np.linspace(0.0, 10.0, 400)
+    peak_frame = _gauss(q, 5.0, 5.0, 0.3) + 0.01 * rng.standard_normal(q.size)
+    flat_frame = 1.0 + 0.01 * rng.standard_normal(q.size)  # no peak
+    iq = np.stack([peak_frame, flat_frame])
+
+    peak = PeakDef("p", q_min=4.0, q_max=6.0, model="gaussian",
+                   baseline="linear", link="independent")
+    res = fit_peak_across_frames(q, iq, peak)
+
+    assert res["success"][0]                      # real peak fits
+    assert not res["success"][1]                  # no peak → gated out
+    assert res["amplitude"][1] == 0.0
+    assert res["area"][1] == 0.0
+    assert np.isnan(res["center"][1])
+    assert np.isnan(res["fwhm"][1])
+
+
+def test_width_cannot_exceed_drawn_range():
+    """FWHM is bounded by the drawn q-range even when the data is very broad."""
+    q = np.linspace(0.0, 10.0, 400)
+    # A broad gaussian (sigma 2.0) viewed through a narrow [4.5, 5.5] window.
+    iq = _gauss(q, 5.0, 5.0, 2.0)[None, :]
+    peak = PeakDef("p", q_min=4.5, q_max=5.5, model="gaussian",
+                   baseline="none", link="independent")
+    res = fit_peak_across_frames(q, iq, peak)
+    # Whether or not it is accepted, the fitted FWHM may never exceed the range.
+    if res["success"][0]:
+        assert res["fwhm"][0] <= (5.5 - 4.5) + 1e-9
+
+
+def test_linked_shares_center_and_width():
+    """Linked mode recovers per-frame amplitudes with a single shared centre."""
+    q = np.linspace(0.0, 10.0, 400)
+    amps = np.array([1.0, 2.0, 3.0, 4.0])
+    mu, sigma = 5.0, 0.3
+    iq = np.stack([_gauss(q, a, mu, sigma) for a in amps])
+    peak = PeakDef("p", q_min=3.0, q_max=7.0, model="gaussian",
+                   baseline="none", link="linked")
+    res = fit_peak_across_frames(q, iq, peak)
+    assert res["success"].all()
+    # All frames share one centre/width.
+    centers = res["center"][res["success"]]
+    assert np.allclose(centers, centers[0])
+    assert res["center"][0] == pytest.approx(mu, abs=2e-2)
+    # Amplitudes still recovered per frame.
+    np.testing.assert_allclose(res["amplitude"], amps, rtol=5e-2)
+
+
+def test_linked_falls_back_when_no_aggregate_peak():
+    """Linked mode with no peak anywhere notes a fallback and gates frames."""
+    rng = np.random.default_rng(1)
+    q = np.linspace(0.0, 10.0, 200)
+    iq = 1.0 + 0.01 * rng.standard_normal((5, q.size))
+    peak = PeakDef("p", q_min=4.0, q_max=6.0, model="gaussian",
+                   baseline="linear", link="linked")
+    res = fit_peak_across_frames(q, iq, peak)
+    assert "note" in res
+    assert not res["success"].any()
+
+
+def test_bg_factor_widens_baseline_window():
+    """A linear baseline is recovered well when the flank window is widened."""
+    q = np.linspace(0.0, 10.0, 600)
+    amp, mu, sigma = 3.0, 5.0, 0.3
+    slope, intercept = 0.5, 2.0
+    iq = (_gauss(q, amp, mu, sigma) + slope * q + intercept)[None, :]
+    peak = PeakDef("p", q_min=4.5, q_max=5.5, model="gaussian",
+                   baseline="linear", link="independent", bg_factor=3.0)
+    res = fit_peak_across_frames(q, iq, peak)
+    assert res["success"][0]
+    assert res["amplitude"][0] == pytest.approx(amp, rel=5e-2)
+    assert res["center"][0] == pytest.approx(mu, abs=2e-2)
+
+
+def test_peakdef_key_includes_link_and_bg():
+    a = PeakDef("p", 3.0, 7.0, link="linked", bg_factor=2.0)
+    b = PeakDef("p", 3.0, 7.0, link="independent", bg_factor=2.0)
+    c = PeakDef("p", 3.0, 7.0, link="linked", bg_factor=3.0)
+    assert a.key() != b.key()
+    assert a.key() != c.key()

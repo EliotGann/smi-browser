@@ -50,9 +50,10 @@ from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 from smi_browser import nsls2api
 from smi_browser import memlog
+from smi_browser.data.scalars import derive_virtual_columns
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
-    prune_lock_table,
+    prune_lock_table, read_peak_defs, write_peak_defs,
 )
 
 log = logging.getLogger(__name__)
@@ -431,6 +432,29 @@ def _count_total() -> int:
     return _state.get("total", 0)
 
 
+def _decode_bytes_column(arr: np.ndarray) -> np.ndarray:
+    """Decode a 1-D array of bytes (HDF5 strings) to a str object array.
+
+    Fixed-width (``|S``) and object arrays of ``bytes`` / ``np.bytes_`` are
+    converted element-wise to ``str``; anything else is returned unchanged.
+    """
+    def _dec(v):
+        if isinstance(v, (bytes, bytearray, np.bytes_)):
+            try:
+                return bytes(v).decode("utf-8", "replace")
+            except Exception:
+                return str(v)
+        return v
+
+    if arr.dtype.kind == "S":  # fixed-width bytes
+        return np.array([_dec(v) for v in arr], dtype=object)
+    if arr.dtype == object and len(arr):
+        sample = arr[: min(len(arr), 64)]
+        if any(isinstance(v, (bytes, bytearray, np.bytes_)) for v in sample):
+            return np.array([_dec(v) for v in arr], dtype=object)
+    return arr
+
+
 def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
     """Convert a {field: ndarray} dict of scalars into a DataFrame."""
     if not scalar_data:
@@ -444,6 +468,11 @@ def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
             arr = np.array([arr.item()])
         if arr.ndim != 1:
             continue
+        # Strings cached in HDF5 come back as bytes (h5py vlen / fixed-width),
+        # which Tabulator renders as "[object ArrayBuffer]" and which the
+        # filename parser can't read.  Decode them to real str so text columns
+        # display correctly and virtual axes can be derived.
+        arr = _decode_bytes_column(arr)
         columns[key] = arr
         max_len = max(max_len, len(arr))
 
@@ -477,6 +506,14 @@ def _scalars_to_dataframe(scalar_data: dict) -> pd.DataFrame:
                 if not np.array_equal(order, np.arange(len(order))):
                     df = df.iloc[order].reset_index(drop=True)
                 break
+
+    # Derive numeric "virtual" axes from structured per-frame string fields
+    # (e.g. target_file_name → fn:ai, fn:eV, fn:degC).  These let users plot
+    # quantities that are only encoded in filenames and have no real scalar.
+    try:
+        df = derive_virtual_columns(df)
+    except Exception:
+        log.exception("scalars: derive_virtual_columns failed")
     return df
 
 
@@ -5066,8 +5103,9 @@ _peak_fit_cancel = threading.Event()
 _peak_fit_state: dict[str, Any] = {"doc": None}
 _peak_guard = {"active": False}
 
+_PEAK_TABLE_COLS = ["name", "q_min", "q_max", "model", "baseline", "link", "bg"]
 w_peak_table = pn.widgets.Tabulator(
-    value=pd.DataFrame(columns=["name", "q_min", "q_max", "model", "baseline"]),
+    value=pd.DataFrame(columns=_PEAK_TABLE_COLS),
     show_index=False, sizing_mode="stretch_width", height=180,
     configuration={"layout": "fitColumns", "rowHeight": 24},
     editors={
@@ -5076,6 +5114,8 @@ w_peak_table = pn.widgets.Tabulator(
         "q_max": {"type": "number", "step": 0.01},
         "model": {"type": "list", "values": ["gaussian", "lorentzian"]},
         "baseline": {"type": "list", "values": ["linear", "none"]},
+        "link": {"type": "list", "values": ["linked", "independent", "tracked"]},
+        "bg": {"type": "number", "step": 0.5},
     },
 )
 w_btn_peak_add = pn.widgets.Button(name="+ Peak", button_type="default", width=90)
@@ -5120,9 +5160,49 @@ def _peak_defs_from_table() -> list[PeakDef]:
         name = str(row.get("name") or f"p{len(peaks) + 1}")
         model = str(row.get("model") or "gaussian")
         baseline = str(row.get("baseline") or "linear")
+        link = str(row.get("link") or "linked")
+        try:
+            bg = float(row.get("bg"))
+        except (TypeError, ValueError):
+            bg = 2.0
+        if not np.isfinite(bg) or bg <= 0:
+            bg = 2.0
         peaks.append(PeakDef(name=name, q_min=qmin, q_max=qmax,
-                             model=model, baseline=baseline))
+                             model=model, baseline=baseline,
+                             link=link, bg_factor=bg))
     return peaks
+
+
+def _save_peak_defs():
+    """Persist the current peak table to the global cross-scan list."""
+    df = w_peak_table.value
+    if df is None or df.empty:
+        write_peak_defs([])
+        return
+    cols = [c for c in _PEAK_TABLE_COLS if c in df.columns]
+    try:
+        write_peak_defs(df[cols].to_dict(orient="records"))
+    except Exception:
+        log.exception("peakmap: failed to persist peak definitions")
+
+
+def _load_peak_defs():
+    """Seed the peak table from the persisted global list (startup)."""
+    defs = read_peak_defs()
+    if not defs:
+        return
+    rows = []
+    for d in defs:
+        if not isinstance(d, dict):
+            continue
+        rows.append({c: d.get(c) for c in _PEAK_TABLE_COLS})
+    if not rows:
+        return
+    _peak_guard["active"] = True
+    try:
+        w_peak_table.value = pd.DataFrame(rows, columns=_PEAK_TABLE_COLS)
+    finally:
+        _peak_guard["active"] = False
 
 
 def _axis_values(name: str) -> "np.ndarray | None":
@@ -5245,6 +5325,14 @@ def _peakmap_load(uid: "str | None", force: bool = False):
         scalars[k] = arr[seq_order] if seq_order is not None else arr
     _peakmap_cache.update(uid=uid, q=q, iq=iq, scalars=scalars)
 
+    # Repopulate the in-memory fit cache from disk so a previously-fit map
+    # renders immediately, with no re-fitting, after a browser restart.
+    try:
+        for pkey, res in cache.read_peakfit_index():
+            _peak_fit_cache[(uid, pkey)] = res
+    except Exception:
+        log.exception("peakmap: failed to preload cached fits for %s", uid[:8])
+
     # Axis selectors mirror the 2D explore map: primary scalar columns with
     # defaults taken from the start-document motor hints (innermost = X,
     # next-outer = Y).  Default to a 2D map when two motors are available.
@@ -5301,14 +5389,15 @@ def _default_peak_range() -> tuple[float, float]:
 
 def _append_peak_row(q_min: float, q_max: float):
     df = w_peak_table.value
-    df = df.copy() if df is not None else pd.DataFrame(
-        columns=["name", "q_min", "q_max", "model", "baseline"])
+    df = df.copy() if df is not None else pd.DataFrame(columns=_PEAK_TABLE_COLS)
     new_row = {
         "name": f"p{len(df) + 1}",
         "q_min": round(float(q_min), 4),
         "q_max": round(float(q_max), 4),
         "model": "gaussian",
         "baseline": "linear",
+        "link": "linked",
+        "bg": 2.0,
     }
     _peak_guard["active"] = True
     try:
@@ -5318,6 +5407,7 @@ def _append_peak_row(q_min: float, q_max: float):
         _peak_guard["active"] = False
     _update_heatmap_bands()
     _update_z_peak_options()
+    _save_peak_defs()
 
 
 def _on_peak_add(event=None):
@@ -5339,6 +5429,7 @@ def _on_peak_remove(event=None):
         _peak_guard["active"] = False
     _update_heatmap_bands()
     _update_z_peak_options()
+    _save_peak_defs()
 
 
 def _on_heatmap_select(event):
@@ -5358,6 +5449,7 @@ def _on_peak_table_change(event=None):
         return
     _update_heatmap_bands()
     _update_z_peak_options()
+    _save_peak_defs()
 
 
 def _selected_peak_def() -> "PeakDef | None":
@@ -5454,6 +5546,8 @@ def _on_peak_fit(event=None):
     def _set_status(msg):
         _marshal(lambda: setattr(w_peak_status, "object", msg))
 
+    notes: list[str] = []
+
     def _worker():
         cancelled = False
         try:
@@ -5473,6 +5567,21 @@ def _on_peak_fit(event=None):
                     cancelled = True
                     break
                 _peak_fit_cache[key] = res
+                if res.get("note"):
+                    notes.append(f"`{pk.name}`: {res['note']}")
+                # Persist to the per-scan cache so the map survives a restart.
+                try:
+                    arrays = {k: res[k] for k in (*FIT_PARAMS, "success")
+                              if k in res}
+                    ScanCache(uid).write_peakfit(
+                        pk.key(), arrays,
+                        attrs={"name": pk.name, "q_min": pk.q_min,
+                               "q_max": pk.q_max, "model": pk.model,
+                               "baseline": pk.baseline, "link": pk.link,
+                               "bg_factor": pk.bg_factor},
+                    )
+                except Exception:
+                    log.exception("peakmap: failed to cache fit for %s", pk.name)
                 counter["done"] = base + n_frames
         except Exception as exc:
             log.exception("peak fit failed")
@@ -5488,9 +5597,11 @@ def _on_peak_fit(event=None):
             if cancelled:
                 w_peak_status.object = "*Fit cancelled.*"
             else:
-                w_peak_status.object = (
-                    f"**Fit complete** — {len(peaks)} peak(s) across "
-                    f"{n_frames} frames.")
+                msg = (f"**Fit complete** — {len(peaks)} peak(s) across "
+                       f"{n_frames} frames.")
+                if notes:
+                    msg += "  \n" + "  \n".join(f"⚠ {n}" for n in notes)
+                w_peak_status.object = msg
             _mem_report("peakmap:fit")
         _marshal(_finish)
 
@@ -5505,6 +5616,10 @@ w_peak_table.param.watch(_on_peak_table_change, "value")
 for _w in (w_peak_z_peak, w_peak_z_param, w_peak_map_x, w_peak_map_y,
            w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect):
     _w.param.watch(_update_peak_map, "value")
+
+# Restore the persisted global peak list (drawn peaks survive a restart).
+_load_peak_defs()
+_update_z_peak_options()
 
 peak_map_panel = pn.Column(
     pn.pane.Markdown(
@@ -6428,8 +6543,11 @@ def _load_primary():
     w_primary_table.value = df
     w_primary_spinner.value = False
     w_primary_spinner.visible = False
+    n_virtual = sum(1 for c in df.columns if str(c).startswith("fn:"))
+    virtual_note = f", +{n_virtual} from filenames" if n_virtual else ""
     w_primary_status.object = (
-        f"**{len(df)} rows, {len(df.columns)} fields** ({dt_ms:.0f} ms)"
+        f"**{len(df)} rows, {len(df.columns)} fields**{virtual_note} "
+        f"({dt_ms:.0f} ms)"
     )
     # Populate plot selectors with numeric columns (preserve previous selection if possible)
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -9009,6 +9127,8 @@ def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
                     subdir_template=export_config.get("subdir_template", ""),
                     basename_template=export_config.get("basename_template", ""),
                     frame_label_col=export_config.get("frame_label_col"),
+                    h5_sections=export_config.get("h5_sections"),
+                    peak_param=export_config.get("peak_param", "area"),
                 )
 
         conn.send(("ok", summary))
@@ -9029,6 +9149,8 @@ def _snapshot_export_config() -> dict:
         "auto_export": bool(w_export_auto.value),
         "export_dir": _resolve_export_dir() or "",
         "formats": _export_formats(),
+        "h5_sections": _h5_sections(),
+        "peak_param": w_export_peak_param.value,
         "subdir_template": w_export_subdir.value or "",
         "basename_template": w_export_basename.value or "",
         "frame_label_col": _get_frame_label_cols() or None,
@@ -9476,15 +9598,73 @@ w_export_frame_label_3 = pn.widgets.Select(
     width=180,
 )
 
-# Format checkboxes
-w_export_h5 = pn.widgets.Checkbox(name="HDF5 result", value=True)
-w_export_png_2d = pn.widgets.Checkbox(name="PNG 2D map", value=True)
-w_export_png_iq = pn.widgets.Checkbox(name="PNG I(q)", value=True)
-w_export_png_linecuts = pn.widgets.Checkbox(name="PNG linecuts", value=True)
-w_export_csv_iq = pn.widgets.Checkbox(name="CSV I(q) + per-frame", value=True)
-w_export_csv_scalars = pn.widgets.Checkbox(name="CSV primary scalars", value=False)
-w_export_csv_baseline = pn.widgets.Checkbox(name="CSV baseline", value=False)
+# --- Format checkboxes, grouped by output type ---
+
+# HDF5 master + per-section content toggles
+w_export_h5 = pn.widgets.Checkbox(name="Write HDF5 result (.h5)", value=True)
+w_h5_metadata = pn.widgets.Checkbox(name="Metadata", value=True)
+w_h5_primary = pn.widgets.Checkbox(name="Primary scalars", value=True)
+w_h5_baseline_config = pn.widgets.Checkbox(name="Baseline + config", value=True)
+w_h5_iq = pn.widgets.Checkbox(name="Processed I(q)", value=True)
+w_h5_raw_images = pn.widgets.Checkbox(name="Raw 2D images", value=False)
+w_h5_qchi = pn.widgets.Checkbox(name="Processed q-χ (if available)", value=False)
+w_h5_peakfit = pn.widgets.Checkbox(name="Peak fit results (if available)", value=False)
+
+#: (h5-section key, widget) — drives _h5_sections() and select/clear-all.
+_H5_SECTION_WIDGETS = [
+    ("metadata", w_h5_metadata),
+    ("primary", w_h5_primary),
+    ("baseline_config", w_h5_baseline_config),
+    ("processed_iq", w_h5_iq),
+    ("raw_images", w_h5_raw_images),
+    ("processed_qchi", w_h5_qchi),
+    ("peakfit", w_h5_peakfit),
+]
+
+# PNG images
+w_export_png_2d = pn.widgets.Checkbox(name="2D map", value=True)
+w_export_png_iq = pn.widgets.Checkbox(name="I(q)", value=True)
+w_export_png_linecuts = pn.widgets.Checkbox(name="Linecuts", value=True)
+w_export_png_peaks = pn.widgets.Checkbox(name="Peak results (if available)", value=False)
+w_export_peak_param = pn.widgets.Select(
+    name="Peak param", options=list(FIT_PARAMS), value="area", width=130,
+)
+
+# CSV tables
+w_export_csv_iq = pn.widgets.Checkbox(name="I(q) + per-frame", value=True)
+w_export_csv_scalars = pn.widgets.Checkbox(name="Primary scalars", value=False)
+w_export_csv_baseline = pn.widgets.Checkbox(name="Baseline + config", value=False)
+
+# Other
 w_export_metadata = pn.widgets.Checkbox(name="Metadata JSON", value=False)
+
+#: All format checkboxes toggled by Select-all / Clear-all.
+_EXPORT_FORMAT_WIDGETS = [
+    w_export_h5, w_export_png_2d, w_export_png_iq, w_export_png_linecuts,
+    w_export_png_peaks, w_export_csv_iq, w_export_csv_scalars,
+    w_export_csv_baseline, w_export_metadata,
+] + [w for _, w in _H5_SECTION_WIDGETS]
+
+w_btn_export_select_all = pn.widgets.Button(
+    name="✓ Select all", button_type="light", width=110,
+)
+w_btn_export_clear_all = pn.widgets.Button(
+    name="✗ Clear all", button_type="light", width=110,
+)
+
+
+def _on_export_select_all(event=None):
+    for w in _EXPORT_FORMAT_WIDGETS:
+        w.value = True
+
+
+def _on_export_clear_all(event=None):
+    for w in _EXPORT_FORMAT_WIDGETS:
+        w.value = False
+
+
+w_btn_export_select_all.on_click(_on_export_select_all)
+w_btn_export_clear_all.on_click(_on_export_clear_all)
 
 w_export_auto = pn.widgets.Checkbox(
     name="Auto-export after processing",
@@ -9594,6 +9774,8 @@ def _export_formats() -> set[str]:
         fmts.add("png_iq")
     if w_export_png_linecuts.value:
         fmts.add("png_linecuts")
+    if w_export_png_peaks.value:
+        fmts.add("png_peaks")
     if w_export_csv_iq.value:
         fmts.add("csv_iq")
     if w_export_csv_scalars.value:
@@ -9603,6 +9785,61 @@ def _export_formats() -> set[str]:
     if w_export_metadata.value:
         fmts.add("metadata_txt")
     return fmts
+
+
+def _h5_sections() -> set[str]:
+    """Selected HDF5 content sections from the per-section checkboxes."""
+    return {key for key, w in _H5_SECTION_WIDGETS if w.value}
+
+
+def _gather_peak_fits(uid: str, *, use_ui_axis: bool = False):
+    """Return ``(peak_fits, peak_axis)`` for a scan, or ``(None, None)``.
+
+    Peak fits are read from the per-scan cache (``/peakfit``), so this works
+    for current-scan, collection, and background-batch exports alike.  When
+    ``use_ui_axis`` is set and ``uid`` is the scan currently loaded in the Peak
+    Map tab, the axis mirrors the tab's X/Y selection; otherwise the map falls
+    back to a frame-index x-axis.
+    """
+    try:
+        entries = ScanCache(uid).read_peakfit_full()
+    except Exception:
+        log.exception("export: failed to read peak fits for %s", uid[:8])
+        return None, None
+    if not entries:
+        return None, None
+
+    peak_fits = []
+    for e in entries:
+        key = e["key"]
+        attrs = e.get("attrs") or {}
+        # q-range/model live in attrs; fall back to the key tuple components.
+        peak_fits.append({
+            "name": attrs.get("name") or "peak",
+            "q_min": float(attrs.get("q_min", key[0] if len(key) > 0 else 0.0)),
+            "q_max": float(attrs.get("q_max", key[1] if len(key) > 1 else 0.0)),
+            "model": attrs.get("model", key[2] if len(key) > 2 else ""),
+            "baseline": attrs.get("baseline", key[3] if len(key) > 3 else ""),
+            "link": attrs.get("link", key[4] if len(key) > 4 else ""),
+            "bg_factor": float(attrs.get("bg_factor", key[5] if len(key) > 5 else 2.0)),
+            "results": e["arrays"],
+        })
+
+    peak_axis = None
+    if use_ui_axis and _peakmap_cache.get("uid") == uid:
+        try:
+            x_name = w_peak_map_x.value
+            y_name = w_peak_map_y.value
+            x = _axis_values(x_name)
+            if x is not None:
+                y = None if y_name == _PEAK_NONE_Y else _axis_values(y_name)
+                peak_axis = {
+                    "x": x, "x_label": x_name,
+                    "y": y, "y_label": (y_name if y is not None else ""),
+                }
+        except Exception:
+            log.exception("export: failed to build peak axis from UI")
+    return peak_fits, peak_axis
 
 
 def _resolve_export_dir() -> Path | None:
@@ -9751,6 +9988,7 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
                 lambda row: " | ".join(row), axis=1,
             ).tolist()
 
+    peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=True)
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -9769,6 +10007,10 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
         subdir_template=w_export_subdir.value,
         basename_template=w_export_basename.value,
         frame_label_col=_get_frame_label_cols() or None,
+        h5_sections=_h5_sections(),
+        peak_fits=peak_fits,
+        peak_axis=peak_axis,
+        peak_param=w_export_peak_param.value,
     )
 
 
@@ -9839,6 +10081,7 @@ def _on_export_multi(uids: list[str]) -> None:
                 errors += 1
                 continue
             try:
+                peak_fits, peak_axis = _gather_peak_fits(uid)
                 _, files = export_scan(
                     out_dir=out_dir,
                     uid=uid,
@@ -9852,6 +10095,10 @@ def _on_export_multi(uids: list[str]) -> None:
                     subdir_template=w_export_subdir.value,
                     basename_template=w_export_basename.value,
                     frame_label_col=_get_frame_label_cols() or None,
+                    h5_sections=_h5_sections(),
+                    peak_fits=peak_fits,
+                    peak_axis=peak_axis,
+                    peak_param=w_export_peak_param.value,
                 )
                 total_files += len(files)
             except Exception:
@@ -9904,6 +10151,7 @@ def _on_export_collection(event):
             coll_raw_md = _collection.get_raw_metadata(coll_uid)
 
             try:
+                coll_peaks, coll_peak_axis = _gather_peak_fits(coll_uid)
                 _, files = export_scan(
                     out_dir=out_dir,
                     uid=coll_uid,
@@ -9917,6 +10165,10 @@ def _on_export_collection(event):
                     subdir_template=w_export_subdir.value,
                     basename_template=w_export_basename.value,
                     frame_label_col=_get_frame_label_cols() or None,
+                    h5_sections=_h5_sections(),
+                    peak_fits=coll_peaks,
+                    peak_axis=coll_peak_axis,
+                    peak_param=w_export_peak_param.value,
                 )
                 total_files += len(files)
             except Exception:
@@ -10055,6 +10307,7 @@ def _do_export_single_to_dir(uid: str, out_dir) -> tuple | None:
                 lambda row: " | ".join(row), axis=1,
             ).tolist()
 
+    peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=True)
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -10073,6 +10326,10 @@ def _do_export_single_to_dir(uid: str, out_dir) -> tuple | None:
         subdir_template="",  # flat — no subdir in zip
         basename_template=w_export_basename.value,
         frame_label_col=_get_frame_label_cols() or None,
+        h5_sections=_h5_sections(),
+        peak_fits=peak_fits,
+        peak_axis=peak_axis,
+        peak_param=w_export_peak_param.value,
     )
 
 
@@ -10110,6 +10367,7 @@ def _on_download_collection(event):
                     scan_dir.mkdir(exist_ok=True)
 
                     try:
+                        coll_peaks, coll_peak_axis = _gather_peak_fits(coll_uid)
                         _, files = export_scan(
                             out_dir=Path(tmpdir),
                             uid=coll_uid,
@@ -10124,6 +10382,10 @@ def _on_download_collection(event):
                             subdir_template=w_export_subdir.value or "{uid_short}",
                             basename_template=w_export_basename.value,
                             frame_label_col=_get_frame_label_cols() or None,
+                            h5_sections=_h5_sections(),
+                            peak_fits=coll_peaks,
+                            peak_axis=coll_peak_axis,
+                            peak_param=w_export_peak_param.value,
                         )
                         # Add files to zip under a scan subdirectory
                         actual_subdir = w_export_subdir.value or "{uid_short}"
@@ -10202,9 +10464,37 @@ export_panel = pn.Column(
         stylesheets=[":host { font-size: 11px; color: #666; }"],
     ),
     pn.layout.Divider(),
-    pn.pane.Markdown("**Output formats:**"),
-    pn.Row(w_export_h5, w_export_png_2d, w_export_png_iq, w_export_png_linecuts),
-    pn.Row(w_export_csv_iq, w_export_csv_scalars, w_export_csv_baseline, w_export_metadata),
+    pn.Row(
+        pn.pane.Markdown("**Output formats**", margin=(5, 10, 5, 0)),
+        w_btn_export_select_all, w_btn_export_clear_all,
+    ),
+    pn.Card(
+        w_export_h5,
+        pn.pane.Markdown(
+            "*Contents (only written when present in the scan):*",
+            stylesheets=[":host { font-size: 11px; color: #666; }"],
+            margin=(0, 0, 0, 20),
+        ),
+        pn.Column(
+            w_h5_metadata, w_h5_primary, w_h5_baseline_config, w_h5_iq,
+            w_h5_raw_images, w_h5_qchi, w_h5_peakfit,
+            margin=(0, 0, 0, 20),
+        ),
+        title="HDF5 (.h5)", collapsed=False, sizing_mode="stretch_width",
+    ),
+    pn.Card(
+        pn.Column(w_export_png_2d, w_export_png_iq, w_export_png_linecuts),
+        pn.Row(w_export_png_peaks, w_export_peak_param),
+        title="PNG images", collapsed=False, sizing_mode="stretch_width",
+    ),
+    pn.Card(
+        pn.Column(w_export_csv_iq, w_export_csv_scalars, w_export_csv_baseline),
+        title="CSV tables", collapsed=True, sizing_mode="stretch_width",
+    ),
+    pn.Card(
+        pn.Column(w_export_metadata),
+        title="Other", collapsed=True, sizing_mode="stretch_width",
+    ),
     pn.layout.Divider(),
     pn.Row(w_btn_export_current, w_btn_export_collection, w_export_auto),
     pn.Row(w_btn_download_current, w_btn_download_collection),
@@ -10319,10 +10609,12 @@ def _bxp_process_fn(uid: str):
         raw_md = None
 
     formats = _export_formats()
+    h5_sections = _h5_sections()
 
-    # Optionally fetch raw detector images for HDF5 output.
+    # Optionally fetch raw detector images for HDF5 output — only when the
+    # HDF5 "raw images" section is actually selected (the fetch is expensive).
     raw_images: dict | None = None
-    if "h5" in formats:
+    if "h5" in formats and "raw_images" in h5_sections:
         raw_images = {}
         try:
             info = tb.stream_info_for(run, "primary")
@@ -10359,6 +10651,7 @@ def _bxp_process_fn(uid: str):
                 lambda row: " | ".join(row), axis=1,
             ).tolist()
 
+    peak_fits, peak_axis = _gather_peak_fits(uid)
     scan_dir, files = export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -10377,6 +10670,10 @@ def _bxp_process_fn(uid: str):
         subdir_template=w_export_subdir.value,
         basename_template=w_export_basename.value,
         frame_label_col=label_cols or None,
+        h5_sections=h5_sections,
+        peak_fits=peak_fits,
+        peak_axis=peak_axis,
+        peak_param=w_export_peak_param.value,
     )
 
     # Return a triple compatible with BatchProcessor; add_fn is a no-op.

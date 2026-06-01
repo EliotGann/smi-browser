@@ -309,6 +309,8 @@ def _save_dataset_h5(
     raw_metadata: dict | None = None,
     raw_images: dict[str, np.ndarray] | None = None,
     frame_labels: list[str] | None = None,
+    sections: set[str] | None = None,
+    peak_fits: list[dict] | None = None,
 ) -> None:
     """Save the full scan data and processing results to an HDF5 file.
 
@@ -318,14 +320,31 @@ def _save_dataset_h5(
          merged/per-frame q-chi, line cuts with per-frame labeling, parameters
       3. Processed GI: all of the above + summed/per-frame qxy-qz,
          line cuts, parameters
+
+    ``sections`` selects which groups to write (``None`` = all, for backward
+    compatibility).  Recognised keys: ``"metadata"``, ``"primary"``,
+    ``"baseline_config"``, ``"raw_images"``, ``"processed_iq"``,
+    ``"processed_qchi"``, ``"peakfit"``.  ``peak_fits`` (used by the
+    ``"peakfit"`` section) is a list of per-peak dicts with ``name``/``q_min``/
+    ``q_max``/``model``/``baseline``/``link``/``bg_factor`` and a ``results``
+    dict of per-frame arrays.
     """
     import h5py
     import pandas as pd
     from .figures.cuts import compute_cross_section
 
+    _ALL_SECTIONS = {
+        "metadata", "primary", "baseline_config", "raw_images",
+        "processed_iq", "processed_qchi", "peakfit",
+    }
+    _sec = _ALL_SECTIONS if sections is None else set(sections)
+
+    def on(key: str) -> bool:
+        return key in _sec
+
     with h5py.File(path, "w") as f:
         # --- Raw detector images ---
-        if raw_images:
+        if raw_images and on("raw_images"):
             img_grp = f.create_group("raw_images")
             for field_name, stack in raw_images.items():
                 if stack is not None:
@@ -335,7 +354,7 @@ def _save_dataset_h5(
                     )
 
         # --- Primary stream scalars ---
-        if primary_df is not None and not primary_df.empty:
+        if primary_df is not None and not primary_df.empty and on("primary"):
             p_grp = f.create_group("primary")
             for col in primary_df.columns:
                 arr = primary_df[col].values
@@ -353,7 +372,7 @@ def _save_dataset_h5(
                     )
 
         # --- Baseline stream scalars ---
-        if baseline_df is not None and not baseline_df.empty:
+        if baseline_df is not None and not baseline_df.empty and on("baseline_config"):
             b_grp = f.create_group("baseline")
             for col in baseline_df.columns:
                 arr = baseline_df[col].values
@@ -371,7 +390,7 @@ def _save_dataset_h5(
                     )
 
         # --- Primary stream configuration data ---
-        if config_df is not None and not config_df.empty:
+        if config_df is not None and not config_df.empty and on("baseline_config"):
             c_grp = f.create_group("config")
             for col in config_df.columns:
                 arr = config_df[col].values
@@ -389,7 +408,7 @@ def _save_dataset_h5(
                     )
 
         # --- Raw metadata (start/stop documents) ---
-        if raw_metadata:
+        if raw_metadata and on("metadata"):
             md_grp = f.create_group("metadata")
             for section_key in ("start", "stop"):
                 section = raw_metadata.get(section_key)
@@ -415,101 +434,110 @@ def _save_dataset_h5(
         # ===== PROCESSING RESULTS (only if processed) =====
 
         # --- Transmission result ---
-        if result is not None:
+        if result is not None and (on("processed_iq") or on("processed_qchi")):
             grp = f.create_group("transmission")
             grp.attrs["geometry"] = result.geometry or ""
             grp.attrs["uid"] = result.uid or ""
 
-            # Merged I(q)
-            iq = result.merged_iq
-            iq_grp = grp.create_group("merged_iq")
-            for var in iq.data_vars:
-                iq_grp.create_dataset(var, data=iq[var].values)
-            if "q" in iq.coords:
-                iq_grp.create_dataset("q", data=iq["q"].values)
+            if on("processed_iq"):
+                # Merged I(q)
+                iq = result.merged_iq
+                iq_grp = grp.create_group("merged_iq")
+                for var in iq.data_vars:
+                    iq_grp.create_dataset(var, data=iq[var].values)
+                if "q" in iq.coords:
+                    iq_grp.create_dataset("q", data=iq["q"].values)
 
-            # Per-frame I(q)
-            pf_iq = getattr(result, "per_frame_iq", None)
-            if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
-                pf_iq_grp = grp.create_group("per_frame_iq")
-                pf_iq_grp.attrs["n_frames"] = pf_iq.sizes["frame"]
-                pf_iq_grp.create_dataset("q", data=pf_iq["q"].values)
-                pf_iq_grp.create_dataset("I", data=pf_iq["I"].values)
-                if "saxs_I" in pf_iq:
-                    pf_iq_grp.create_dataset("saxs_I", data=pf_iq["saxs_I"].values)
-                if "waxs_I" in pf_iq:
-                    pf_iq_grp.create_dataset("waxs_I", data=pf_iq["waxs_I"].values)
-                # Frame-level scalar labels
-                for var in pf_iq.data_vars:
-                    if var in ("I", "saxs_I", "waxs_I"):
-                        continue
-                    arr = pf_iq[var]
-                    if arr.dims == ("frame",):
-                        pf_iq_grp.create_dataset(var, data=arr.values)
-                # Store frame label strings if provided
-                if frame_labels:
-                    pf_iq_grp.create_dataset(
-                        "frame_labels",
-                        data=np.array(frame_labels, dtype=h5py.string_dtype()),
-                    )
+                # Per-frame I(q)
+                pf_iq = getattr(result, "per_frame_iq", None)
+                if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
+                    pf_iq_grp = grp.create_group("per_frame_iq")
+                    pf_iq_grp.attrs["n_frames"] = pf_iq.sizes["frame"]
+                    pf_iq_grp.create_dataset("q", data=pf_iq["q"].values)
+                    pf_iq_grp.create_dataset("I", data=pf_iq["I"].values)
+                    if "saxs_I" in pf_iq:
+                        pf_iq_grp.create_dataset("saxs_I", data=pf_iq["saxs_I"].values)
+                    if "waxs_I" in pf_iq:
+                        pf_iq_grp.create_dataset("waxs_I", data=pf_iq["waxs_I"].values)
+                    # Frame-level scalar labels
+                    for var in pf_iq.data_vars:
+                        if var in ("I", "saxs_I", "waxs_I"):
+                            continue
+                        arr = pf_iq[var]
+                        if arr.dims == ("frame",):
+                            pf_iq_grp.create_dataset(var, data=arr.values)
+                    # Store frame label strings if provided
+                    if frame_labels:
+                        pf_iq_grp.create_dataset(
+                            "frame_labels",
+                            data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                        )
 
-            # Merged q-chi
-            qchi = result.merged_qchi
-            qchi_grp = grp.create_group("merged_qchi")
-            qchi_grp.create_dataset("intensity", data=qchi["intensity"].values)
-            if "q" in qchi.coords:
-                qchi_grp.create_dataset("q", data=qchi["q"].values)
-            if "chi" in qchi.coords:
-                qchi_grp.create_dataset("chi", data=qchi["chi"].values)
-
-            # Per-frame q-chi (from saxs/waxs q_chi_frames)
-            saxs = getattr(result, "saxs", None)
-            waxs = getattr(result, "waxs", None)
-            saxs_qchi_frames = saxs.get("q_chi_frames") if saxs else None
-            waxs_qchi_frames = waxs.get("q_chi_frames") if waxs else None
-            if saxs_qchi_frames is not None or waxs_qchi_frames is not None:
-                pf_qchi_grp = grp.create_group("per_frame_qchi")
-                # Use the merged grid coords
+            if on("processed_qchi"):
+                # Merged q-chi
+                qchi = result.merged_qchi
+                qchi_grp = grp.create_group("merged_qchi")
+                qchi_grp.create_dataset("intensity", data=qchi["intensity"].values)
                 if "q" in qchi.coords:
-                    pf_qchi_grp.create_dataset("q", data=qchi["q"].values)
+                    qchi_grp.create_dataset("q", data=qchi["q"].values)
                 if "chi" in qchi.coords:
-                    pf_qchi_grp.create_dataset("chi", data=qchi["chi"].values)
-                if saxs_qchi_frames is not None:
-                    _write_qchi_frames_streamed(
-                        pf_qchi_grp.create_group("saxs"), saxs_qchi_frames)
-                if waxs_qchi_frames is not None:
-                    _write_qchi_frames_streamed(
-                        pf_qchi_grp.create_group("waxs"), waxs_qchi_frames)
-                if frame_labels:
-                    pf_qchi_grp.create_dataset(
-                        "frame_labels",
-                        data=np.array(frame_labels, dtype=h5py.string_dtype()),
-                    )
+                    qchi_grp.create_dataset("chi", data=qchi["chi"].values)
+
+                # Per-frame q-chi (from saxs/waxs q_chi_frames)
+                saxs = getattr(result, "saxs", None)
+                waxs = getattr(result, "waxs", None)
+                saxs_qchi_frames = saxs.get("q_chi_frames") if saxs else None
+                waxs_qchi_frames = waxs.get("q_chi_frames") if waxs else None
+                if saxs_qchi_frames is not None or waxs_qchi_frames is not None:
+                    pf_qchi_grp = grp.create_group("per_frame_qchi")
+                    # Use the merged grid coords
+                    if "q" in qchi.coords:
+                        pf_qchi_grp.create_dataset("q", data=qchi["q"].values)
+                    if "chi" in qchi.coords:
+                        pf_qchi_grp.create_dataset("chi", data=qchi["chi"].values)
+                    if saxs_qchi_frames is not None:
+                        _write_qchi_frames_streamed(
+                            pf_qchi_grp.create_group("saxs"), saxs_qchi_frames)
+                    if waxs_qchi_frames is not None:
+                        _write_qchi_frames_streamed(
+                            pf_qchi_grp.create_group("waxs"), waxs_qchi_frames)
+                    if frame_labels:
+                        pf_qchi_grp.create_dataset(
+                            "frame_labels",
+                            data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                        )
 
         # --- GI result ---
-        if gi_result is not None:
+        if gi_result is not None and (on("processed_iq") or on("processed_qchi")):
             grp = f.create_group("gi")
-            grp.create_dataset("summed", data=gi_result.summed)
-            grp.create_dataset("qxy_grid", data=gi_result.qxy_grid)
-            grp.create_dataset("qz_grid", data=gi_result.qz_grid)
-            if gi_result.frames:
+            if on("processed_iq"):
+                grp.create_dataset("summed", data=gi_result.summed)
+                grp.create_dataset("qxy_grid", data=gi_result.qxy_grid)
+                grp.create_dataset("qz_grid", data=gi_result.qz_grid)
+                if gi_result.alpha_i_deg:
+                    grp.create_dataset(
+                        "alpha_i_deg",
+                        data=np.array(gi_result.alpha_i_deg, dtype=np.float64),
+                    )
+                grp.attrs["alpha_i_source"] = gi_result.alpha_i_source or ""
+                if frame_labels:
+                    grp.create_dataset(
+                        "frame_labels",
+                        data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                    )
+            # Per-frame GI frames are the heavy part — gate under q-chi.
+            if on("processed_qchi") and gi_result.frames:
                 frames_grp = grp.create_group("frames")
                 for i, frame in enumerate(gi_result.frames):
                     frames_grp.create_dataset(f"frame_{i:04d}", data=frame)
-            if gi_result.alpha_i_deg:
-                grp.create_dataset(
-                    "alpha_i_deg",
-                    data=np.array(gi_result.alpha_i_deg, dtype=np.float64),
-                )
-            grp.attrs["alpha_i_source"] = gi_result.alpha_i_source or ""
-            if frame_labels:
-                grp.create_dataset(
-                    "frame_labels",
-                    data=np.array(frame_labels, dtype=h5py.string_dtype()),
-                )
+
+        # --- Peak-fit results ---
+        if on("peakfit") and peak_fits:
+            _write_peakfit_h5(f.create_group("peakfit"), peak_fits)
 
         # --- Cross-section cuts (from the current 2D display) ---
-        if cuts and x is not None and y is not None and image is not None:
+        if (on("processed_iq") and cuts and x is not None and y is not None
+                and image is not None):
             cuts_grp = f.create_group("cuts")
             for i, cut in enumerate(cuts):
                 sec = compute_cross_section(
@@ -539,6 +567,139 @@ def _save_dataset_h5(
                         params_grp.attrs[k] = v
                 except TypeError:
                     params_grp.attrs[k] = str(v)
+
+
+# ---------------------------------------------------------------------------
+# Peak-fit helpers (HDF5 group + PNG stack)
+# ---------------------------------------------------------------------------
+
+#: Per-frame fit parameters written for each peak.
+_PEAK_FIT_PARAMS = ("amplitude", "center", "fwhm", "area")
+
+
+def _peak_png_name(pk: dict, param: str | None, used: set[str]) -> str:
+    """Filename ``peak_<name>_q<qmin>-<qmax>[_<param>]`` with collisions deduped."""
+    def _safe(s) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+
+    name = _safe(pk.get("name") or "peak")
+    qmin = float(pk.get("q_min", 0.0))
+    qmax = float(pk.get("q_max", 0.0))
+    base = f"peak_{name}_q{qmin:.3f}-{qmax:.3f}"
+    if param:
+        base = f"{base}_{param}"
+    stem = base
+    i = 1
+    while stem in used:
+        stem = f"{base}_{i}"
+        i += 1
+    used.add(stem)
+    return stem
+
+
+def _write_peakfit_h5(root, peak_fits: list[dict]) -> None:
+    """Write one subgroup per peak (datasets + identity attrs)."""
+    used: set[str] = set()
+    for pk in peak_fits:
+        stem = _peak_png_name(pk, None, used)
+        g = root.create_group(stem)
+        for attr in ("name", "q_min", "q_max", "model", "baseline",
+                     "link", "bg_factor"):
+            if pk.get(attr) is not None:
+                g.attrs[attr] = pk[attr]
+        results = pk.get("results") or {}
+        for key, arr in results.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.dtype == bool:
+                arr = arr.astype("u1")
+            g.create_dataset(key, data=arr)
+
+
+def _save_peak_pngs(
+    peak_fits: list[dict],
+    axis: dict | None,
+    param: str,
+    scan_dir: Path,
+    prefix: str,
+) -> list[Path]:
+    """One PNG per peak: ``param`` mapped across the scan.
+
+    ``axis`` (``{x, x_label, y, y_label}``) defaults to a frame-index x-axis.
+    A 2-D ``imshow`` is drawn when a usable ``y`` axis is supplied, otherwise a
+    1-D line of ``param`` vs ``x``.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if param not in _PEAK_FIT_PARAMS:
+        param = "area"
+    axis = axis or {}
+    x = axis.get("x")
+    x_label = axis.get("x_label") or "frame"
+    y = axis.get("y")
+    y_label = axis.get("y_label") or ""
+
+    written: list[Path] = []
+    used: set[str] = set()
+    with _MPL_LOCK:
+        for pk in peak_fits:
+            results = pk.get("results") or {}
+            z = results.get(param)
+            if z is None:
+                continue
+            z = np.asarray(z, dtype=float)
+            n = z.size
+            xv = np.asarray(x, dtype=float) if x is not None else np.arange(n, dtype=float)
+            if xv.size != n:
+                xv = np.arange(n, dtype=float)
+            stem = _peak_png_name(pk, param, used)
+            fname = f"{prefix}{stem}.png" if prefix else f"{stem}.png"
+            path = scan_dir / fname
+            fig = None
+            try:
+                yv = np.asarray(y, dtype=float) if y is not None else None
+                if yv is not None and yv.size == n:
+                    fig, p = _peak_map_2d(xv, yv, z, x_label, y_label, param, pk)
+                else:
+                    fig, ax = plt.subplots(figsize=(7, 4))
+                    finite = np.isfinite(xv) & np.isfinite(z)
+                    order = np.argsort(xv[finite])
+                    ax.plot(xv[finite][order], z[finite][order], "-o", ms=3,
+                            color="#1f77b4")
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(f"{pk.get('name', 'peak')} {param}")
+                    ax.set_title(
+                        f"{pk.get('name', 'peak')}  "
+                        f"q∈[{float(pk.get('q_min', 0)):.3f}, "
+                        f"{float(pk.get('q_max', 0)):.3f}]  ·  {param}")
+                    fig.tight_layout()
+                fig.savefig(path, dpi=150)
+                written.append(path)
+            finally:
+                if fig is not None:
+                    plt.close(fig)
+    return written
+
+
+def _peak_map_2d(xv, yv, z, x_label, y_label, param, pk):
+    """Build a 2-D scatter/grid map of ``z`` over (x, y) for a peak PNG."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    finite = np.isfinite(xv) & np.isfinite(yv) & np.isfinite(z)
+    sc = ax.scatter(xv[finite], yv[finite], c=z[finite], cmap="viridis", s=18)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(
+        f"{pk.get('name', 'peak')}  "
+        f"q∈[{float(pk.get('q_min', 0)):.3f}, "
+        f"{float(pk.get('q_max', 0)):.3f}]  ·  {param}")
+    fig.colorbar(sc, ax=ax, label=param)
+    fig.tight_layout()
+    return fig, ax
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +818,10 @@ def export_scan(
     subdir_template: str = "{uid_short}",
     basename_template: str = "",
     frame_label_col: str | list[str] | None = None,
+    h5_sections: set[str] | None = None,
+    peak_fits: list[dict] | None = None,
+    peak_axis: dict | None = None,
+    peak_param: str = "area",
 ) -> tuple[Path, list[str]]:
     """Export a single scan's data to *out_dir* with configurable outputs.
 
@@ -680,9 +845,19 @@ def export_scan(
     formats : set of format keys, optional
         Which outputs to produce.  Keys:
         ``"h5"``, ``"png_2d"``, ``"png_iq"``, ``"png_linecuts"``,
-        ``"csv_iq"``, ``"csv_scalars"``, ``"csv_baseline"``,
+        ``"png_peaks"``, ``"csv_iq"``, ``"csv_scalars"``, ``"csv_baseline"``,
         ``"metadata_txt"``, ``"png_grid"``
         If None, all available formats are exported.
+    h5_sections : set of section keys, optional
+        Which groups the HDF5 writer includes (``None`` = all).  See
+        :func:`_save_dataset_h5`.
+    peak_fits : list of per-peak dicts, optional
+        Peak-fit results for the ``"peakfit"`` HDF5 section and ``"png_peaks"``.
+    peak_axis : dict, optional
+        ``{x, x_label, y, y_label}`` driving the peak-result PNG maps
+        (defaults to a frame-index x-axis).
+    peak_param : str
+        Which fit parameter the peak PNGs plot (default ``"area"``).
     subdir_template : str
         Template for the scan sub-directory name.  Leave empty to put files
         directly in ``out_dir`` (with ``basename_template`` as filename prefix).
@@ -779,6 +954,8 @@ def export_scan(
             raw_metadata=raw_metadata,
             raw_images=raw_images,
             frame_labels=frame_labels,
+            sections=h5_sections,
+            peak_fits=peak_fits,
         )
         files_written.append(_fname("result.h5"))
 
@@ -800,6 +977,13 @@ def export_scan(
             cuts, x, y, image, x_label, y_label, scan_dir, prefix=prefix,
         )
         files_written.extend(p.name for p in lc_paths)
+
+    # --- Peak-result PNGs (one per peak, chosen parameter) ---
+    if "png_peaks" in formats and peak_fits:
+        peak_paths = _save_peak_pngs(
+            peak_fits, peak_axis, peak_param, scan_dir, prefix,
+        )
+        files_written.extend(p.name for p in peak_paths)
 
     # --- CSV: merged I(q) ---
     if "csv_iq" in formats and result is not None and hasattr(result, "merged_iq"):

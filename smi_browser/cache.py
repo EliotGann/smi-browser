@@ -322,18 +322,115 @@ class ScanCache:
 
     def write_reduction(self, arrays: dict[str, np.ndarray],
                         params: dict[str, Any] | None = None) -> None:
-        """Persist reduction outputs, overwriting any previous run."""
+        """Persist reduction outputs, overwriting any previous run.
+
+        Re-processing invalidates any cached peak fits (they were computed
+        against the *previous* ``pf_iq`` stack), so the ``peakfit`` group is
+        dropped here too.
+        """
         import h5py
         with self._lock:
             with h5py.File(self.path, "a") as f:
                 if "reduction" in f:
                     del f["reduction"]
+                if "peakfit" in f:
+                    del f["peakfit"]
                 g = f.create_group("reduction")
                 for k, v in (arrays or {}).items():
                     g.create_dataset(k, data=np.asarray(v),
                                      compression="gzip", compression_opts=4)
                 _dict_to_attrs(g.attrs, params or {})
         _maybe_evict()
+
+    # -- peak fits -----------------------------------------------------
+
+    def write_peakfit(self, peak_key: Sequence, arrays: dict[str, np.ndarray],
+                     attrs: dict[str, Any] | None = None) -> None:
+        """Persist one peak's per-frame fit result, keyed by ``peak_key``.
+
+        ``peak_key`` is ``PeakDef.key()`` (a tuple).  Stored under
+        ``/peakfit/<hash>``; re-fitting the same peak overwrites it.  The full
+        key is recorded as an attr so :meth:`read_peakfit_index` can rebuild it.
+        """
+        import h5py
+        h = _peak_hash(peak_key)
+        with self._lock:
+            with h5py.File(self.path, "a") as f:
+                root = f.require_group("peakfit")
+                if h in root:
+                    del root[h]
+                g = root.create_group(h)
+                for k, v in (arrays or {}).items():
+                    arr = np.asarray(v)
+                    if arr.dtype == bool:
+                        arr = arr.astype("u1")
+                    g.create_dataset(k, data=arr, compression="gzip",
+                                     compression_opts=4)
+                g.attrs["key_json"] = json.dumps(list(peak_key), default=str)
+                _dict_to_attrs(g.attrs, attrs or {})
+        _maybe_evict()
+
+    def read_peakfit_full(self) -> list[dict]:
+        """Return ``[{"key", "attrs", "arrays"}, ...]`` for all cached peaks.
+
+        ``arrays`` mirrors the dict produced by ``fit_peak_across_frames``
+        (``amplitude``/``center``/``fwhm``/``area`` float arrays + ``success``
+        bool array); ``attrs`` carries the stored peak identity (``name``,
+        ``q_min``, ``q_max``, ``model``, ...).  Used by the exporter, which
+        needs the peak name and q-range for filenames/group names.
+        """
+        import h5py
+        if not self.path.exists():
+            return []
+        out: list[dict] = []
+        with self._lock:
+            try:
+                with h5py.File(self.path, "r") as f:
+                    if "peakfit" not in f:
+                        return []
+                    for h in f["peakfit"]:
+                        g = f["peakfit"][h]
+                        raw = g.attrs.get("key_json")
+                        if raw is None:
+                            continue
+                        try:
+                            key = tuple(json.loads(raw))
+                        except (TypeError, ValueError):
+                            continue
+                        arrays: dict[str, np.ndarray] = {}
+                        for k in g.keys():
+                            arr = g[k][...]
+                            if k == "success":
+                                arr = arr.astype(bool)
+                            arrays[k] = arr
+                        attrs = _attrs_to_dict(g.attrs)
+                        attrs.pop("key_json", None)
+                        out.append({"key": key, "attrs": attrs, "arrays": arrays})
+            except OSError as exc:
+                log.warning("ScanCache.read_peakfit_full: %s", exc)
+                return []
+        return out
+
+    def read_peakfit_index(self) -> list[tuple[tuple, dict[str, np.ndarray]]]:
+        """Return ``[(peak_key, result_arrays), ...]`` for all cached peaks.
+
+        Thin wrapper over :meth:`read_peakfit_full` used to repopulate the
+        in-memory fit cache on load so a previously-fit map renders without
+        re-fitting.
+        """
+        return [(e["key"], e["arrays"]) for e in self.read_peakfit_full()]
+
+    def clear_peakfit(self) -> None:
+        import h5py
+        if not self.path.exists():
+            return
+        with self._lock:
+            try:
+                with h5py.File(self.path, "a") as f:
+                    if "peakfit" in f:
+                        del f["peakfit"]
+            except OSError as exc:
+                log.warning("ScanCache.clear_peakfit: %s", exc)
 
     # -- maintenance ---------------------------------------------------
 
@@ -345,6 +442,46 @@ class ScanCache:
                 pass
             except OSError as exc:
                 log.warning("ScanCache.delete: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Peak-fit / peak-definition helpers
+# ---------------------------------------------------------------------------
+
+def _peak_hash(peak_key: Sequence) -> str:
+    """Stable, filesystem-safe digest of a ``PeakDef.key()`` tuple."""
+    import hashlib
+    raw = json.dumps(list(peak_key), default=str, sort_keys=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def peak_defs_path() -> Path:
+    """Path to the global (cross-scan) peak-definition list."""
+    return cache_root() / "peak_defs.json"
+
+
+def read_peak_defs() -> list[dict]:
+    """Return the persisted global peak-definition list (``[]`` if none)."""
+    path = peak_defs_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        log.warning("read_peak_defs: %s", exc)
+        return []
+    return data if isinstance(data, list) else []
+
+
+def write_peak_defs(defs: list[dict]) -> None:
+    """Persist the global peak-definition list (atomic replace)."""
+    path = peak_defs_path()
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(list(defs), indent=2, default=str))
+        tmp.replace(path)
+    except OSError as exc:
+        log.warning("write_peak_defs: %s", exc)
 
 
 # ---------------------------------------------------------------------------

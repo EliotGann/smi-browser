@@ -179,6 +179,73 @@ def test_reduction_overwrites(isolated_cache_dir):
 
 
 # ---------------------------------------------------------------------------
+# Peak fits + peak definitions
+# ---------------------------------------------------------------------------
+
+def _peakfit_arrays(n=4):
+    return {
+        "amplitude": np.arange(n, dtype=float),
+        "center": np.full(n, 5.0),
+        "fwhm": np.full(n, 0.3),
+        "area": np.arange(n, dtype=float) * 2.0,
+        "success": np.array([True, False, True, True][:n]),
+    }
+
+
+def test_peakfit_roundtrip(isolated_cache_dir):
+    c = ScanCache("uid-pf")
+    key = (3.0, 7.0, "gaussian", "linear", "linked", 2.0)
+    c.write_peakfit(key, _peakfit_arrays(),
+                    attrs={"name": "p1", "model": "gaussian"})
+    idx = c.read_peakfit_index()
+    assert len(idx) == 1
+    got_key, res = idx[0]
+    assert tuple(got_key) == key
+    np.testing.assert_allclose(res["amplitude"], [0.0, 1.0, 2.0, 3.0])
+    assert res["success"].dtype == bool
+    assert list(res["success"]) == [True, False, True, True]
+
+
+def test_peakfit_overwrites_same_key(isolated_cache_dir):
+    c = ScanCache("uid-pf2")
+    key = (3.0, 7.0, "gaussian", "none", "independent", 2.0)
+    c.write_peakfit(key, {"amplitude": np.array([1.0])})
+    c.write_peakfit(key, {"amplitude": np.array([9.0])})
+    idx = c.read_peakfit_index()
+    assert len(idx) == 1
+    np.testing.assert_allclose(idx[0][1]["amplitude"], [9.0])
+
+
+def test_reduction_clears_peakfit(isolated_cache_dir):
+    c = ScanCache("uid-pf3")
+    c.write_reduction({"pf_iq_I": np.zeros((2, 3))}, {})
+    c.write_peakfit((1.0, 2.0, "gaussian", "none", "linked", 2.0),
+                    {"amplitude": np.array([1.0, 2.0])})
+    assert len(c.read_peakfit_index()) == 1
+    # Re-processing overwrites pf_iq → stale fits must be dropped.
+    c.write_reduction({"pf_iq_I": np.ones((2, 3))}, {})
+    assert c.read_peakfit_index() == []
+
+
+def test_clear_peakfit(isolated_cache_dir):
+    c = ScanCache("uid-pf4")
+    c.write_peakfit((1.0, 2.0, "gaussian", "none", "linked", 2.0),
+                    {"amplitude": np.array([1.0])})
+    c.clear_peakfit()
+    assert c.read_peakfit_index() == []
+
+
+def test_peak_defs_roundtrip(isolated_cache_dir):
+    from smi_browser.cache import read_peak_defs, write_peak_defs
+    assert read_peak_defs() == []
+    defs = [{"name": "p1", "q_min": 2.1, "q_max": 2.5, "model": "gaussian",
+             "baseline": "linear", "link": "linked", "bg": 2.0}]
+    write_peak_defs(defs)
+    got = read_peak_defs()
+    assert got == defs
+
+
+# ---------------------------------------------------------------------------
 # Fetch wrappers
 # ---------------------------------------------------------------------------
 
