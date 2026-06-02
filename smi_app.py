@@ -9154,6 +9154,8 @@ def _snapshot_export_config() -> dict:
         "subdir_template": w_export_subdir.value or "",
         "basename_template": w_export_basename.value or "",
         "frame_label_col": _get_frame_label_cols() or None,
+        "force_fetch": bool(w_export_force_fetch.value),
+        "process_if_needed": bool(w_export_process_if_needed.value),
     }
 
 
@@ -9666,6 +9668,15 @@ def _on_export_clear_all(event=None):
 w_btn_export_select_all.on_click(_on_export_select_all)
 w_btn_export_clear_all.on_click(_on_export_clear_all)
 
+w_export_force_fetch = pn.widgets.Checkbox(
+    name="Force fetch from tiled (metadata, primary, baseline, raw images)",
+    value=False,
+)
+w_export_process_if_needed = pn.widgets.Checkbox(
+    name="Process if not already processed (I(q), q-χ)",
+    value=False,
+)
+
 w_export_auto = pn.widgets.Checkbox(
     name="Auto-export after processing",
     value=False,
@@ -9686,6 +9697,10 @@ w_btn_download_collection = pn.widgets.Button(
 w_export_status = pn.pane.Markdown("", sizing_mode="stretch_width")
 w_export_spinner = pn.indicators.LoadingSpinner(
     value=False, visible=False, size=20,
+)
+w_export_progress = pn.indicators.Progress(
+    name="Export", value=0, max=100, width=300,
+    visible=False, sizing_mode="stretch_width",
 )
 
 
@@ -9898,7 +9913,7 @@ def _resolve_export_dir() -> Path | None:
     return None
 
 
-def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
+def _do_export_single(uid: str, progress_cb=None) -> tuple[Path, list[str]] | None:
     """Export one scan using current settings.  Returns (dir, files) or None."""
     out_dir = _resolve_export_dir()
     if out_dir is None:
@@ -9910,6 +9925,25 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     result = _proc_result_cache.get("result")
     gi_result = _proc_result_cache.get("gi_result")
     params = _last_result.get("params") or {}
+
+    force_fetch = w_export_force_fetch.value
+    process_if_needed = w_export_process_if_needed.value
+
+    # "Process if not already processed" — run reduction when result is absent
+    if process_if_needed and result is None and gi_result is None:
+        try:
+            reduce_fn, call_params, geometry = _build_proc_params(uid)
+            log.info("export: processing %s on demand (%s)", uid[:8], geometry)
+            proc_result = reduce_fn(**call_params)
+            _cache_reduction_result(uid, proc_result, geometry, call_params)
+            if geometry == "grazing":
+                gi_result = proc_result
+            else:
+                result = proc_result
+            params = call_params
+        except Exception as exc:
+            log.warning("export: on-demand processing failed for %s: %s",
+                        uid[:8], exc)
 
     # Gather 2D cache
     proc_2d = None
@@ -9926,18 +9960,23 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     # Gather cuts
     cuts = list(_persisted_cuts)
 
-    # Primary/baseline/config
+    # Primary/baseline/config — force-fetch from tiled if requested
     primary_df = w_primary_table.value if _detail_cache.get("primary_loaded") else None
     baseline_df = None
     config_df = None
-    if _detail_cache.get("baseline_loaded"):
+    if force_fetch or _detail_cache.get("baseline_loaded"):
         run = _ensure_run()
-        if run and "baseline" in tb.stream_names(run):
-            try:
-                baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
-            except Exception:
-                pass
         if run:
+            if (force_fetch and primary_df is None):
+                try:
+                    primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
+                except Exception:
+                    pass
+            if "baseline" in tb.stream_names(run):
+                try:
+                    baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+                except Exception:
+                    pass
             try:
                 config_df = _config_to_dataframe(run)
             except Exception:
@@ -9952,27 +9991,27 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
     except Exception:
         pass
 
-    # Raw detector images
+    # Raw detector images — use streaming to avoid loading full stack into RAM
     raw_images = None
-    if "h5" in _export_formats():
-        raw_images = {}
+    raw_image_source = None
+    h5_secs = _h5_sections()
+    if "h5" in _export_formats() and "raw_images" in h5_secs:
         image_fields = _image_cache.get("fields") or []
         run = _ensure_run()
+        # When force_fetch is on, discover image fields from tiled if not cached
+        if force_fetch and not image_fields and run:
+            try:
+                info = tb.stream_info_for(run, "primary")
+                image_fields = list(info.get("images", []) or [])
+            except Exception:
+                pass
         if run and image_fields:
-            for field in image_fields:
-                try:
-                    from smi_browser.cache import cache_path as _cache_path
-                    import h5py as _h5
-                    cp = _cache_path(uid)
-                    if cp.exists():
-                        with _h5.File(cp, "r") as cf:
-                            if f"images/{field}" in cf:
-                                raw_images[field] = cf[f"images/{field}"][:]
-                                continue
-                    # Fallback: fetch from tiled
-                    raw_images[field] = tb.fetch_all_frames(run, "primary", field)
-                except Exception:
-                    log.debug("Could not fetch raw images for field %s", field)
+            from smi_browser.export import build_raw_image_source
+            from smi_browser.cache import cache_path as _cache_path
+            raw_image_source = build_raw_image_source(
+                uid, image_fields, run=run, cache_path_fn=_cache_path,
+                force_tiled=force_fetch,
+            )
 
     # Frame labels from primary scalars
     frame_labels = None
@@ -10002,15 +10041,17 @@ def _do_export_single(uid: str) -> tuple[Path, list[str]] | None:
         config_df=config_df,
         raw_metadata=raw_md,
         raw_images=raw_images if raw_images else None,
+        raw_image_source=raw_image_source,
         frame_labels=frame_labels,
         formats=_export_formats(),
         subdir_template=w_export_subdir.value,
         basename_template=w_export_basename.value,
         frame_label_col=_get_frame_label_cols() or None,
-        h5_sections=_h5_sections(),
+        h5_sections=h5_secs,
         peak_fits=peak_fits,
         peak_axis=peak_axis,
         peak_param=w_export_peak_param.value,
+        progress_cb=progress_cb,
     )
 
 
@@ -10025,21 +10066,51 @@ def _on_export_current(event):
     uid = uids[0]
     w_export_spinner.value = True
     w_export_spinner.visible = True
+    w_export_progress.value = 0
+    w_export_progress.visible = True
     w_export_status.object = "*Exporting…*"
-    try:
-        out = _do_export_single(uid)
-        if out:
-            scan_dir, files = out
-            w_export_status.object = (
-                f"**Exported** {len(files)} items → `{scan_dir}`\n\n"
-                + "\n".join(f"- {f}" for f in files)
+
+    doc = pn.state.curdoc
+
+    def _progress_cb(current, total):
+        """Called from the export thread on each frame written."""
+        pct = int(100 * current / total) if total else 100
+        try:
+            doc.add_next_tick_callback(
+                lambda p=pct, c=current, t=total: _update_export_progress(p, c, t)
             )
-    except Exception as exc:
-        log.exception("Export failed")
-        w_export_status.object = f"**Export error:** `{exc}`"
-    finally:
-        w_export_spinner.value = False
-        w_export_spinner.visible = False
+        except Exception:
+            pass
+
+    def _update_export_progress(pct, current, total):
+        w_export_progress.value = pct
+        w_export_status.object = f"*Exporting… frame {current}/{total}*"
+
+    def _run_export():
+        try:
+            out = _do_export_single(uid, progress_cb=_progress_cb)
+            def _done():
+                w_export_progress.visible = False
+                w_export_spinner.value = False
+                w_export_spinner.visible = False
+                if out:
+                    scan_dir, files = out
+                    w_export_status.object = (
+                        f"**Exported** {len(files)} items → `{scan_dir}`\n\n"
+                        + "\n".join(f"- {f}" for f in files)
+                    )
+            doc.add_next_tick_callback(_done)
+        except Exception as exc:
+            log.exception("Export failed")
+            def _err(e=exc):
+                w_export_progress.visible = False
+                w_export_spinner.value = False
+                w_export_spinner.visible = False
+                w_export_status.object = f"**Export error:** `{e}`"
+            doc.add_next_tick_callback(_err)
+
+    import threading
+    threading.Thread(target=_run_export, daemon=True).start()
 
 
 def _on_export_multi(uids: list[str]) -> None:
@@ -10060,12 +10131,23 @@ def _on_export_multi(uids: list[str]) -> None:
 
     available = [u for u in uids if u in _collection]
     missing = [u for u in uids if u not in _collection]
-    if not available:
+
+    # When "process if needed" is on, process unprocessed scans on the fly.
+    process_if_needed = w_export_process_if_needed.value
+    force_fetch = w_export_force_fetch.value
+
+    if not available and not process_if_needed:
         w_export_status.object = (
             "**No selected scans have been processed yet.**  "
-            "Run *Process N selected* from the Process tab first."
+            "Run *Process N selected* from the Process tab first, or "
+            "enable *Process if not already processed* in the HDF5 options."
         )
         return
+
+    # If process_if_needed, treat missing scans as available too
+    if process_if_needed:
+        available = uids  # attempt all
+        missing = []
 
     w_export_spinner.value = True
     w_export_spinner.visible = True
@@ -10077,20 +10159,55 @@ def _on_export_multi(uids: list[str]) -> None:
     try:
         for uid in available:
             res = _collection.get_result(uid)
-            if res is None:
+            coll_params = _collection._processing.get(uid, {})
+
+            # On-demand processing for scans not in the collection
+            if res is None and process_if_needed:
+                try:
+                    reduce_fn, call_params, geometry = _build_proc_params(uid)
+                    log.info("multi-export: processing %s on demand", uid[:8])
+                    proc_result = reduce_fn(**call_params)
+                    _cache_reduction_result(uid, proc_result, geometry, call_params)
+                    res = proc_result
+                    coll_params = call_params
+                except Exception:
+                    log.exception("multi-export: on-demand processing failed for %s", uid[:8])
+                    errors += 1
+                    continue
+            elif res is None:
                 errors += 1
                 continue
+
+            # Force-fetch primary/baseline/config from tiled when requested
+            primary_df = _collection.get_primary_df(uid)
+            baseline_df = _collection.get_baseline_df(uid)
+            config_df = _collection.get_config_df(uid)
+            raw_md = _collection.get_raw_metadata(uid)
+            if force_fetch:
+                try:
+                    run = _get_cat()[uid]
+                    if primary_df is None:
+                        primary_df = _scalar_stream_to_frame(run, "primary", uid=uid)
+                    if baseline_df is None and "baseline" in tb.stream_names(run):
+                        baseline_df = _scalar_stream_to_frame(run, "baseline", uid=uid)
+                    if config_df is None:
+                        config_df = _config_to_dataframe(run)
+                    if raw_md is None:
+                        raw_md = dict(run.metadata)
+                except Exception:
+                    log.debug("multi-export: force-fetch failed for %s", uid[:8])
+
             try:
                 peak_fits, peak_axis = _gather_peak_fits(uid)
                 _, files = export_scan(
                     out_dir=out_dir,
                     uid=uid,
                     result=res,
-                    params=_collection._processing.get(uid, {}),
-                    primary_df=_collection.get_primary_df(uid),
-                    baseline_df=_collection.get_baseline_df(uid),
-                    config_df=_collection.get_config_df(uid),
-                    raw_metadata=_collection.get_raw_metadata(uid),
+                    params=coll_params,
+                    primary_df=primary_df,
+                    baseline_df=baseline_df,
+                    config_df=config_df,
+                    raw_metadata=raw_md,
                     formats=_export_formats(),
                     subdir_template=w_export_subdir.value,
                     basename_template=w_export_basename.value,
@@ -10141,6 +10258,7 @@ def _on_export_collection(event):
     w_export_status.object = f"*Exporting {len(_collection)} scans…*"
     total_files = 0
     errors = 0
+    force_fetch = w_export_force_fetch.value
     try:
         for coll_uid in _collection.uids:
             coll_result = _collection.get_result(coll_uid)
@@ -10149,6 +10267,24 @@ def _on_export_collection(event):
             coll_baseline = _collection.get_baseline_df(coll_uid)
             coll_config = _collection.get_config_df(coll_uid)
             coll_raw_md = _collection.get_raw_metadata(coll_uid)
+
+            # Force-fetch from tiled when requested
+            if force_fetch:
+                try:
+                    run = _get_cat()[coll_uid]
+                    if coll_primary is None:
+                        coll_primary = _scalar_stream_to_frame(
+                            run, "primary", uid=coll_uid)
+                    if coll_baseline is None and "baseline" in tb.stream_names(run):
+                        coll_baseline = _scalar_stream_to_frame(
+                            run, "baseline", uid=coll_uid)
+                    if coll_config is None:
+                        coll_config = _config_to_dataframe(run)
+                    if coll_raw_md is None:
+                        coll_raw_md = dict(run.metadata)
+                except Exception:
+                    log.debug("collection export: force-fetch failed for %s",
+                              coll_uid[:8])
 
             try:
                 coll_peaks, coll_peak_axis = _gather_peak_fits(coll_uid)
@@ -10480,6 +10616,24 @@ export_panel = pn.Column(
             w_h5_raw_images, w_h5_qchi, w_h5_peakfit,
             margin=(0, 0, 0, 20),
         ),
+        pn.layout.Divider(),
+        pn.pane.Markdown(
+            "**Data acquisition options:**",
+            stylesheets=[":host { font-size: 12px; }"],
+            margin=(5, 0, 0, 10),
+        ),
+        pn.Column(
+            w_export_force_fetch, w_export_process_if_needed,
+            margin=(0, 0, 0, 20),
+        ),
+        pn.pane.Markdown(
+            "*Force fetch:* download metadata/primary/baseline/raw images "
+            "from tiled even if not already loaded in the browser.  \n"
+            "*Process if needed:* run reduction to produce I(q)/q-χ when "
+            "results are not already cached (uses current Process tab settings).",
+            stylesheets=[":host { font-size: 11px; color: #666; }"],
+            margin=(0, 0, 0, 20),
+        ),
         title="HDF5 (.h5)", collapsed=False, sizing_mode="stretch_width",
     ),
     pn.Card(
@@ -10499,6 +10653,7 @@ export_panel = pn.Column(
     pn.Row(w_btn_export_current, w_btn_export_collection, w_export_auto),
     pn.Row(w_btn_download_current, w_btn_download_collection),
     pn.Row(w_export_status, w_export_spinner),
+    w_export_progress,
     sizing_mode="stretch_width",
 )
 
@@ -10611,32 +10766,43 @@ def _bxp_process_fn(uid: str):
     formats = _export_formats()
     h5_sections = _h5_sections()
 
-    # Optionally fetch raw detector images for HDF5 output — only when the
-    # HDF5 "raw images" section is actually selected (the fetch is expensive).
-    raw_images: dict | None = None
+    # "Process if needed" — run reduction when HDF5 processed sections are
+    # requested but no result exists yet.
+    result = None
+    gi_result = None
+    params = None
+    if w_export_process_if_needed.value and (
+        "processed_iq" in h5_sections or "processed_qchi" in h5_sections
+    ):
+        try:
+            reduce_fn, call_params, geometry = _build_proc_params(uid)
+            log.info("batch export: processing %s on demand (%s)", uid[:8], geometry)
+            proc_result = reduce_fn(**call_params)
+            _cache_reduction_result(uid, proc_result, geometry, call_params)
+            if geometry == "grazing":
+                gi_result = proc_result
+            else:
+                result = proc_result
+            params = call_params
+        except Exception:
+            log.warning("batch export: on-demand processing failed for %s", uid[:8])
+
+    # Optionally fetch raw detector images for HDF5 output — use streaming
+    # to avoid loading the full multi-GB stack into memory.
+    raw_image_source = None
     if "h5" in formats and "raw_images" in h5_sections:
-        raw_images = {}
         try:
             info = tb.stream_info_for(run, "primary")
             image_fields = list(info.get("images", []) or [])
         except Exception:
             image_fields = []
-        for field in image_fields:
-            try:
-                from smi_browser.cache import cache_path as _cache_path
-                import h5py as _h5
-                cp = _cache_path(uid)
-                if cp.exists():
-                    with _h5.File(cp, "r") as cf:
-                        if f"images/{field}" in cf:
-                            raw_images[field] = cf[f"images/{field}"][:]
-                            continue
-                raw_images[field] = tb.fetch_all_frames(run, "primary", field)
-            except Exception:
-                log.debug("batch export: failed raw image fetch for %s/%s",
-                          uid[:8], field)
-        if not raw_images:
-            raw_images = None
+        if image_fields:
+            from smi_browser.export import build_raw_image_source
+            from smi_browser.cache import cache_path as _cache_path
+            raw_image_source = build_raw_image_source(
+                uid, image_fields, run=run, cache_path_fn=_cache_path,
+                force_tiled=w_export_force_fetch.value,
+            )
 
     # Frame labels from primary scalars.
     frame_labels = None
@@ -10655,16 +10821,16 @@ def _bxp_process_fn(uid: str):
     scan_dir, files = export_scan(
         out_dir=out_dir,
         uid=uid,
-        result=None,
-        gi_result=None,
+        result=result,
+        gi_result=gi_result,
         cuts=None,
         proc_2d_cache=None,
-        params=None,
+        params=params,
         primary_df=primary_df,
         baseline_df=baseline_df,
         config_df=config_df,
         raw_metadata=raw_md,
-        raw_images=raw_images,
+        raw_image_source=raw_image_source,
         frame_labels=frame_labels,
         formats=formats,
         subdir_template=w_export_subdir.value,
