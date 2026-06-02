@@ -38,9 +38,12 @@ __all__ = [
     "nearest_agbh_order",
     "PeakFitResult",
     "BeamOffsetResult",
+    "MultiRingResult",
     "fit_ring_peaks",
     "fit_beam_offset_qspace",
+    "fit_multi_ring",
     "q_offset_to_pixel_delta",
+    "q_offset_to_pixel_delta_multi",
 ]
 
 # Silver behenate d_001 = 58.380 Å  →  q_1 = 2π/d
@@ -405,7 +408,11 @@ def q_offset_to_pixel_delta(
         )
 
     if fit.ring_q_expected and fit.q0 > 0:
-        ddist_mm = float(distance_mm * (fit.ring_q_expected / fit.q0 - 1.0))
+        # D_correct = D_assumed * (q_observed / q_expected), so
+        # ΔD = D_assumed * (q0 / q_expected - 1).
+        # Positive ΔD when ring appears at too-high q (detector further
+        # than assumed); negative when ring is at too-low q.
+        ddist_mm = float(distance_mm * (fit.q0 / fit.ring_q_expected - 1.0))
     else:
         ddist_mm = None
 
@@ -419,4 +426,227 @@ def q_offset_to_pixel_delta(
         dcol_px=float(dcol_px),
         ddist_mm=ddist_mm,
         ring_q_expected=fit.ring_q_expected,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-ring simultaneous fit
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MultiRingResult:
+    """Joint beam-offset + distance from fitting multiple AgBh rings.
+
+    The model fits ``q_n(chi) = q0_n + A_r * sin(chi) + A_c * cos(chi)``
+    with a *shared* ``(A_r, A_c)`` across all rings.  The per-ring q0
+    values give independent distance estimates via ``D_actual/D_assumed =
+    q0_n / q_expected_n``, which are combined as a weighted mean.
+    """
+    orders: tuple[int, ...]
+    q0_per_ring: dict[int, float]       # {order: fitted ring centre}
+    A_r: float                          # shared sin(chi) amplitude (nm⁻¹)
+    A_c: float                          # shared cos(chi) amplitude (nm⁻¹)
+    rms: float                          # joint residual RMS (nm⁻¹)
+    n_total: int                        # total accepted chi slices
+    n_per_ring: dict[int, int]          # {order: n_accepted}
+    peak_fits: dict[int, PeakFitResult] # per-ring PeakFitResult
+    dist_ratio: float                   # weighted-mean q0/q_expected
+    # Filled in by q_offset_to_pixel_delta_multi:
+    drow_px: float | None = None
+    dcol_px: float | None = None
+    ddist_mm: float | None = None
+
+
+def fit_multi_ring(
+    qchi,
+    *,
+    orders: Sequence[int],
+    chi_min: float = -180.0,
+    chi_max: float = 180.0,
+    q_half_width: float = 0.15,
+    bg_order: int = 1,
+    snr_threshold: float = 3.0,
+    max_sigma_frac: float = 0.5,
+    chi_stride: int = 1,
+    min_rings: int = 2,
+    min_chi_per_ring: int = 8,
+) -> MultiRingResult:
+    """Fit multiple AgBh rings simultaneously for joint beam-offset + distance.
+
+    For each ring order in ``orders``, the corresponding q-window is
+    ``[n*q1 - q_half_width, n*q1 + q_half_width]``.  Per-chi Gaussian
+    peaks are fit independently per ring via :func:`fit_ring_peaks`, then
+    a joint linear least-squares solves for the shared beam-offset
+    ``(A_r, A_c)`` and per-ring intercepts ``q0_n``.
+
+    Parameters
+    ----------
+    qchi
+        Dataset/DataArray with ``intensity(q, chi)`` covering the full q
+        range needed for all requested rings.
+    orders
+        Which AgBh ring orders to fit (e.g. ``[1, 2, 3, 4]`` for SAXS).
+    chi_min, chi_max
+        Azimuthal window (degrees).
+    q_half_width
+        Half-width of the q-window around each ring centre.
+    bg_order, snr_threshold, max_sigma_frac, chi_stride
+        Passed to :func:`fit_ring_peaks` for each ring.
+    min_rings
+        Minimum number of rings that must succeed for the joint fit.
+    min_chi_per_ring
+        Minimum accepted chi slices per ring.
+
+    Returns
+    -------
+    MultiRingResult
+        Contains per-ring results and the joint offset/distance solution.
+        ``drow_px / dcol_px / ddist_mm`` are ``None`` until converted via
+        :func:`q_offset_to_pixel_delta_multi`.
+    """
+    if len(orders) < 1:
+        raise ValueError("Must specify at least one ring order")
+
+    peak_fits: dict[int, PeakFitResult] = {}
+    for n in orders:
+        q_centre = agbh_q(n)
+        q_min = q_centre - q_half_width
+        q_max = q_centre + q_half_width
+        try:
+            pf = fit_ring_peaks(
+                qchi,
+                q_min=q_min,
+                q_max=q_max,
+                chi_min=chi_min,
+                chi_max=chi_max,
+                bg_order=bg_order,
+                snr_threshold=snr_threshold,
+                max_sigma_frac=max_sigma_frac,
+                chi_stride=chi_stride,
+            )
+        except ValueError:
+            continue
+        if pf.n_accepted >= min_chi_per_ring:
+            peak_fits[n] = pf
+
+    if len(peak_fits) < min_rings:
+        raise ValueError(
+            f"Only {len(peak_fits)} ring(s) produced enough data "
+            f"(need min_rings={min_rings}).  "
+            f"Orders attempted: {list(orders)}, "
+            f"succeeded: {list(peak_fits.keys())}"
+        )
+
+    # --- Joint linear least-squares ---
+    # Model per ring n:  q_peak(chi) = q0_n + A_r*sin(chi) + A_c*cos(chi)
+    # Parameter vector: [q0_1, q0_2, ..., q0_k, A_r, A_c]
+    ring_order_list = sorted(peak_fits.keys())
+    k = len(ring_order_list)
+
+    # Build design matrix and target vector
+    chi_all = []
+    q_all = []
+    ring_idx = []  # which ring each row belongs to
+    for i, n in enumerate(ring_order_list):
+        pf = peak_fits[n]
+        chi_all.append(pf.chi_deg)
+        q_all.append(pf.q_peak)
+        ring_idx.append(np.full(pf.n_accepted, i, dtype=int))
+
+    chi_cat = np.concatenate(chi_all)
+    q_cat = np.concatenate(q_all)
+    idx_cat = np.concatenate(ring_idx)
+    n_total = len(chi_cat)
+
+    # Design matrix: k columns for per-ring intercepts + 2 for sin/cos
+    A = np.zeros((n_total, k + 2), dtype=float)
+    chi_rad = np.deg2rad(chi_cat)
+    for i in range(k):
+        A[idx_cat == i, i] = 1.0
+    A[:, k] = np.sin(chi_rad)
+    A[:, k + 1] = np.cos(chi_rad)
+
+    coefs, *_ = np.linalg.lstsq(A, q_cat, rcond=None)
+    q0_vals = coefs[:k]
+    A_r = float(coefs[k])
+    A_c = float(coefs[k + 1])
+
+    resid = q_cat - A @ coefs
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+
+    q0_per_ring = {n: float(q0_vals[i]) for i, n in enumerate(ring_order_list)}
+    n_per_ring = {n: peak_fits[n].n_accepted for n in ring_order_list}
+
+    # Distance ratio: weighted mean of q0_n / q_expected_n
+    # Weight by number of accepted chi slices per ring.
+    ratios = np.array([q0_vals[i] / agbh_q(n) for i, n in enumerate(ring_order_list)])
+    weights = np.array([peak_fits[n].n_accepted for n in ring_order_list], dtype=float)
+    dist_ratio = float(np.average(ratios, weights=weights))
+
+    return MultiRingResult(
+        orders=tuple(ring_order_list),
+        q0_per_ring=q0_per_ring,
+        A_r=A_r,
+        A_c=A_c,
+        rms=rms,
+        n_total=n_total,
+        n_per_ring=n_per_ring,
+        peak_fits=peak_fits,
+        dist_ratio=dist_ratio,
+    )
+
+
+def q_offset_to_pixel_delta_multi(
+    fit: MultiRingResult,
+    *,
+    wavelength_nm: float,
+    distance_mm: float,
+    pixel_mm: float = 0.172,
+    chi_convention: str = "smi",
+) -> MultiRingResult:
+    """Convert a :class:`MultiRingResult` to pixel + mm deltas.
+
+    Same geometry conversion as :func:`q_offset_to_pixel_delta`, but
+    derives ``ddist_mm`` from the weighted ``dist_ratio`` across all
+    fitted rings rather than a single ring.
+
+    Returns a new ``MultiRingResult`` with ``drow_px``, ``dcol_px``,
+    ``ddist_mm`` populated.
+    """
+    if wavelength_nm <= 0 or distance_mm <= 0 or pixel_mm <= 0:
+        raise ValueError("wavelength, distance, and pixel size must be positive")
+
+    scale_px = (wavelength_nm * distance_mm) / (2.0 * np.pi * pixel_mm)
+    if chi_convention in ("smi", "smi_saxs"):
+        drow_px = -fit.A_c * scale_px
+        dcol_px = fit.A_r * scale_px
+    elif chi_convention == "smi_waxs":
+        drow_px = fit.A_c * scale_px
+        dcol_px = fit.A_r * scale_px
+    elif chi_convention == "atan2_y_x":
+        drow_px = fit.A_r * scale_px
+        dcol_px = fit.A_c * scale_px
+    else:
+        raise ValueError(
+            "chi_convention must be 'smi'/'smi_saxs'/'smi_waxs'/'atan2_y_x', "
+            f"got {chi_convention!r}"
+        )
+
+    # dist_ratio = q0_observed / q_expected (weighted mean across rings).
+    # D_correct = D_assumed * dist_ratio  →  ΔD = D_assumed * (dist_ratio - 1)
+    ddist_mm = float(distance_mm * (fit.dist_ratio - 1.0))
+
+    return MultiRingResult(
+        orders=fit.orders,
+        q0_per_ring=fit.q0_per_ring,
+        A_r=fit.A_r,
+        A_c=fit.A_c,
+        rms=fit.rms,
+        n_total=fit.n_total,
+        n_per_ring=fit.n_per_ring,
+        peak_fits=fit.peak_fits,
+        dist_ratio=fit.dist_ratio,
+        drow_px=float(drow_px),
+        dcol_px=float(dcol_px),
+        ddist_mm=ddist_mm,
     )

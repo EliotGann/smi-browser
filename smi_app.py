@@ -154,7 +154,7 @@ DEFAULT_SAXS_DIST_DELTA = _LD.saxs_distance_delta_mm
 # so the widgets show meaningful numbers even before any override.  When a
 # widget value still equals its default, _on_process passes None so the
 # upstream loader supplies its own calibrated default.)
-DEFAULT_N_Q = 2000          # smi-tiled default is 1000; smi-browser used 2000
+DEFAULT_N_Q = 3000          # smi-tiled default is 1000; calibrated for SMI
 DEFAULT_N_CHI = 360
 DEFAULT_SAXS_MASK = ""      # empty → use bundled default from smi-tiled
 DEFAULT_WAXS_MASK = ""
@@ -3419,7 +3419,7 @@ w_proc_geometry = pn.widgets.Select(
 
 # --- Output grid ---
 w_proc_nq = pn.widgets.IntInput(
-    name="n_q", value=3000, start=100, end=10000, step=100, width=90,
+    name="n_q", value=DEFAULT_N_Q, start=100, end=10000, step=100, width=90,
 )
 w_proc_nchi = pn.widgets.IntInput(
     name="n_χ", value=DEFAULT_N_CHI, start=36, end=720, step=36, width=90,
@@ -3436,13 +3436,13 @@ w_gi_grid_row = pn.Row(w_proc_nqxy, w_proc_nqz)
 # --- Masks ---
 w_proc_saxs_mask = pn.widgets.TextInput(
     name="SAXS mask",
-    value="/home/xf12id/saxs_14.5m_pin.json",  # TEMP test default
+    value=DEFAULT_SAXS_MASK,
     placeholder=f"(default: {DEFAULT_SAXS_MASK_NAME})",
     width=320,
 )
 w_proc_waxs_mask = pn.widgets.TextInput(
     name="WAXS mask",
-    value="/home/xf12id/waxs_hot_spots.json",  # TEMP test default
+    value=DEFAULT_WAXS_MASK,
     placeholder=f"(default: {DEFAULT_WAXS_MASK_NAME})",
     width=320,
 )
@@ -3462,22 +3462,22 @@ w_proc_saxs_q_margin = pn.widgets.FloatInput(
 
 # --- Geometry corrections ---
 w_proc_saxs_row_delta = pn.widgets.FloatInput(
-    name="SAXS Δrow", value=DEFAULT_SAXS_ROW_DELTA, step=0.50, width=80,
+    name="SAXS Δrow", value=-1.8615138075796633, step=0.50, width=80,
 )
 w_proc_saxs_col_delta = pn.widgets.FloatInput(
-    name="SAXS Δcol", value=DEFAULT_SAXS_COL_DELTA, step=0.50, width=80,
+    name="SAXS Δcol", value=0.09503462237784324, step=0.50, width=80,
 )
 w_proc_dist_delta = pn.widgets.FloatInput(
-    name="SAXS Δdist (mm)", value=DEFAULT_SAXS_DIST_DELTA, step=1.00, width=110,
+    name="SAXS Δdist (mm)", value=-24.702705577005723, step=1.00, width=110,
 )
 w_proc_waxs_row_delta = pn.widgets.FloatInput(
-    name="WAXS Δrow", value=0.5, step=0.50, width=80,  # TEMP test default
+    name="WAXS Δrow", value=0.5506777818757322, step=0.50, width=80,
 )
 w_proc_waxs_col_delta = pn.widgets.FloatInput(
-    name="WAXS Δcol", value=-3.5, step=0.50, width=80,  # TEMP test default
+    name="WAXS Δcol", value=-3.2518613652412176, step=0.50, width=80,
 )
 w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
-    name="WAXS col/arc°", value=-0.16,  # TEMP test default
+    name="WAXS col/arc°", value=-0.16,
     step=0.01, width=100,
 )
 w_saxs_geom_section = pn.Column(
@@ -3943,9 +3943,11 @@ from smi_browser.calibrate import (
     AGBH_Q1_NM,
     agbh_q,
     fit_beam_offset_qspace,
+    fit_multi_ring,
     fit_ring_peaks,
     nearest_agbh_order,
     q_offset_to_pixel_delta,
+    q_offset_to_pixel_delta_multi,
 )
 
 
@@ -4022,6 +4024,29 @@ def _make_calibrate_widgets(
     )
     result = pn.pane.Markdown("")
 
+    # Multi-ring widgets
+    multi_start = pn.widgets.IntInput(
+        name="Orders from", value=default_ring_order - 2 if default_ring_order > 2 else 1,
+        start=1, end=9, width=90,
+    )
+    multi_end = pn.widgets.IntInput(
+        name="Orders to", value=default_ring_order + 2 if default_ring_order < 8 else 9,
+        start=1, end=9, width=90,
+    )
+    multi_q_half = pn.widgets.FloatInput(
+        name="q half-width", value=0.15, step=0.01, start=0.02, width=100,
+        description="Half-width of q-window around each ring centre.",
+    )
+    multi_fit_btn = pn.widgets.Button(
+        name=f"Fit {label} multi-ring", button_type="primary", width=170,
+    )
+    multi_apply_btn = pn.widgets.Button(
+        name="↪ Apply multi to Process", button_type="success", width=190,
+        disabled=True,
+    )
+    multi_status = pn.pane.Markdown("")
+    multi_result = pn.pane.Markdown("")
+
     return {
         "detector": detector,
         "expose_distance": expose_distance,
@@ -4041,8 +4066,17 @@ def _make_calibrate_widgets(
         "pick_btn": pick_btn,
         "status": status,
         "result": result,
-        # Filled in by _on_calibrate_fit:
+        # Multi-ring
+        "multi_start": multi_start,
+        "multi_end": multi_end,
+        "multi_q_half": multi_q_half,
+        "multi_fit_btn": multi_fit_btn,
+        "multi_apply_btn": multi_apply_btn,
+        "multi_status": multi_status,
+        "multi_result": multi_result,
+        # Filled in by _on_calibrate_fit / _on_multi_ring_fit:
         "last_fit_px": None,
+        "last_multi_fit_px": None,
     }
 
 
@@ -4270,6 +4304,124 @@ def _on_calibrate_reset(slot):
     return _cb
 
 
+def _format_multi_ring_result(fit, expose_distance: bool) -> str:
+    """Markdown summary for multi-ring fit results."""
+    parts = [
+        f"**Δrow = {fit.drow_px:+.2f} px**",
+        f"**Δcol = {fit.dcol_px:+.2f} px**",
+    ]
+    if expose_distance and fit.ddist_mm is not None:
+        parts.append(f"**Δdist = {fit.ddist_mm:+.2f} mm**")
+    parts.append(f"rings used: {list(fit.orders)}")
+    parts.append(f"dist ratio = {fit.dist_ratio:.5f}")
+    for n in fit.orders:
+        parts.append(f"  ring {n}: q₀={fit.q0_per_ring[n]:.4f} nm⁻¹, "
+                     f"n_χ={fit.n_per_ring[n]}")
+    parts.append(f"rms = {fit.rms:.4f} nm⁻¹")
+    parts.append(f"total χ slices = {fit.n_total}")
+    return "  \n".join(parts)
+
+
+def _on_multi_ring_fit(slot):
+    """Run fit_multi_ring on the current q-χ map."""
+    def _cb(_event):
+        detector = slot["detector"]
+        qchi = _current_qchi_for_detector(detector)
+        if qchi is None:
+            slot["multi_status"].object = (
+                f"*No {detector.upper()} q-χ map in cache — Process a scan first.*"
+            )
+            slot["multi_result"].object = ""
+            slot["multi_apply_btn"].disabled = True
+            return
+
+        start = int(slot["multi_start"].value)
+        end = int(slot["multi_end"].value)
+        if start > end:
+            start, end = end, start
+        orders = list(range(start, end + 1))
+
+        try:
+            result = fit_multi_ring(
+                qchi,
+                orders=orders,
+                chi_min=float(slot["chi_min"].value),
+                chi_max=float(slot["chi_max"].value),
+                q_half_width=float(slot["multi_q_half"].value),
+                bg_order=int(slot["bg_order"].value),
+                snr_threshold=float(slot["snr"].value),
+                min_rings=2,
+            )
+        except Exception as exc:
+            slot["multi_status"].object = f"*Multi-ring fit failed: {exc}*"
+            slot["multi_result"].object = ""
+            slot["multi_apply_btn"].disabled = True
+            return
+
+        lam_nm, dist_mm, px_mm = _calibrate_geometry_for(slot)
+        try:
+            result_px = q_offset_to_pixel_delta_multi(
+                result,
+                wavelength_nm=lam_nm,
+                distance_mm=dist_mm,
+                pixel_mm=px_mm,
+                chi_convention=(
+                    "smi_waxs" if detector == "waxs" else "smi_saxs"
+                ),
+            )
+        except Exception as exc:
+            slot["multi_status"].object = f"*Pixel conversion failed: {exc}*"
+            slot["multi_result"].object = ""
+            slot["multi_apply_btn"].disabled = True
+            return
+
+        slot["last_multi_fit_px"] = result_px
+        slot["multi_status"].object = (
+            f"*Multi-ring fit OK — {len(result_px.orders)} rings, "
+            f"{result_px.n_total} total χ slices.  "
+            f"Click **↪ Apply multi to Process** to add deltas.*"
+        )
+        slot["multi_result"].object = _format_multi_ring_result(
+            result_px, expose_distance=slot["expose_distance"],
+        )
+        slot["multi_apply_btn"].disabled = False
+        _draw_multi_ring_overlay(result_px)
+    return _cb
+
+
+def _on_multi_ring_apply(slot):
+    """Add the multi-ring fitted deltas to Process-tab widgets."""
+    def _cb(_event):
+        fit_px = slot.get("last_multi_fit_px")
+        if fit_px is None:
+            return
+        if slot["detector"] == "saxs":
+            w_proc_saxs_row_delta.value = float(
+                w_proc_saxs_row_delta.value + fit_px.drow_px
+            )
+            w_proc_saxs_col_delta.value = float(
+                w_proc_saxs_col_delta.value + fit_px.dcol_px
+            )
+            if slot["expose_distance"] and fit_px.ddist_mm is not None:
+                w_proc_dist_delta.value = float(
+                    w_proc_dist_delta.value + fit_px.ddist_mm
+                )
+        else:
+            w_proc_waxs_row_delta.value = float(
+                w_proc_waxs_row_delta.value + fit_px.drow_px
+            )
+            w_proc_waxs_col_delta.value = float(
+                w_proc_waxs_col_delta.value + fit_px.dcol_px
+            )
+        slot["multi_status"].object = (
+            f"*Multi-ring Δ applied — click **⚙ Process** to re-reduce, "
+            f"then fit again to verify convergence.*"
+        )
+        slot["multi_apply_btn"].disabled = True
+        slot["last_multi_fit_px"] = None
+    return _cb
+
+
 def _on_calibrate_pick_toggle(slot):
     """Activate the 2-click q-range picker for this detector.
 
@@ -4388,6 +4540,43 @@ def _draw_calibrate_overlay(detector, peak_fit, fit_q, fit_px):
         cr.visible = True
 
 
+def _draw_multi_ring_overlay(multi_result):
+    """Update overlay with peaks + sinusoid curves for all fitted rings."""
+    src_p = _calibrate_overlay.get("peaks_source")
+    src_c = _calibrate_overlay.get("fit_curve_source")
+    if src_p is None or src_c is None:
+        return
+
+    # Concatenate peaks from all rings.
+    all_q, all_chi = [], []
+    for n in multi_result.orders:
+        pf = multi_result.peak_fits[n]
+        all_q.extend(map(float, pf.q_peak))
+        all_chi.extend(map(float, pf.chi_deg))
+    src_p.data = {"q": all_q, "chi": all_chi}
+
+    # Dense sinusoid for each ring, NaN-separated for a single line glyph.
+    chi_dense = np.linspace(-180.0, 180.0, 361)
+    chi_rad = np.deg2rad(chi_dense)
+    q_segments, chi_segments = [], []
+    for n in multi_result.orders:
+        q0 = multi_result.q0_per_ring[n]
+        q_curve = q0 + multi_result.A_r * np.sin(chi_rad) + multi_result.A_c * np.cos(chi_rad)
+        q_segments.extend(q_curve.tolist())
+        chi_segments.extend(chi_dense.tolist())
+        # NaN separator between rings
+        q_segments.append(float("nan"))
+        chi_segments.append(float("nan"))
+    src_c.data = {"q": q_segments, "chi": chi_segments}
+
+    pr = _calibrate_overlay.get("peaks_renderer")
+    cr = _calibrate_overlay.get("curve_renderer")
+    if pr is not None:
+        pr.visible = True
+    if cr is not None:
+        cr.visible = True
+
+
 def _draw_pick_lines(q_values):
     """Refresh the vertical Span markers for the q-pick guides."""
     from bokeh.models import Span
@@ -4418,6 +4607,8 @@ for _slot in (_CAL_SAXS, _CAL_WAXS):
     _slot["apply_btn"].on_click(_on_calibrate_apply(_slot))
     _slot["reset_btn"].on_click(_on_calibrate_reset(_slot))
     _slot["pick_btn"].param.watch(_on_calibrate_pick_toggle(_slot), "value")
+    _slot["multi_fit_btn"].on_click(_on_multi_ring_fit(_slot))
+    _slot["multi_apply_btn"].on_click(_on_multi_ring_apply(_slot))
 
 
 def _build_calibrate_panel(slot):
@@ -4430,6 +4621,11 @@ def _build_calibrate_panel(slot):
     fit_row_2 = pn.Row(slot["chi_min"], slot["chi_max"], slot["snr"], slot["bg_order"])
     btn_row = pn.Row(slot["pick_btn"], slot["fit_btn"],
                      slot["apply_btn"], slot["reset_btn"])
+    # Multi-ring section
+    multi_row = pn.Row(
+        slot["multi_start"], slot["multi_end"], slot["multi_q_half"],
+    )
+    multi_btn_row = pn.Row(slot["multi_fit_btn"], slot["multi_apply_btn"])
     expose = slot["expose_distance"]
     extra_md = "" if expose else (
         "  \n*WAXS panels are non-coplanar; the single-ring sinusoid catches "
@@ -4449,12 +4645,22 @@ def _build_calibrate_panel(slot):
         pn.pane.Markdown("**Detector geometry** *(used to convert q-shift → "
                          "pixels and distance)*"),
         geo_row,
-        pn.pane.Markdown("**Fit window**"),
+        pn.pane.Markdown("**Single-ring fit window**"),
         fit_row_1,
         fit_row_2,
         btn_row,
         slot["status"],
         slot["result"],
+        pn.layout.Divider(),
+        pn.pane.Markdown(
+            f"**Multi-ring fit** — fit orders simultaneously for joint "
+            f"beam-offset + distance (uses shared χ window, SNR, bg order "
+            f"from above)."
+        ),
+        multi_row,
+        multi_btn_row,
+        slot["multi_status"],
+        slot["multi_result"],
         sizing_mode="stretch_width",
     )
 
@@ -4491,6 +4697,10 @@ w_btn_add_collection = pn.widgets.Button(
 )
 w_proc_status = pn.pane.Markdown("*Select a scan and click Process.*")
 w_proc_spinner = pn.indicators.LoadingSpinner(value=False, size=40, visible=False)
+w_proc_progress = pn.indicators.Progress(
+    name="Processing", value=0, max=100, width=300,
+    visible=False, sizing_mode="stretch_width",
+)
 w_proc_iq_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=400)
 w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=500)
 w_proc_frame_slider = pn.widgets.IntSlider(
@@ -8353,6 +8563,8 @@ def _on_process(event):
     w_proc_status.object = f"*Processing `{uid[:12]}…` ({geometry})*"
     w_proc_spinner.value = True
     w_proc_spinner.visible = True
+    w_proc_progress.value = 0
+    w_proc_progress.visible = True
     w_btn_process.disabled = True
     _proc_result_cache.update(result=None, gi_result=None)
     _per_frame_qchi_lru.clear()
@@ -8365,13 +8577,42 @@ def _on_process(event):
         # printed command and actual kwargs always stay in sync.
         reduce_fn, call_params, _geom_label = _build_proc_params(uid)
 
+        # Progress callback — maps stage progress to 0–100 percentage.
+        # Stages for combined: load, saxs_setup, saxs_integrate, waxs_setup,
+        #   waxs_integrate, merge
+        # Stages for GI: load, gi_setup, gi_integrate
+        _STAGE_WEIGHTS_COMBINED = {
+            "load": (0, 10),
+            "saxs_setup": (10, 15),
+            "saxs_integrate": (15, 55),
+            "waxs_setup": (55, 60),
+            "waxs_integrate": (60, 95),
+            "merge": (95, 100),
+        }
+        _STAGE_WEIGHTS_GI = {
+            "load": (0, 10),
+            "gi_setup": (10, 20),
+            "gi_integrate": (20, 100),
+        }
+        _stage_weights = (_STAGE_WEIGHTS_GI if geometry == "grazing"
+                          else _STAGE_WEIGHTS_COMBINED)
+
+        def _proc_progress_cb(stage: str, current: int, total: int):
+            bounds = _stage_weights.get(stage)
+            if bounds is None:
+                return
+            lo, hi = bounds
+            frac = current / max(total, 1)
+            pct = int(lo + (hi - lo) * frac)
+            w_proc_progress.value = min(pct, 100)
+
         if geometry == "grazing":
             gi_params = call_params
 
             _args_str = ", ".join(f"{k}={v!r}" for k, v in gi_params.items())
             print(f"\n>>> reduce_smi_gi({_args_str})\n")
 
-            gi_result = reduce_fn(**gi_params)
+            gi_result = reduce_fn(**gi_params, progress=_proc_progress_cb)
             dt = time.perf_counter() - t0
 
             _cache_reduction_result(uid, gi_result, geometry, gi_params)
@@ -8413,7 +8654,7 @@ def _on_process(event):
             _args_str = ", ".join(f"{k}={v!r}" for k, v in params.items())
             print(f"\n>>> reduce_smi_combined({_args_str})\n")
 
-            result = reduce_fn(**params)
+            result = reduce_fn(**params, progress=_proc_progress_cb)
             dt = time.perf_counter() - t0
 
             _cache_reduction_result(uid, result, geometry, params)
@@ -8517,6 +8758,7 @@ def _on_process(event):
         w_btn_process.disabled = False
         w_proc_spinner.value = False
         w_proc_spinner.visible = False
+        w_proc_progress.visible = False
         _mem_report("process:done")
 
 
@@ -12402,6 +12644,7 @@ w_detail_tabs = pn.Tabs(
             # Quick controls — geometry selector + run button
             pn.Row(w_proc_geometry, w_btn_process, w_btn_add_collection,
                    w_proc_spinner),
+            w_proc_progress,
             w_proc_status,
             # Per-frame controls apply to both the 2D q-chi and 1D I(q) views,
             # so they live above the sub-tabs.

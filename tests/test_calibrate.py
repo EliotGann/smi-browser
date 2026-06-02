@@ -8,12 +8,15 @@ import xarray as xr
 from smi_browser.calibrate import (
     AGBH_Q1_NM,
     BeamOffsetResult,
+    MultiRingResult,
     PeakFitResult,
     agbh_q,
     fit_beam_offset_qspace,
+    fit_multi_ring,
     fit_ring_peaks,
     nearest_agbh_order,
     q_offset_to_pixel_delta,
+    q_offset_to_pixel_delta_multi,
 )
 
 
@@ -279,9 +282,10 @@ def test_pixel_delta_distance_correction_recovers_known_offset():
     pixel_mm = 0.172
     distance_true_mm = 8500.0
     distance_assumed_mm = 8700.0  # 200 mm too far
-    # Apparent q scales as D_true / D_assumed (smaller D → larger q)
+    # Apparent q = q_true * D_actual / D_assumed (ring appears at lower q
+    # when assumed distance exceeds actual distance).
     q0_true = 5 * AGBH_Q1_NM
-    q0_apparent = q0_true * (distance_assumed_mm / distance_true_mm)
+    q0_apparent = q0_true * (distance_true_mm / distance_assumed_mm)
 
     qchi = _synth_ring_qchi(
         q0_true=q0_apparent, A_r=0.0, A_c=0.0, sigma=0.04,
@@ -297,7 +301,7 @@ def test_pixel_delta_distance_correction_recovers_known_offset():
         distance_mm=distance_assumed_mm,
         pixel_mm=pixel_mm,
     )
-    # ddist_mm = D_assumed * (q_expected/q0 - 1) ≈ -200 mm
+    # ddist_mm = D_assumed * (q0/q_expected - 1) ≈ -200 mm
     assert fit_px.ddist_mm == pytest.approx(
         distance_true_mm - distance_assumed_mm, abs=1.0
     )
@@ -309,3 +313,181 @@ def test_pixel_delta_rejects_bad_geometry():
         q_offset_to_pixel_delta(fit, wavelength_nm=0.0, distance_mm=8500.0)
     with pytest.raises(ValueError):
         q_offset_to_pixel_delta(fit, wavelength_nm=0.077, distance_mm=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# fit_multi_ring — simultaneous multi-peak calibration
+# ---------------------------------------------------------------------------
+
+def _synth_multi_ring_qchi(
+    *,
+    orders: list[int],
+    A_r: float = 0.0,
+    A_c: float = 0.0,
+    sigma: float = 0.04,
+    amp: float = 100.0,
+    baseline: float = 5.0,
+    noise: float = 0.5,
+    n_chi: int = 360,
+    q_per_nm: int = 1000,
+    seed: int = 42,
+    dist_ratio: float = 1.0,
+) -> xr.Dataset:
+    """Build a wide q-chi Dataset containing multiple AgBh rings.
+
+    ``dist_ratio`` shifts all ring centres by a constant factor (simulating
+    a distance error: q_apparent = q_true * dist_ratio).
+    """
+    rng = np.random.default_rng(seed)
+    q_lo = agbh_q(min(orders)) * dist_ratio - 0.5
+    q_hi = agbh_q(max(orders)) * dist_ratio + 0.5
+    n_q = int((q_hi - q_lo) * q_per_nm)
+    q = np.linspace(q_lo, q_hi, n_q)
+    chi = np.linspace(-180.0, 180.0, n_chi)
+    chi_rad = np.deg2rad(chi)
+
+    # Build intensity as sum of Gaussians for each ring
+    intensity = np.full((n_q, n_chi), baseline, dtype=float)
+    for n in orders:
+        mu_base = agbh_q(n) * dist_ratio
+        mu_chi = mu_base + A_r * np.sin(chi_rad) + A_c * np.cos(chi_rad)
+        qq, mm = np.meshgrid(q, mu_chi, indexing="ij")
+        intensity += amp * np.exp(-0.5 * ((qq - mm) / sigma) ** 2)
+
+    intensity += rng.normal(scale=noise, size=intensity.shape)
+    return xr.Dataset(
+        {"intensity": (("q", "chi"), intensity)},
+        coords={"q": q, "chi": chi},
+    )
+
+
+def test_fit_multi_ring_recovers_centred_rings():
+    """Multi-ring fit with no beam offset → A_r ≈ A_c ≈ 0."""
+    orders = [3, 4, 5, 6]
+    qchi = _synth_multi_ring_qchi(orders=orders)
+    result = fit_multi_ring(qchi, orders=orders)
+    assert isinstance(result, MultiRingResult)
+    assert set(result.orders) == set(orders)
+    assert abs(result.A_r) < 0.002
+    assert abs(result.A_c) < 0.002
+    for n in orders:
+        assert result.q0_per_ring[n] == pytest.approx(agbh_q(n), abs=0.005)
+    assert result.dist_ratio == pytest.approx(1.0, abs=0.001)
+
+
+def test_fit_multi_ring_recovers_beam_offset():
+    """Shared A_r, A_c recovered across multiple rings."""
+    A_r, A_c = 0.06, -0.03
+    orders = [2, 3, 4, 5]
+    qchi = _synth_multi_ring_qchi(orders=orders, A_r=A_r, A_c=A_c)
+    result = fit_multi_ring(qchi, orders=orders)
+    assert result.A_r == pytest.approx(A_r, abs=0.003)
+    assert result.A_c == pytest.approx(A_c, abs=0.003)
+    assert result.rms < 0.01
+
+
+def test_fit_multi_ring_recovers_distance_error():
+    """dist_ratio ≠ 1 when rings appear shifted by a distance error."""
+    # Simulate detector 3% closer than assumed (rings at higher q)
+    dist_ratio_true = 8500.0 / 8700.0  # ≈ 0.977
+    orders = [3, 4, 5, 6]
+    qchi = _synth_multi_ring_qchi(
+        orders=orders, dist_ratio=dist_ratio_true, noise=0.3,
+    )
+    result = fit_multi_ring(qchi, orders=orders)
+    assert result.dist_ratio == pytest.approx(dist_ratio_true, abs=0.002)
+
+
+def test_fit_multi_ring_pixel_delta_distance():
+    """End-to-end: multi-ring → pixel delta → distance correction."""
+    wavelength_nm = 1.23984198 / 16.1
+    distance_assumed_mm = 8700.0
+    distance_true_mm = 8500.0
+    dist_ratio = distance_true_mm / distance_assumed_mm
+    orders = [3, 4, 5, 6]
+    qchi = _synth_multi_ring_qchi(
+        orders=orders, dist_ratio=dist_ratio, noise=0.3,
+    )
+    result = fit_multi_ring(qchi, orders=orders)
+    result_px = q_offset_to_pixel_delta_multi(
+        result,
+        wavelength_nm=wavelength_nm,
+        distance_mm=distance_assumed_mm,
+    )
+    # Should recover ΔD ≈ -200 mm
+    assert result_px.ddist_mm == pytest.approx(
+        distance_true_mm - distance_assumed_mm, abs=5.0,
+    )
+    # No beam offset injected
+    assert abs(result_px.drow_px) < 0.5
+    assert abs(result_px.dcol_px) < 0.5
+
+
+def test_fit_multi_ring_with_beam_offset_and_distance():
+    """Joint recovery of beam offset + distance from multiple rings."""
+    wavelength_nm = 1.23984198 / 16.1
+    distance_assumed_mm = 8700.0
+    pixel_mm = 0.172
+    scale_px = (wavelength_nm * distance_assumed_mm) / (2 * np.pi * pixel_mm)
+    drow_true, dcol_true = 1.2, -1.8
+    A_r_true = dcol_true / scale_px
+    A_c_true = -drow_true / scale_px
+
+    dist_ratio = 8500.0 / 8700.0
+    orders = [3, 4, 5, 6]
+    qchi = _synth_multi_ring_qchi(
+        orders=orders, A_r=A_r_true, A_c=A_c_true,
+        dist_ratio=dist_ratio, noise=0.3,
+    )
+    result = fit_multi_ring(qchi, orders=orders)
+    result_px = q_offset_to_pixel_delta_multi(
+        result,
+        wavelength_nm=wavelength_nm,
+        distance_mm=distance_assumed_mm,
+        pixel_mm=pixel_mm,
+        chi_convention="smi_saxs",
+    )
+    assert result_px.drow_px == pytest.approx(drow_true, abs=0.3)
+    assert result_px.dcol_px == pytest.approx(dcol_true, abs=0.3)
+    assert result_px.ddist_mm == pytest.approx(-200.0, abs=5.0)
+
+
+def test_fit_multi_ring_skips_missing_rings():
+    """Rings outside q range are skipped; fit proceeds with available ones."""
+    orders_in_data = [3, 4, 5]
+    qchi = _synth_multi_ring_qchi(orders=orders_in_data)
+    # Request rings 3-7, but 6 and 7 are outside the data
+    result = fit_multi_ring(qchi, orders=[3, 4, 5, 6, 7], min_rings=2)
+    assert set(result.orders) == set(orders_in_data)
+
+
+def test_fit_multi_ring_raises_if_too_few_rings():
+    """Error if fewer than min_rings succeed."""
+    orders = [3, 4, 5]
+    qchi = _synth_multi_ring_qchi(orders=[3])  # only ring 3 in data
+    with pytest.raises(ValueError, match="Only 1 ring"):
+        fit_multi_ring(qchi, orders=orders, min_rings=2)
+
+
+def test_fit_multi_ring_waxs_convention():
+    """WAXS chi convention works for multi-ring."""
+    wavelength_nm = 1.23984198 / 16.1
+    distance_mm = 273.0
+    pixel_mm = 0.172
+    scale_px = (wavelength_nm * distance_mm) / (2 * np.pi * pixel_mm)
+    drow_true, dcol_true = 2.0, -1.5
+    A_r_true = dcol_true / scale_px
+    A_c_true = drow_true / scale_px  # +δrow for WAXS
+
+    orders = [5, 6, 7, 8]
+    qchi = _synth_multi_ring_qchi(orders=orders, A_r=A_r_true, A_c=A_c_true)
+    result = fit_multi_ring(qchi, orders=orders)
+    result_px = q_offset_to_pixel_delta_multi(
+        result,
+        wavelength_nm=wavelength_nm,
+        distance_mm=distance_mm,
+        pixel_mm=pixel_mm,
+        chi_convention="smi_waxs",
+    )
+    assert result_px.drow_px == pytest.approx(drow_true, abs=0.3)
+    assert result_px.dcol_px == pytest.approx(dcol_true, abs=0.3)
