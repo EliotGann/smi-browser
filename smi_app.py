@@ -50,6 +50,7 @@ from batch_processor import BatchProcessor
 from live_stream import LiveStreamManager
 from smi_browser import nsls2api
 from smi_browser import memlog
+from smi_browser.config import DEFAULT_CYCLE, RECENT_CYCLES
 from smi_browser.data.scalars import derive_virtual_columns
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
@@ -12120,28 +12121,56 @@ proposal_card = pn.Card(
 
 
 def _load_cycles():
-    """Populate the cycle dropdown (fast, unauthenticated)."""
-    cycles = nsls2api.fetch_cycles()
-    current = nsls2api.fetch_current_cycle()
-    if not cycles:
-        w_proposal_cycle.options = ["(unavailable)"]
-        w_proposal_cycle.value = "(unavailable)"
-        return
-    # Most recent first; prepend "All cycles" and "commissioning"
-    cycle_opts = ["All cycles", "commissioning"] + list(reversed(cycles))
+    """Populate the cycle dropdown.
+
+    Tries the NSLS-II API first.  When the API is unreachable (e.g. running
+    off the BNL network) falls back to the hardcoded ``RECENT_CYCLES`` list
+    so the app remains usable.  Selection priority:
+
+      1. The user's previously saved cycle (if still in the option list)
+      2. The API's reported ``current`` cycle (if API reachable)
+      3. ``DEFAULT_CYCLE`` (``$SMI_BROWSER_DEFAULT_CYCLE`` or "2026-2")
+      4. The newest cycle in the option list
+    """
+    api_cycles = nsls2api.fetch_cycles()
+    api_current = nsls2api.fetch_current_cycle()
+
+    if api_cycles:
+        # API returns oldest-first; reverse so newest appears first.
+        recent = list(reversed(api_cycles))
+        api_ok = True
+    else:
+        recent = list(RECENT_CYCLES)
+        api_ok = False
+        log.info(
+            "NSLS-II API unreachable; using hardcoded RECENT_CYCLES (%d cycles)",
+            len(recent),
+        )
+
+    cycle_opts = recent + ["commissioning", "All cycles"]
     w_proposal_cycle.options = cycle_opts
-    # Restore saved cycle if available and still valid
+
     saved_cycle = _load_saved_cycle()
     if saved_cycle and saved_cycle in cycle_opts:
         w_proposal_cycle.value = saved_cycle
-    elif current and current in cycle_opts:
-        w_proposal_cycle.value = current
+    elif api_ok and api_current and api_current in cycle_opts:
+        w_proposal_cycle.value = api_current
+    elif DEFAULT_CYCLE in cycle_opts:
+        w_proposal_cycle.value = DEFAULT_CYCLE
     else:
-        w_proposal_cycle.value = cycle_opts[2] if len(cycle_opts) > 2 else cycle_opts[0]
+        w_proposal_cycle.value = cycle_opts[0]
 
 
 def _refresh_proposals(cycle: str | None = None):
-    """Fetch proposals for the logged-in user and populate the dropdown."""
+    """Fetch proposals for the logged-in user and populate the dropdown.
+
+    Tries the NSLS-II API first.  When it raises (network unreachable on an
+    off-site machine) falls back to enumerating ``data_session`` values from
+    the tiled catalog itself.  The tiled fallback can't supply per-user
+    access info, titles, or PIs — it shows every SMI proposal in the cycle
+    with a scan count, and surfaces a status banner explaining the
+    degraded mode.
+    """
     username = _tiled_whoami()
     if not username:
         w_proposal_select.options = ["(log in first)"]
@@ -12157,19 +12186,31 @@ def _refresh_proposals(cycle: str | None = None):
     w_proposal_spinner.visible = True
     w_proposal_status.object = "*Loading proposals…*"
 
+    cycle_filter = cycle if cycle and cycle != "All cycles" else None
+    api_ok = True
+    proposals: list[nsls2api.ProposalInfo] = []
+
     try:
-        cycle_filter = cycle if cycle and cycle != "All cycles" else None
         if w_proposal_all.value and cycle_filter:
             # Fetch ALL beamline proposals for this cycle (beamline-scientist mode)
             proposals = nsls2api.build_cycle_proposal_list(cycle_filter)
         else:
             proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
     except Exception as exc:
-        log.warning("Proposal fetch failed: %s", exc)
-        w_proposal_select.options = ["(error loading)"]
-        w_proposal_select.value = "(error loading)"
-        w_proposal_status.object = f"*Error: {exc}*"
-        return
+        log.warning(
+            "NSLS-II API unreachable: %s; falling back to tiled enumeration", exc,
+        )
+        api_ok = False
+        try:
+            proposals = nsls2api.proposals_from_tiled(_get_cat(), cycle_filter)
+        except Exception as exc2:
+            log.warning("Tiled proposal fallback also failed: %s", exc2)
+            w_proposal_select.options = ["(unavailable)"]
+            w_proposal_select.value = "(unavailable)"
+            w_proposal_status.object = (
+                f"*Both NSLS-II API and tiled enumeration unavailable: {exc}*"
+            )
+            return
     finally:
         w_proposal_spinner.value = False
         w_proposal_spinner.visible = False
@@ -12182,7 +12223,16 @@ def _refresh_proposals(cycle: str | None = None):
     _proposal_map = {p.data_session: p for p in proposals}
 
     if not proposals:
-        # User may have beamline-wide access — show that info
+        if not api_ok:
+            # Tiled fallback ran but found nothing for this cycle.
+            w_proposal_select.options = ["(none found via tiled)"]
+            w_proposal_select.value = "(none found via tiled)"
+            cy = cycle_filter or "all cycles"
+            w_proposal_status.object = (
+                f"*No SMI proposals for {cy} in tiled (NSLS-II API unreachable)*"
+            )
+            return
+        # API succeeded but returned no proposals — check beamline-wide access.
         beamline_access = nsls2api.fetch_user_beamline_access(username)
         has_smi = any(b.lower() == "smi" for b in beamline_access)
         if has_smi:
@@ -12214,7 +12264,16 @@ def _refresh_proposals(cycle: str | None = None):
             w_proposal_select.value = saved_ds
         else:
             w_proposal_select.value = "(All)"
-    w_proposal_status.object = f"*{len(proposals)} proposal{'s' if len(proposals) != 1 else ''}*"
+
+    n = len(proposals)
+    plural = "" if n == 1 else "s"
+    if api_ok:
+        w_proposal_status.object = f"*{n} proposal{plural}*"
+    else:
+        w_proposal_status.object = (
+            f"*{n} proposal{plural} via tiled "
+            "(NSLS-II API unreachable; titles/PIs unavailable)*"
+        )
 
 
 def _on_cycle_change(*_events):

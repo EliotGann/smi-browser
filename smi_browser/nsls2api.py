@@ -364,3 +364,80 @@ def build_cycle_proposal_list(
 
     results.sort(key=lambda p: p.proposal_id, reverse=True)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Fallback: enumerate proposals from the tiled catalog when the API is down
+# ---------------------------------------------------------------------------
+
+def proposals_from_tiled(cat, cycle: str | None) -> list[ProposalInfo]:
+    """Enumerate SMI proposals directly from the tiled catalog.
+
+    Used as a fallback when ``api.nsls2.bnl.gov`` is unreachable.  Issues a
+    server-side ``distinct`` query for ``start.data_session`` (optionally
+    restricted to a cycle).  Cannot supply proposal titles or PI names —
+    those require the NSLS-II API — so the returned ``ProposalInfo`` rows
+    use ``"?"`` for the PI and ``"(N scans)"`` as a placeholder title.
+
+    Parameters
+    ----------
+    cat : tiled catalog
+        The catalog node to query (typically ``smi/migration``).
+    cycle : str or None
+        If provided (and not ``"commissioning"`` or a non-cycle sentinel),
+        restrict the enumeration to ``start.cycle == cycle``.
+
+    Returns
+    -------
+    list[ProposalInfo]
+        Sorted by proposal_id descending; empty on failure.
+    """
+    # Lazy import to avoid pulling tiled into nsls2api's module-load path.
+    from smi_browser import _tiled as _tb
+
+    cycle_norm = (cycle or "").strip()
+    if cycle_norm.lower() in {"", "all cycles", "(loading…)", "(unavailable)"}:
+        unified_filters = None
+    elif cycle_norm.lower() == "commissioning":
+        # Commissioning scans aren't tagged with a regular cycle string;
+        # enumerate without a cycle filter and let the user narrow further.
+        unified_filters = None
+    else:
+        unified_filters = [("exact", "cycle", cycle_norm)]
+
+    try:
+        vals = _tb.distinct_values(
+            cat,
+            key="data_session",
+            unified_filters=unified_filters,
+            counts=True,
+            # When we have a cycle filter the subset is small enough to
+            # bypass the size guard.  Without one we keep the default
+            # protection so we don't hammer tiled with a 2.7M-row query.
+            size_limit=0 if unified_filters else _tb.DISTINCT_SIZE_LIMIT,
+        )
+    except Exception:
+        log.exception("Tiled distinct(data_session) failed for cycle=%r", cycle)
+        return []
+
+    if not vals:
+        return []
+
+    out: list[ProposalInfo] = []
+    for entry in vals:
+        ds = entry.get("value")
+        if not ds:
+            continue
+        pid = _proposal_id_from_data_session(str(ds))
+        cnt = entry.get("count")
+        title = f"({cnt} scans)" if cnt else "(via tiled — API unreachable)"
+        out.append(ProposalInfo(
+            proposal_id=pid,
+            data_session=str(ds),
+            title=title,
+            pi_name="?",
+            cycles=[cycle_norm] if unified_filters else [],
+        ))
+
+    out.sort(key=lambda p: p.proposal_id, reverse=True)
+    return out

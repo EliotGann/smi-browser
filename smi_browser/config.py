@@ -5,6 +5,8 @@ that a single upstream change propagates everywhere.
 """
 from __future__ import annotations
 
+import os
+
 import pandas as pd
 
 from smi_tiled import defaults as smid
@@ -17,6 +19,25 @@ DEFAULT_TILED_URI = smid.DEFAULT_TILED_URI
 DEFAULT_CATALOG = smid.DEFAULT_CATALOG
 DEFAULT_SAXS_MASK_NAME = smid.DEFAULT_SAXS_MASK_NAME
 DEFAULT_WAXS_MASK_NAME = smid.DEFAULT_WAXS_MASK_NAME
+
+# ---------------------------------------------------------------------------
+# Cycle defaults  (used by the proposal selector when the NSLS-II API is
+# unreachable, e.g. when running on an off-network machine that still has
+# HTTPS access to tiled.nsls2.bnl.gov)
+# ---------------------------------------------------------------------------
+
+# Cycle to pre-select on first launch when no saved value or API current is
+# available.  Override with ``$SMI_BROWSER_DEFAULT_CYCLE``.
+DEFAULT_CYCLE = os.environ.get("SMI_BROWSER_DEFAULT_CYCLE", "2026-2")
+
+# Hardcoded fallback list shown in the cycle dropdown when the NSLS-II API is
+# unreachable.  Most-recent first; bump as new cycles begin.
+RECENT_CYCLES = [
+    "2026-3", "2026-2", "2026-1",
+    "2025-3", "2025-2", "2025-1",
+    "2024-3", "2024-2", "2024-1",
+    "2023-3", "2023-2", "2023-1",
+]
 
 # ---------------------------------------------------------------------------
 # Detector classification
