@@ -20,6 +20,17 @@ log = logging.getLogger(__name__)
 _MPL_LOCK = threading.Lock()
 
 
+def _json_default(o):
+    """Best-effort JSON encoder for numpy scalars/arrays and unknown types."""
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
 # ---------------------------------------------------------------------------
 # Directory resolution
 # ---------------------------------------------------------------------------
@@ -267,33 +278,48 @@ def _save_linecuts(
 # ---------------------------------------------------------------------------
 
 def _write_qchi_frames_streamed(grp, frames_ds, progress_cb=None) -> None:
-    """Write a per-frame q-chi ``(frame, q, chi)`` stack to HDF5 frame-by-frame.
+    """Write a per-frame 2-D stack to HDF5 frame-by-frame.
 
-    ``frames_ds['intensity']`` may be a lazy dask/zarr array (large scans), so
-    we compute and write one frame at a time into a per-frame-chunked dataset
-    instead of materialising the whole multi-GB stack via ``.values``.
+    Handles both transmission ``(frame, q, chi)`` (vars: ``intensity, counts``)
+    and grazing-incidence ``(frame, qxy, qz)`` (var: ``intensity`` only)
+    layouts.  Every data variable that has a ``frame`` dim is written in a
+    single pass over the frame index, so lazy dask/zarr arrays only need to
+    be materialised once per frame instead of once per variable.
     """
     n = int(frames_ds.sizes.get("frame", 0))
     grp.attrs["n_frames"] = n
     if n == 0:
         return
-    intensity = frames_ds["intensity"]
-    sample = np.asarray(intensity.isel(frame=0).values)
-    dset = grp.create_dataset(
-        "intensity", shape=(n,) + sample.shape, dtype=sample.dtype,
-        chunks=(1,) + sample.shape, compression="gzip", compression_opts=4,
-    )
-    dset[0] = sample
+
+    var_names = [
+        name for name, da in frames_ds.data_vars.items()
+        if "frame" in da.dims
+    ]
+    if not var_names:
+        return
+
+    dsets: dict[str, Any] = {}
+    for name in var_names:
+        sample = np.asarray(frames_ds[name].isel(frame=0).values)
+        dset = grp.create_dataset(
+            name, shape=(n,) + sample.shape, dtype=sample.dtype,
+            chunks=(1,) + sample.shape, compression="gzip", compression_opts=4,
+        )
+        dset[0] = sample
+        dsets[name] = dset
     if progress_cb:
         progress_cb(1, n)
+
     for i in range(1, n):
-        dset[i] = np.asarray(intensity.isel(frame=i).values)
+        for name in var_names:
+            dsets[name][i] = np.asarray(frames_ds[name].isel(frame=i).values)
         if progress_cb:
             progress_cb(i + 1, n)
-    if "q" in frames_ds.coords:
-        grp.create_dataset("q", data=frames_ds["q"].values)
-    if "chi" in frames_ds.coords:
-        grp.create_dataset("chi", data=frames_ds["chi"].values)
+
+    # Coordinate axes: transmission uses (q, chi); GI uses (qxy, qz).
+    for coord in ("q", "chi", "qxy", "qz"):
+        if coord in frames_ds.coords:
+            grp.create_dataset(coord, data=frames_ds[coord].values)
 
 
 def _write_raw_images_streamed(
@@ -679,15 +705,50 @@ def _save_dataset_h5(
             grp = f.create_group("transmission")
             grp.attrs["geometry"] = result.geometry or ""
             grp.attrs["uid"] = result.uid or ""
+            # Provenance: incident angle + scan_info (best-effort serialisation)
+            inc_ang = getattr(result, "incident_angle_deg", None)
+            if inc_ang is not None:
+                try:
+                    grp.attrs["incident_angle_deg"] = float(inc_ang)
+                except (TypeError, ValueError):
+                    pass
+            scan_info = getattr(result, "scan_info", None)
+            if scan_info:
+                try:
+                    import json
+                    grp.attrs["scan_info"] = json.dumps(
+                        scan_info, default=_json_default,
+                    )
+                except (TypeError, ValueError):
+                    grp.attrs["scan_info"] = str(scan_info)
 
             if on("processed_iq"):
                 # Merged I(q)
                 iq = result.merged_iq
-                iq_grp = grp.create_group("merged_iq")
-                for var in iq.data_vars:
-                    iq_grp.create_dataset(var, data=iq[var].values)
-                if "q" in iq.coords:
-                    iq_grp.create_dataset("q", data=iq["q"].values)
+                if iq is not None:
+                    iq_grp = grp.create_group("merged_iq")
+                    for var in iq.data_vars:
+                        iq_grp.create_dataset(var, data=iq[var].values)
+                    if "q" in iq.coords:
+                        iq_grp.create_dataset("q", data=iq["q"].values)
+
+                # Per-detector native-grid I(q) (uncombined, native q axis)
+                saxs = getattr(result, "saxs", None)
+                waxs = getattr(result, "waxs", None)
+                saxs_iq = saxs.get("iq") if saxs else None
+                waxs_iq = waxs.get("iq") if waxs else None
+                if saxs_iq is not None:
+                    sg = grp.create_group("saxs_iq")
+                    for var in saxs_iq.data_vars:
+                        sg.create_dataset(var, data=saxs_iq[var].values)
+                    if "q" in saxs_iq.coords:
+                        sg.create_dataset("q", data=saxs_iq["q"].values)
+                if waxs_iq is not None:
+                    wg = grp.create_group("waxs_iq")
+                    for var in waxs_iq.data_vars:
+                        wg.create_dataset(var, data=waxs_iq[var].values)
+                    if "q" in waxs_iq.coords:
+                        wg.create_dataset("q", data=waxs_iq["q"].values)
 
                 # Per-frame I(q)
                 pf_iq = getattr(result, "per_frame_iq", None)
@@ -715,14 +776,17 @@ def _save_dataset_h5(
                         )
 
             if on("processed_qchi"):
-                # Merged q-chi
+                # Merged q-chi (all 6 data vars: intensity, counts,
+                # saxs_intensity, saxs_counts, waxs_intensity, waxs_counts)
                 qchi = result.merged_qchi
-                qchi_grp = grp.create_group("merged_qchi")
-                qchi_grp.create_dataset("intensity", data=qchi["intensity"].values)
-                if "q" in qchi.coords:
-                    qchi_grp.create_dataset("q", data=qchi["q"].values)
-                if "chi" in qchi.coords:
-                    qchi_grp.create_dataset("chi", data=qchi["chi"].values)
+                if qchi is not None:
+                    qchi_grp = grp.create_group("merged_qchi")
+                    for var in qchi.data_vars:
+                        qchi_grp.create_dataset(var, data=qchi[var].values)
+                    if "q" in qchi.coords:
+                        qchi_grp.create_dataset("q", data=qchi["q"].values)
+                    if "chi" in qchi.coords:
+                        qchi_grp.create_dataset("chi", data=qchi["chi"].values)
 
                 # Per-frame q-chi (from saxs/waxs q_chi_frames)
                 saxs = getattr(result, "saxs", None)
@@ -732,9 +796,9 @@ def _save_dataset_h5(
                 if saxs_qchi_frames is not None or waxs_qchi_frames is not None:
                     pf_qchi_grp = grp.create_group("per_frame_qchi")
                     # Use the merged grid coords
-                    if "q" in qchi.coords:
+                    if qchi is not None and "q" in qchi.coords:
                         pf_qchi_grp.create_dataset("q", data=qchi["q"].values)
-                    if "chi" in qchi.coords:
+                    if qchi is not None and "chi" in qchi.coords:
                         pf_qchi_grp.create_dataset("chi", data=qchi["chi"].values)
                     if saxs_qchi_frames is not None:
                         _write_qchi_frames_streamed(
@@ -753,11 +817,21 @@ def _save_dataset_h5(
         # --- GI result ---
         if gi_result is not None and (on("processed_iq") or on("processed_qchi")):
             grp = f.create_group("gi")
+            # Provenance: scanned motor + per-frame motor values
+            scan_motor = getattr(gi_result, "scan_motor", None)
+            if scan_motor:
+                grp.attrs["scan_motor"] = str(scan_motor)
+            scan_motor_values = getattr(gi_result, "scan_motor_values", None)
+            if scan_motor_values is not None:
+                arr = np.asarray(scan_motor_values)
+                if arr.size > 0:
+                    grp.create_dataset("scan_motor_values", data=arr)
+
             if on("processed_iq"):
                 grp.create_dataset("summed", data=gi_result.summed)
                 grp.create_dataset("qxy_grid", data=gi_result.qxy_grid)
                 grp.create_dataset("qz_grid", data=gi_result.qz_grid)
-                if gi_result.alpha_i_deg:
+                if gi_result.alpha_i_deg is not None:
                     grp.create_dataset(
                         "alpha_i_deg",
                         data=np.array(gi_result.alpha_i_deg, dtype=np.float64),
@@ -768,11 +842,22 @@ def _save_dataset_h5(
                         "frame_labels",
                         data=np.array(frame_labels, dtype=h5py.string_dtype()),
                     )
-            # Per-frame GI frames are the heavy part — gate under q-chi.
-            if on("processed_qchi") and gi_result.frames:
-                frames_grp = grp.create_group("frames")
-                for i, frame in enumerate(gi_result.frames):
-                    frames_grp.create_dataset(f"frame_{i:04d}", data=frame)
+
+            # Per-frame qxy-vs-qz stack — the GI equivalent of transmission's
+            # per_frame_qchi.  Mirrors that layout: a single 3-D dataset with
+            # qxy/qz coord arrays, gated under processed_qchi.
+            if on("processed_qchi"):
+                pf_qxy_qz = getattr(gi_result, "q_chi_frames", None)
+                if pf_qxy_qz is not None and pf_qxy_qz.sizes.get("frame", 0) > 0:
+                    pf_grp = grp.create_group("per_frame_qxy_qz")
+                    _write_qchi_frames_streamed(
+                        pf_grp, pf_qxy_qz, progress_cb=progress_cb,
+                    )
+                    if frame_labels:
+                        pf_grp.create_dataset(
+                            "frame_labels",
+                            data=np.array(frame_labels, dtype=h5py.string_dtype()),
+                        )
 
         # --- Peak-fit results ---
         if on("peakfit") and peak_fits:
