@@ -5885,13 +5885,20 @@ def _qchi_merge_grid(result):
     return q_grid, chi_grid
 
 
-def _regrid_qchi_frame(src_q, src_chi, data, q_grid, chi_grid):
-    """Regrid a single frame's (q, chi) data onto the merged grid -> (n_q, n_chi)."""
+def _regrid_qchi_frame(src_q, src_chi, data, q_grid, chi_grid, fill=np.nan):
+    """Regrid a single frame's (q, chi) data onto the merged grid -> (n_q, n_chi).
+
+    ``fill`` is used both for non-finite source samples and for target points
+    outside the source grid.  Mirrors ``smi_tiled.integrator._regrid_2d``:
+    pass ``np.nan`` for intensity (so weighted-merge denominators ignore it)
+    and ``0.0`` for counts (so the merge correctly takes the union of
+    detector coverage instead of the intersection).
+    """
     from scipy.interpolate import RegularGridInterpolator
-    finite_data = np.where(np.isfinite(data), data, 0.0)
+    finite_data = np.where(np.isfinite(data), data, fill)
     interp = RegularGridInterpolator(
         (src_q, src_chi), finite_data,
-        method="nearest", bounds_error=False, fill_value=np.nan,
+        method="nearest", bounds_error=False, fill_value=fill,
     )
     tq, tc = np.meshgrid(q_grid, chi_grid, indexing="ij")
     return interp((tq, tc))
@@ -5930,18 +5937,16 @@ def _get_per_frame_qchi_frame(result, frame_idx):
         schi = np.asarray(saxs_frames["chi"].values, dtype=float)
         s_I_raw = saxs_frames["intensity"].isel(frame=frame_idx).values.astype(float)
         s_N_raw = saxs_frames["counts"].isel(frame=frame_idx).values.astype(float)
-        s_I = _regrid_qchi_frame(sq, schi, s_I_raw, q_grid, chi_grid)
-        s_N = _regrid_qchi_frame(sq, schi, np.where(np.isfinite(s_N_raw), s_N_raw, 0.0),
-                                 q_grid, chi_grid)
+        s_I = _regrid_qchi_frame(sq, schi, s_I_raw, q_grid, chi_grid, fill=np.nan)
+        s_N = _regrid_qchi_frame(sq, schi, s_N_raw, q_grid, chi_grid, fill=0.0)
 
     if waxs_frames is not None and frame_idx < waxs_frames.sizes.get("frame", 0):
         wq = np.asarray(waxs_frames["q"].values, dtype=float)
         wchi = np.asarray(waxs_frames["chi"].values, dtype=float)
         w_I_raw = waxs_frames["intensity"].isel(frame=frame_idx).values.astype(float)
         w_N_raw = waxs_frames["counts"].isel(frame=frame_idx).values.astype(float)
-        w_I = _regrid_qchi_frame(wq, wchi, w_I_raw, q_grid, chi_grid)
-        w_N = _regrid_qchi_frame(wq, wchi, np.where(np.isfinite(w_N_raw), w_N_raw, 0.0),
-                                 q_grid, chi_grid)
+        w_I = _regrid_qchi_frame(wq, wchi, w_I_raw, q_grid, chi_grid, fill=np.nan)
+        w_N = _regrid_qchi_frame(wq, wchi, w_N_raw, q_grid, chi_grid, fill=0.0)
 
     # Count-weighted merge (same logic as merge_q_chi_weighted).
     if s_I is not None and w_I is not None:
