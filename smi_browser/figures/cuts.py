@@ -1,4 +1,10 @@
-"""Cross-section (cuts) helpers — projecting cuts to/from Bokeh sources."""
+"""Cross-section (cuts) helpers — projecting cuts to/from Bokeh sources.
+
+The numerical cross-section math (:func:`compute_cross_section`) now lives in
+:mod:`smi_tiled.derived.linecuts`; this module re-exports it via a thin
+wrapper so existing browser code keeps importing from ``smi_browser.figures.cuts``.
+The Bokeh-glyph helpers below stay in the browser because they are UI-specific.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -74,30 +80,13 @@ def source_data_to_cuts(data: dict, x, y) -> list[dict]:
 
 def compute_cross_section(cut: dict, x, y, image,
                           x_label: str = "", y_label: str = ""):
-    """Compute a 1-D cross section through a 2-D image.
+    """See :func:`smi_tiled.derived.linecuts.compute_cross_section`.
 
-    Returns ``(axis, intensity, axis_label)`` or ``None``.
+    Re-exported here so existing browser imports keep resolving while the
+    canonical implementation lives in ``smi-tiled``.
     """
-    if x is None or y is None or image is None:
-        return None
-    c = float(cut["center"])
-    w = float(cut["width"]) or 0.0
-    half = max(w / 2.0, 0.0)
-    if cut["kind"] == "h":
-        mask = (y >= c - half) & (y <= c + half)
-        if not np.any(mask):
-            idx = int(np.argmin(np.abs(y - c)))
-            section = image[idx, :].astype(float)
-        else:
-            section = np.nanmean(image[mask, :], axis=0)
-        return x, section, x_label
-    mask = (x >= c - half) & (x <= c + half)
-    if not np.any(mask):
-        idx = int(np.argmin(np.abs(x - c)))
-        section = image[:, idx].astype(float)
-    else:
-        section = np.nanmean(image[:, mask], axis=1)
-    return y, section, y_label
+    from smi_tiled.derived.linecuts import compute_cross_section as _impl
+    return _impl(cut, x, y, image, x_label=x_label, y_label=y_label)
 
 
 def format_cut_label(i: int, cut: dict) -> str:

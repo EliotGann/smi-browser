@@ -62,6 +62,12 @@ def build_proc_params(
     dyn_aper_q_cutoff: float = 0.0,
     # WAXS calibration overrides (passed as waxs_kwargs / waxs_cal_overrides)
     waxs_kwargs: dict[str, Any] | None = None,
+    # Derived analysis products (forwarded verbatim to smi_tiled).
+    # When supplied, reduce_smi_combined / reduce_smi_gi attach these as
+    # ``result.per_frame_iq[fn:*]``, ``result.line_cuts``, ``result.peak_fits``.
+    virtual_axes: Any = None,        # VirtualAxesConfig | None
+    line_cuts: Any = None,           # Sequence[LineCutSpec] | None
+    peak_fits: Any = None,           # Sequence[PeakDef] | None
     # Defaults (to know whether to send a value or omit it)
     default_n_q: int = 2000,
     default_n_chi: int = 360,
@@ -112,6 +118,12 @@ def build_proc_params(
             params["waxs_beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
         if waxs_kwargs:
             params["waxs_cal_overrides"] = waxs_kwargs
+        if virtual_axes is not None:
+            params["virtual_axes"] = virtual_axes
+        if line_cuts:
+            params["line_cuts"] = list(line_cuts)
+        if peak_fits:
+            params["peak_fits"] = list(peak_fits)
         return "reduce_smi_gi", params
 
     # Transmission / combined
@@ -205,5 +217,13 @@ def build_proc_params(
     # WAXS kwargs (calibration + masking overrides)
     if waxs_kwargs:
         params["waxs_kwargs"] = waxs_kwargs
+
+    # Derived analysis products (smi_tiled.derived stages run after reduction).
+    if virtual_axes is not None:
+        params["virtual_axes"] = virtual_axes
+    if line_cuts:
+        params["line_cuts"] = list(line_cuts)
+    if peak_fits:
+        params["peak_fits"] = list(peak_fits)
 
     return "reduce_smi_combined", params
