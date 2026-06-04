@@ -12089,6 +12089,15 @@ w_filter_summary = pn.pane.Markdown(_filter_summary_text(), margin=(0, 5))
 _proposal_cache: list[nsls2api.ProposalInfo] = []
 _proposal_map: dict[str, nsls2api.ProposalInfo] = {}  # data_session → info
 
+# Whether api.nsls2.bnl.gov is reachable from this host.  Latched in
+# ``_load_cycles()`` based on whether ``fetch_cycles()`` returned a non-empty
+# list; consulted by ``_refresh_proposals()`` so we skip the API path entirely
+# (and go straight to the tiled fallback) when the API is unreachable.  The
+# ``nsls2api`` helpers swallow httpx errors and return ``[]`` rather than
+# raising, so a try/except around ``build_proposal_list`` is *not* sufficient
+# to detect API failure on its own.
+_nsls2_api_reachable: bool = True
+
 w_proposal_cycle = pn.widgets.Select(
     name="Cycle", options=["(loading…)"], value="(loading…)", width=110,
 )
@@ -12135,15 +12144,17 @@ def _load_cycles():
     api_cycles = nsls2api.fetch_cycles()
     api_current = nsls2api.fetch_current_cycle()
 
+    global _nsls2_api_reachable
     if api_cycles:
         # API returns oldest-first; reverse so newest appears first.
         recent = list(reversed(api_cycles))
-        api_ok = True
+        _nsls2_api_reachable = True
     else:
         recent = list(RECENT_CYCLES)
-        api_ok = False
+        _nsls2_api_reachable = False
         log.info(
-            "NSLS-II API unreachable; using hardcoded RECENT_CYCLES (%d cycles)",
+            "NSLS-II API unreachable; using hardcoded RECENT_CYCLES (%d cycles) "
+            "and tiled-based proposal fallback",
             len(recent),
         )
 
@@ -12153,7 +12164,7 @@ def _load_cycles():
     saved_cycle = _load_saved_cycle()
     if saved_cycle and saved_cycle in cycle_opts:
         w_proposal_cycle.value = saved_cycle
-    elif api_ok and api_current and api_current in cycle_opts:
+    elif _nsls2_api_reachable and api_current and api_current in cycle_opts:
         w_proposal_cycle.value = api_current
     elif DEFAULT_CYCLE in cycle_opts:
         w_proposal_cycle.value = DEFAULT_CYCLE
@@ -12187,36 +12198,54 @@ def _refresh_proposals(cycle: str | None = None):
     w_proposal_status.object = "*Loading proposals…*"
 
     cycle_filter = cycle if cycle and cycle != "All cycles" else None
-    api_ok = True
+    api_ok = False
     proposals: list[nsls2api.ProposalInfo] = []
 
-    try:
-        if w_proposal_all.value and cycle_filter:
-            # Fetch ALL beamline proposals for this cycle (beamline-scientist mode)
-            proposals = nsls2api.build_cycle_proposal_list(cycle_filter)
-        else:
-            proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
-    except Exception as exc:
-        log.warning(
-            "NSLS-II API unreachable: %s; falling back to tiled enumeration", exc,
-        )
-        api_ok = False
+    global _nsls2_api_reachable
+
+    if _nsls2_api_reachable:
+        try:
+            if w_proposal_all.value and cycle_filter:
+                # Fetch ALL beamline proposals for this cycle
+                proposals = nsls2api.build_cycle_proposal_list(cycle_filter)
+            else:
+                proposals = nsls2api.build_proposal_list(username, cycle=cycle_filter)
+            api_ok = True
+        except Exception as exc:
+            # build_proposal_list() normally swallows network errors and
+            # returns [] (see nsls2api helpers), so reaching this branch
+            # means something more serious — but treat it the same way.
+            log.warning(
+                "NSLS-II API call raised: %s; switching to tiled fallback",
+                exc,
+            )
+            _nsls2_api_reachable = False
+
+    if not api_ok:
+        # API is known to be down — go straight to the tiled fallback.
         try:
             proposals = nsls2api.proposals_from_tiled(_get_cat(), cycle_filter)
         except Exception as exc2:
-            log.warning("Tiled proposal fallback also failed: %s", exc2)
+            log.warning("Tiled proposal fallback failed: %s", exc2)
+            w_proposal_spinner.value = False
+            w_proposal_spinner.visible = False
+            w_proposal_cycle.disabled = False
+            w_proposal_select.disabled = False
+            w_proposal_project.disabled = False
             w_proposal_select.options = ["(unavailable)"]
             w_proposal_select.value = "(unavailable)"
             w_proposal_status.object = (
-                f"*Both NSLS-II API and tiled enumeration unavailable: {exc}*"
+                f"*Both NSLS-II API and tiled proposal enumeration unavailable: "
+                f"{exc2}*"
             )
             return
-    finally:
-        w_proposal_spinner.value = False
-        w_proposal_spinner.visible = False
-        w_proposal_cycle.disabled = False
-        w_proposal_select.disabled = False
-        w_proposal_project.disabled = False
+
+    # Re-enable widgets and stop spinner now that fetch is done.
+    w_proposal_spinner.value = False
+    w_proposal_spinner.visible = False
+    w_proposal_cycle.disabled = False
+    w_proposal_select.disabled = False
+    w_proposal_project.disabled = False
 
     global _proposal_cache, _proposal_map
     _proposal_cache = proposals
