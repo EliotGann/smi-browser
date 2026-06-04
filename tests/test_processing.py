@@ -200,3 +200,49 @@ class TestBuildProcParams:
             self.UID, "transmission",
             **self._defaults(waxs_kwargs={"sample_distance_mm": 300.0}))
         assert params["waxs_kwargs"] == {"sample_distance_mm": 300.0}
+
+    # -- Derived-analysis kwargs pass-through --
+    #
+    # ``reduce_smi_combined`` accepts all three; ``reduce_smi_gi`` only
+    # accepts ``line_cuts`` (``virtual_axes`` and ``peak_fits`` operate on
+    # ``per_frame_iq``, which GI does not produce).
+
+    def test_transmission_forwards_all_derived_kwargs(self):
+        va = object()  # opaque sentinel — build_proc_params is pass-through
+        cuts = [{"kind": "h", "center": 0.5, "width": 0.05}]
+        peaks = [{"q_min": 0.1, "q_max": 0.2}]
+        fn, params = build_proc_params(
+            self.UID, "transmission",
+            **self._defaults(),
+            virtual_axes=va, line_cuts=cuts, peak_fits=peaks,
+        )
+        assert fn == "reduce_smi_combined"
+        assert params["virtual_axes"] is va
+        assert params["line_cuts"] == cuts
+        assert params["peak_fits"] == peaks
+
+    def test_transmission_omits_unset_derived_kwargs(self):
+        fn, params = build_proc_params(self.UID, "transmission", **self._defaults())
+        assert "virtual_axes" not in params
+        assert "line_cuts" not in params
+        assert "peak_fits" not in params
+
+    def test_gi_forwards_only_line_cuts(self):
+        # virtual_axes / peak_fits would raise TypeError in reduce_smi_gi;
+        # build_proc_params must drop them silently for the GI branch.
+        cuts = [{"kind": "v", "center": 0.0, "width": 0.1, "target": "qxy_qz"}]
+        fn, params = build_proc_params(
+            self.UID, "grazing",
+            **self._defaults(),
+            virtual_axes=object(),
+            line_cuts=cuts,
+            peak_fits=[{"q_min": 0.1, "q_max": 0.2}],
+        )
+        assert fn == "reduce_smi_gi"
+        assert params["line_cuts"] == cuts
+        assert "virtual_axes" not in params
+        assert "peak_fits" not in params
+
+    def test_gi_omits_unset_line_cuts(self):
+        fn, params = build_proc_params(self.UID, "grazing", **self._defaults())
+        assert "line_cuts" not in params

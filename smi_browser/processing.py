@@ -63,8 +63,10 @@ def build_proc_params(
     # WAXS calibration overrides (passed as waxs_kwargs / waxs_cal_overrides)
     waxs_kwargs: dict[str, Any] | None = None,
     # Derived analysis products (forwarded verbatim to smi_tiled).
-    # When supplied, reduce_smi_combined / reduce_smi_gi attach these as
-    # ``result.per_frame_iq[fn:*]``, ``result.line_cuts``, ``result.peak_fits``.
+    # ``virtual_axes`` and ``peak_fits`` operate on ``result.per_frame_iq``
+    # (only produced by ``reduce_smi_combined``) and are silently ignored
+    # for the grazing-incidence branch — ``reduce_smi_gi`` only accepts
+    # ``line_cuts``, which target the qxy/qz frame stack.
     virtual_axes: Any = None,        # VirtualAxesConfig | None
     line_cuts: Any = None,           # Sequence[LineCutSpec] | None
     peak_fits: Any = None,           # Sequence[PeakDef] | None
@@ -118,12 +120,13 @@ def build_proc_params(
             params["waxs_beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
         if waxs_kwargs:
             params["waxs_cal_overrides"] = waxs_kwargs
-        if virtual_axes is not None:
-            params["virtual_axes"] = virtual_axes
+        # ``virtual_axes`` and ``peak_fits`` are intentionally dropped here:
+        # ``reduce_smi_gi`` does not accept them because ``GIReductionResult``
+        # has no ``per_frame_iq`` (GI produces 2-D qxy/qz frames, not 1-D
+        # I(q) per frame).  ``line_cuts`` is the only derived product that
+        # applies to GI (via the ``qxy_qz`` target).
         if line_cuts:
             params["line_cuts"] = list(line_cuts)
-        if peak_fits:
-            params["peak_fits"] = list(peak_fits)
         return "reduce_smi_gi", params
 
     # Transmission / combined

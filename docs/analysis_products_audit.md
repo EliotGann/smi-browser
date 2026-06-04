@@ -401,8 +401,9 @@ Once the above lands in `smi-tiled`, the browser can shed:
      `apply_peak_fits(result, peaks)` driver that packs results into one
      `xr.Dataset`.
 2. **Integrator hooks** — add `virtual_axes`, `line_cuts`, `peak_fits` kwargs
-   to `reduce_smi_combined` / `reduce_smi_gi`; call the three helpers in
-   order at the end of the pipeline.
+   to `reduce_smi_combined`; call the three helpers in order at the end of
+   the pipeline.  `reduce_smi_gi` only accepts `line_cuts` (the other two
+   require `per_frame_iq`, which the GI pipeline does not produce).
 3. **Result extension** — add three optional fields to
    `CombinedReductionResult` / `GIReductionResult`:
    `line_cuts: dict[str, xr.Dataset] | None`,
@@ -439,11 +440,15 @@ browser-side cleanup completed so far:
   re-exported from `smi_tiled.derived.virtual_axes`; the tiled-fetch glue
   (`scalars_to_dataframe`, `scalar_stream_to_frame`) stays.
 - [smi_browser/processing.py](../smi_browser/processing.py) — new optional
-  `virtual_axes` / `line_cuts` / `peak_fits` kwargs on `build_proc_params`,
-  forwarded verbatim into the kwargs dict for both `reduce_smi_combined` and
-  `reduce_smi_gi`.  Default `None` keeps existing callers untouched.
+  `virtual_axes` / `line_cuts` / `peak_fits` kwargs on `build_proc_params`.
+  The transmission/combined branch forwards all three; the grazing-incidence
+  branch forwards only `line_cuts` because `reduce_smi_gi` does not accept
+  the other two — `apply_virtual_axes` and `apply_peak_fits` operate on
+  `result.per_frame_iq`, which `GIReductionResult` does not carry (GI
+  produces 2-D qxy/qz frames, not 1-D I(q) per frame).  Default `None`
+  keeps existing callers untouched.
 
-All 170 tests pass.
+All 174 tests pass.
 
 ### Remaining work
 
