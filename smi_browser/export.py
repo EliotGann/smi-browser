@@ -906,14 +906,17 @@ _PEAK_FIT_PARAMS = ("amplitude", "center", "fwhm", "area")
 
 
 def _peak_png_name(pk: dict, param: str | None, used: set[str]) -> str:
-    """Filename ``peak_<name>_q<qmin>-<qmax>[_<param>]`` with collisions deduped."""
-    def _safe(s) -> str:
-        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+    """Filename ``peak_<slug>[_<param>]`` with collisions deduped.
 
-    name = _safe(pk.get("name") or "peak")
-    qmin = float(pk.get("q_min", 0.0))
-    qmax = float(pk.get("q_max", 0.0))
-    base = f"peak_{name}_q{qmin:.3f}-{qmax:.3f}"
+    ``<slug>`` is :func:`smi_browser.models.peakfit.peak_slug` of the peak —
+    i.e. ``<name>_q<center>`` where ``<center>`` is the drawn band's
+    midpoint to 3 decimals.  The ``peak_`` prefix is kept so existing
+    glob/regex tooling that walks scan dirs (and the matching HDF5 group
+    keys under ``/peakfit/``) continues to work.
+    """
+    from smi_browser.models.peakfit import peak_slug as _slug
+
+    base = f"peak_{_slug(pk)}"
     if param:
         base = f"{base}_{param}"
     stem = base

@@ -6,7 +6,13 @@ import threading
 import numpy as np
 import pytest
 
-from smi_browser.models.peakfit import PeakDef, fit_peak_across_frames
+from smi_browser.models.peakfit import (
+    PeakDef,
+    fit_peak_across_frames,
+    peak_display_label,
+    peak_q_center,
+    peak_slug,
+)
 
 _GAUSS_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
 
@@ -194,3 +200,96 @@ def test_peakdef_key_includes_link_and_bg():
     c = PeakDef("p", 3.0, 7.0, link="linked", bg_factor=3.0)
     assert a.key() != b.key()
     assert a.key() != c.key()
+
+
+# ---------------------------------------------------------------------------
+# Naming helpers — display label / slug / q-centre.
+# ---------------------------------------------------------------------------
+
+def test_peak_q_center_uses_drawn_band_midpoint():
+    """The "centre" we surface in labels/slugs is the *drawn* band midpoint,
+    not the fitted centre — the drawn band is the stable identity."""
+    pk = PeakDef("alpha", q_min=1.10, q_max=1.40)
+    assert peak_q_center(pk) == pytest.approx(1.25)
+
+
+def test_peak_display_label_named():
+    pk = PeakDef("alpha", q_min=1.10, q_max=1.40)
+    assert peak_display_label(pk) == "alpha (q=1.250)"
+
+
+def test_peak_display_label_uses_three_decimals():
+    """Three decimals is enough to discriminate SAXS-resolution peaks
+    without producing visually noisy labels."""
+    pk = PeakDef("p1", q_min=0.05123, q_max=0.05789)
+    label = peak_display_label(pk)
+    assert label == "p1 (q=0.055)"
+
+
+def test_peak_display_label_unnamed_falls_back_to_q_only():
+    pk = PeakDef("", q_min=2.0, q_max=2.4)
+    assert peak_display_label(pk) == "(q=2.200)"
+
+
+def test_peak_display_label_strips_whitespace_in_name():
+    pk = PeakDef("  alpha  ", q_min=1.0, q_max=2.0)
+    assert peak_display_label(pk) == "alpha (q=1.500)"
+
+
+def test_peak_slug_named():
+    pk = PeakDef("alpha", q_min=1.10, q_max=1.40)
+    assert peak_slug(pk) == "alpha_q1.250"
+
+
+def test_peak_slug_unnamed_falls_back_to_q_only():
+    pk = PeakDef("", q_min=2.0, q_max=2.4)
+    assert peak_slug(pk) == "q2.200"
+
+
+def test_peak_slug_sanitises_unsafe_characters():
+    """Names with spaces, slashes, or other unsafe characters collapse to
+    underscores so the slug is safe for filenames AND HDF5 group keys."""
+    pk = PeakDef("first/second peak!", q_min=1.0, q_max=2.0)
+    slug = peak_slug(pk)
+    assert "/" not in slug
+    assert " " not in slug
+    assert "!" not in slug
+    assert slug.endswith("_q1.500")
+    # Body should preserve alphanumerics and collapse runs of unsafe chars.
+    assert slug.startswith("first_second_peak_")
+
+
+def test_peak_slug_keeps_dot_so_q_value_is_legible():
+    pk = PeakDef("p", q_min=1.10, q_max=1.40)
+    slug = peak_slug(pk)
+    assert slug == "p_q1.250"
+    assert "." in slug  # not collapsed into ``q1_250``
+
+
+def test_peak_slug_only_unsafe_name_falls_back_to_q_only():
+    """A name made entirely of unsafe characters slugs down to nothing —
+    fall back to the q-only form rather than emitting a leading underscore."""
+    pk = PeakDef("///", q_min=1.0, q_max=2.0)
+    assert peak_slug(pk) == "q1.500"
+
+
+def test_peak_slug_distinguishes_same_named_peaks_at_different_q():
+    """Two peaks accidentally given the same name are still distinguishable
+    in filenames/H5 because the q-centre is always part of the slug."""
+    a = PeakDef("p", q_min=1.0, q_max=1.2)
+    b = PeakDef("p", q_min=2.0, q_max=2.2)
+    assert peak_slug(a) != peak_slug(b)
+    assert peak_slug(a) == "p_q1.100"
+    assert peak_slug(b) == "p_q2.100"
+
+
+def test_naming_helpers_accept_dict_shaped_peaks():
+    """The export layer passes dict-shaped peaks (one per cached entry);
+    the same helpers must work without an intermediate PeakDef construction."""
+    pk = {"name": "alpha", "q_min": 1.10, "q_max": 1.40}
+    assert peak_q_center(pk) == pytest.approx(1.25)
+    assert peak_display_label(pk) == "alpha (q=1.250)"
+    assert peak_slug(pk) == "alpha_q1.250"
+    # Missing name and missing q values both degrade gracefully.
+    assert peak_display_label({"q_min": 1.0, "q_max": 2.0}) == "(q=1.500)"
+    assert peak_slug({}) == "q0.000"

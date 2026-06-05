@@ -5303,7 +5303,13 @@ w_coll_compare_plot = _coll_ns.compare_plot
 
 from smi_browser.figures.peakmap import (
     build_iq_heatmap, build_peak_map, band_source_data)
-from smi_browser.models.peakfit import PeakDef, FIT_PARAMS, fit_peak_across_frames
+from smi_browser.models.peakfit import (
+    FIT_PARAMS,
+    PeakDef,
+    fit_peak_across_frames,
+    peak_display_label,
+    peak_slug,
+)
 
 _PEAK_NONE_Y = "— none (1D) —"
 _PEAK_FRAME_AXIS = "frame"
@@ -5320,11 +5326,22 @@ _peak_fit_cancel = threading.Event()
 _peak_fit_state: dict[str, Any] = {"doc": None}
 _peak_guard = {"active": False}
 
-_PEAK_TABLE_COLS = ["name", "q_min", "q_max", "model", "baseline", "link", "bg"]
+_PEAK_TABLE_COLS = ["label", "name", "q_min", "q_max", "model", "baseline", "link", "bg"]
+#: Columns that round-trip into ``peak_defs.json``.  ``label`` is derived
+#: from ``name``/``q_min``/``q_max`` (see :func:`_recompute_peak_labels`) and
+#: is recomputed on every table edit, so we don't persist it.
+_PEAK_TABLE_PERSIST_COLS = [c for c in _PEAK_TABLE_COLS if c != "label"]
 w_peak_table = pn.widgets.Tabulator(
     value=pd.DataFrame(columns=_PEAK_TABLE_COLS),
     show_index=False, sizing_mode="stretch_width", height=180,
-    configuration={"layout": "fitColumns", "rowHeight": 24},
+    configuration={
+        "layout": "fitColumns", "rowHeight": 24,
+        # ``label`` is derived (read-only); editing it has no effect since
+        # _recompute_peak_labels overwrites it on the next callback.  Use
+        # Tabulator's column-level ``editable: false`` since Panel/Bokeh
+        # rejects ``editors={"label": False}`` (expects a CellEditor).
+        "columns": [{"field": "label", "editable": False}],
+    },
     editors={
         "name": {"type": "input"},
         "q_min": {"type": "number", "step": 0.01},
@@ -5390,13 +5407,64 @@ def _peak_defs_from_table() -> list[PeakDef]:
     return peaks
 
 
+def _row_to_label(row) -> str:
+    """Compute the derived display label for one table row.
+
+    Returns ``""`` when the row's q-range is unparseable so the cell is
+    visibly empty rather than showing a misleading ``(q=0.000)``.
+    """
+    try:
+        q_min = float(row.get("q_min"))
+        q_max = float(row.get("q_max"))
+    except (TypeError, ValueError):
+        return ""
+    if not (np.isfinite(q_min) and np.isfinite(q_max)) or q_max <= q_min:
+        return ""
+    return peak_display_label({
+        "name": row.get("name") or "",
+        "q_min": q_min,
+        "q_max": q_max,
+    })
+
+
+def _recompute_peak_labels() -> None:
+    """Refresh the derived ``label`` column from the current name/q-range.
+
+    Called from :func:`_on_peak_table_change` so any edit (including
+    box-select and ``+ Peak``) immediately produces the same
+    ``name (q=1.234)`` form used by exports and HDF5 keys.  Rewrites the
+    table value once if the labels actually changed, with the recursion
+    guard active so the watcher doesn't re-fire.
+    """
+    df = w_peak_table.value
+    if df is None or df.empty:
+        return
+    new_labels = [_row_to_label(row) for _, row in df.iterrows()]
+    current = list(df["label"]) if "label" in df.columns else [None] * len(df)
+    if list(map(str, current)) == new_labels:
+        return
+    df = df.copy()
+    df["label"] = new_labels
+    # Keep the canonical column order so the read-only label stays leftmost.
+    df = df[[c for c in _PEAK_TABLE_COLS if c in df.columns]]
+    _peak_guard["active"] = True
+    try:
+        w_peak_table.value = df
+    finally:
+        _peak_guard["active"] = False
+
+
 def _save_peak_defs():
-    """Persist the current peak table to the global cross-scan list."""
+    """Persist the current peak table to the global cross-scan list.
+
+    The derived ``label`` column is excluded — it's recomputed from the
+    other columns on load (see :func:`_load_peak_defs`).
+    """
     df = w_peak_table.value
     if df is None or df.empty:
         write_peak_defs([])
         return
-    cols = [c for c in _PEAK_TABLE_COLS if c in df.columns]
+    cols = [c for c in _PEAK_TABLE_PERSIST_COLS if c in df.columns]
     try:
         write_peak_defs(df[cols].to_dict(orient="records"))
     except Exception:
@@ -5404,7 +5472,11 @@ def _save_peak_defs():
 
 
 def _load_peak_defs():
-    """Seed the peak table from the persisted global list (startup)."""
+    """Seed the peak table from the persisted global list (startup).
+
+    Stale ``label`` values from older saves are dropped — the column is
+    re-derived as part of the initial display assignment.
+    """
     defs = read_peak_defs()
     if not defs:
         return
@@ -5412,7 +5484,9 @@ def _load_peak_defs():
     for d in defs:
         if not isinstance(d, dict):
             continue
-        rows.append({c: d.get(c) for c in _PEAK_TABLE_COLS})
+        row = {c: d.get(c) for c in _PEAK_TABLE_PERSIST_COLS}
+        row["label"] = _row_to_label(row)
+        rows.append(row)
     if not rows:
         return
     _peak_guard["active"] = True
@@ -5607,7 +5681,7 @@ def _default_peak_range() -> tuple[float, float]:
 def _append_peak_row(q_min: float, q_max: float):
     df = w_peak_table.value
     df = df.copy() if df is not None else pd.DataFrame(columns=_PEAK_TABLE_COLS)
-    new_row = {
+    base = {
         "name": f"p{len(df) + 1}",
         "q_min": round(float(q_min), 4),
         "q_max": round(float(q_max), 4),
@@ -5616,6 +5690,8 @@ def _append_peak_row(q_min: float, q_max: float):
         "link": "linked",
         "bg": 2.0,
     }
+    base["label"] = _row_to_label(base)
+    new_row = {c: base.get(c) for c in _PEAK_TABLE_COLS}
     _peak_guard["active"] = True
     try:
         w_peak_table.value = pd.concat(
@@ -5664,6 +5740,9 @@ def _on_heatmap_select(event):
 def _on_peak_table_change(event=None):
     if _peak_guard["active"]:
         return
+    # Refresh the derived ``label`` column first so the heatmap legend and
+    # any downstream consumers see the updated identity immediately.
+    _recompute_peak_labels()
     _update_heatmap_bands()
     _update_z_peak_options()
     _save_peak_defs()

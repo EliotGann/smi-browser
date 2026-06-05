@@ -209,6 +209,9 @@ def test_h5_peakfit_section(tmp_path):
         assert "peakfit" in f
         sub = list(f["peakfit"].keys())
         assert len(sub) == 1
+        # Group key uses the slug-prefixed form so an external script can walk
+        # /peakfit/ entries without consulting attrs.
+        assert sub[0] == "peak_p1_q2.275"
         g = f["peakfit"][sub[0]]
         assert "area" in g and "success" in g
         assert g.attrs["name"] == "p1"
@@ -232,13 +235,17 @@ def test_h5_sections_none_writes_all(tmp_path):
 # --- Peak-result PNGs ------------------------------------------------------
 
 def test_save_peak_pngs_one_per_peak_with_qrange(tmp_path):
+    """PNG names use the slug ``<name>_q<center>``: peak identity is fully
+    captured in one filename component, and two peaks with the same name
+    but different q-centres still produce distinct files."""
     peaks = [_peak_fit("p1", 2.1, 2.45), _peak_fit("p2", 3.0, 3.4)]
     paths = _save_peak_pngs(peaks, axis=None, param="area",
                             scan_dir=tmp_path, prefix="")
     names = sorted(p.name for p in paths)
+    # q-centre = (q_min + q_max) / 2, formatted to 3 decimals.
     assert names == [
-        "peak_p1_q2.100-2.450_area.png",
-        "peak_p2_q3.000-3.400_area.png",
+        "peak_p1_q2.275_area.png",
+        "peak_p2_q3.200_area.png",
     ]
     assert all((tmp_path / n).stat().st_size > 0 for n in names)
 
@@ -266,7 +273,7 @@ def test_export_scan_peaks_and_sections(tmp_path):
         subdir_template="", basename_template="",
     )
     assert "result.h5" in files
-    assert any(f.startswith("peak_p1_q2.100-2.450_amplitude") for f in files)
+    assert any(f.startswith("peak_p1_q2.275_amplitude") for f in files)
     with h5py.File(out / "result.h5", "r") as f:
         assert "peakfit" in f and "metadata" in f
 
