@@ -59,6 +59,7 @@ def thumbnail_figure(arr: np.ndarray, title: str, mask_visible: bool = False):
         tools="pan,wheel_zoom,box_zoom,reset,save",
         active_scroll="wheel_zoom",
         match_aspect=True,
+        aspect_ratio=(w / h) if h else 1.0,
         sizing_mode="stretch_both",
     )
     p.image(image="image", x="x", y="y", dw="dw", dh="dh",
@@ -154,6 +155,10 @@ def update_image_data(
         fig.x_range.end = w
         fig.y_range.start = 0
         fig.y_range.end = h
+        # Keep the plot frame's aspect locked to the data so pixels stay square
+        # regardless of the container's shape.
+        if h:
+            fig.aspect_ratio = w / h
 
     finite = arr[np.isfinite(arr) & (arr > 0)]
     if finite.size:

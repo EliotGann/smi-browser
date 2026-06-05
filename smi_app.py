@@ -13667,59 +13667,73 @@ w_detail_tabs = pn.Tabs(
     ),
     (
         "Explore",
-        pn.Column(
-            pn.Row(w_image_status, w_image_spinner),
-            pn.Row(w_image_field, w_image_slider, w_image_frame_input,
-                   sizing_mode="stretch_width"),
-            # Linked plot of the scalar table: 1D line plot or 2D map.  Tapping
-            # a 2D point jumps the image below to that frame.
-            pn.Tabs(
-                ("1D", pn.Column(
-                    pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
-                    w_explore_plot_container,
+        # Side-by-side layout: condensed controls + 1D/2D plots live in a
+        # fixed-width, independently-scrollable LEFT column so a tall
+        # color-scale/histogram never pushes the image down; the image fills
+        # the entire RIGHT side (full viewport height + remaining width),
+        # which is the binding constraint for the ~square Pilatus frames.
+        pn.Row(
+            pn.Column(
+                pn.Row(w_image_status, w_image_spinner),
+                pn.Row(w_image_field, w_image_frame_input,
+                       sizing_mode="stretch_width"),
+                w_image_slider,
+                # Linked plot of the scalar table: 1D line plot or 2D map.
+                # Tapping a 2D point jumps the image to that frame.
+                pn.Tabs(
+                    ("1D", pn.Column(
+                        pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
+                        w_explore_plot_container,
+                        sizing_mode="stretch_width",
+                    )),
+                    ("2D", pn.Column(
+                        pn.Row(w_explore_2d_x, w_explore_2d_y, w_explore_2d_z,
+                               w_explore_2d_cmap, w_explore_2d_log, w_explore_2d_aspect,
+                               sizing_mode="stretch_width"),
+                        w_explore_2d_status,
+                        w_explore_2d_plot,
+                        sizing_mode="stretch_width",
+                    )),
                     sizing_mode="stretch_width",
-                )),
-                ("2D", pn.Column(
-                    pn.Row(w_explore_2d_x, w_explore_2d_y, w_explore_2d_z,
-                           w_explore_2d_cmap, w_explore_2d_log, w_explore_2d_aspect,
-                           sizing_mode="stretch_width"),
-                    w_explore_2d_status,
-                    w_explore_2d_plot,
-                    sizing_mode="stretch_width",
-                )),
-                sizing_mode="stretch_width",
-            ),
-            # Plotting tools card — color scale, mask overlay, alignment.
-            pn.Card(
+                ),
+                # Plotting tools card — color scale, mask overlay, alignment.
                 pn.Card(
-                    pn.Row(w_cs_cmap, w_cs_log, w_cs_lock),
-                    w_cs_range,
-                    pn.Row(w_cs_min, w_cs_max),
-                    w_cs_hist,
-                    title="🎨 Color scale",
+                    pn.Card(
+                        pn.Row(w_cs_cmap, w_cs_log, w_cs_lock),
+                        w_cs_range,
+                        pn.Row(w_cs_min, w_cs_max),
+                        w_cs_hist,
+                        title="🎨 Color scale",
+                        collapsed=False, sizing_mode="stretch_width",
+                    ),
+                    pn.Card(
+                        pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit,
+                               w_btn_mask_reload),
+                        pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
+                        w_mask_status,
+                        title="🛡 Mask overlay",
+                        collapsed=True, sizing_mode="stretch_width",
+                    ),
+                    pn.Card(
+                        pn.Row(w_align_enable, w_align_width, w_btn_align_clear),
+                        w_align_stats,
+                        w_align_profile,
+                        title="📐 Alignment / line profile",
+                        collapsed=True, sizing_mode="stretch_width",
+                    ),
+                    title="🛠 Plotting tools",
                     collapsed=False, sizing_mode="stretch_width",
                 ),
-                pn.Card(
-                    pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit,
-                           w_btn_mask_reload),
-                    pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
-                    w_mask_status,
-                    title="🛡 Mask overlay",
-                    collapsed=True, sizing_mode="stretch_width",
-                ),
-                pn.Card(
-                    pn.Row(w_align_enable, w_align_width, w_btn_align_clear),
-                    w_align_stats,
-                    w_align_profile,
-                    title="📐 Alignment / line profile",
-                    collapsed=True, sizing_mode="stretch_width",
-                ),
-                title="🛠 Plotting tools",
-                collapsed=False, sizing_mode="stretch_width",
+                width=460,
+                scroll=True,
+                sizing_mode="stretch_height",
             ),
-            # Image takes the full remaining width / height below
-            w_image_multi_hint,
-            w_image_container,
+            # Image takes the full remaining width / height on the right.
+            pn.Column(
+                w_image_multi_hint,
+                w_image_container,
+                sizing_mode="stretch_both",
+            ),
             sizing_mode="stretch_both",
         ),
     ),
