@@ -5303,6 +5303,7 @@ w_coll_compare_plot = _coll_ns.compare_plot
 
 from smi_browser.figures.peakmap import (
     build_iq_heatmap, build_peak_map, band_source_data)
+from smi_browser.figures import peakmap_composite as _peakcomp
 from smi_browser.models.peakfit import (
     FIT_PARAMS,
     PeakDef,
@@ -5375,6 +5376,75 @@ w_peak_map_aspect = pn.widgets.Select(name="Aspect", options=["fill", "equal"],
 w_peak_heatmap = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=340)
 w_peak_map_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=470)
 w_peak_map_status = pn.pane.Markdown("")
+
+
+# ---------------------------------------------------------------------------
+# Composite (RGB-additive) Peak Map view — widgets and state.
+# ---------------------------------------------------------------------------
+
+#: View mode for the Peak Map output area.  ``"single"`` shows the legacy
+#: per-peak parameter map; ``"composite"`` renders the additive RGB overlay
+#: (matches the reference ``make_ezra_overlay.py`` script's behaviour).
+_PEAK_VIEW_SINGLE = "Single peak"
+_PEAK_VIEW_COMPOSITE = "Composite"
+
+w_peak_view_mode = pn.widgets.RadioButtonGroup(
+    name="View",
+    options=[_PEAK_VIEW_SINGLE, _PEAK_VIEW_COMPOSITE],
+    value=_PEAK_VIEW_COMPOSITE,
+    button_type="default", width=240,
+)
+
+# Composite controls
+_COMP_CHANNEL_COLS = ["include", "label", "color", "gain", "log",
+                      "kind", "source"]
+#: Visible columns; ``kind``/``source`` stay in the DataFrame so the renderer
+#: can route values, but Tabulator ``hidden_columns`` keeps them out of view.
+_COMP_HIDDEN_COLS = ["kind", "source"]
+
+w_peak_comp_table = pn.widgets.Tabulator(
+    value=pd.DataFrame(columns=_COMP_CHANNEL_COLS),
+    show_index=False, sizing_mode="stretch_width", height=220,
+    hidden_columns=_COMP_HIDDEN_COLS,
+    configuration={
+        "layout": "fitColumns", "rowHeight": 26,
+        # ``label`` is derived from the source peak; mark it non-editable at
+        # the Tabulator column level (Bokeh rejects ``editors[...]=False``).
+        "columns": [{"field": "label", "editable": False}],
+    },
+    editors={
+        "include": {"type": "tickCross", "tristate": False},
+        "color": {"type": "input"},  # hex; rendered with a swatch formatter below
+        "gain": {"type": "number", "step": 0.1, "min": 0.0},
+        "log": {"type": "tickCross", "tristate": False},
+    },
+    formatters={
+        "include": {"type": "tickCross", "crossElement": False},
+        "log": {"type": "tickCross", "crossElement": False},
+        "color": {"type": "color"},  # show the hex value as a swatch
+    },
+)
+
+w_peak_comp_pct_lo = pn.widgets.FloatInput(
+    name="pct lo", value=2.0, start=0.0, end=49.0, step=0.5, width=90)
+w_peak_comp_pct_hi = pn.widgets.FloatInput(
+    name="pct hi", value=99.0, start=51.0, end=100.0, step=0.5, width=90)
+w_peak_comp_add_primary = pn.widgets.Select(
+    name="Add primary channel", options=[], width=240)
+w_peak_comp_btn_add_primary = pn.widgets.Button(
+    name="+ Primary", button_type="default", width=90)
+w_peak_comp_btn_remove_primary = pn.widgets.Button(
+    name="− Primary", button_type="default", width=90)
+
+w_peak_comp_plot = pn.pane.Bokeh(
+    object=None, sizing_mode="stretch_width", height=470)
+w_peak_comp_status = pn.pane.Markdown("")
+
+#: Tab-level state for the composite view.
+_composite_state: dict[str, Any] = {
+    "uid": None,           # last UID we built channel rows for
+    "guard": False,        # re-entrancy flag for table writes
+}
 
 
 def _peak_defs_from_table() -> list[PeakDef]:
@@ -5666,6 +5736,13 @@ def _peakmap_load(uid: "str | None", force: bool = False):
     _refresh_heatmap()
     _update_z_peak_options()
     _update_peak_map()
+    # Composite channels are per-UID (peak fits live in the per-scan cache),
+    # so rebuild the channel table whenever we switch scans, then render if
+    # composite mode is active.
+    _composite_state["uid"] = uid
+    _refresh_composite_table()
+    if w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE:
+        _render_composite()
     _mem_report("peakmap:load")
 
 
@@ -5746,6 +5823,11 @@ def _on_peak_table_change(event=None):
     _update_heatmap_bands()
     _update_z_peak_options()
     _save_peak_defs()
+    # Composite channels mirror the peak set — rebuild while preserving
+    # any per-channel choices the user already made.
+    _refresh_composite_table()
+    if w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE:
+        _render_composite()
 
 
 def _selected_peak_def() -> "PeakDef | None":
@@ -5796,6 +5878,350 @@ def _update_peak_map(event=None):
     w_peak_map_plot.object = fig
     n_ok = int(np.isfinite(z).sum())
     w_peak_map_status.object = f"{status}  ·  {n_ok}/{z.size} frames fitted"
+
+
+# ---------------------------------------------------------------------------
+# Composite (RGB-additive) view — helpers and rendering
+# ---------------------------------------------------------------------------
+
+def _primary_axis_columns() -> list[str]:
+    """Numeric per-frame columns available as composite primary channels.
+
+    Mirrors :func:`_axis_values`: prefer the primary scalars table (same
+    source as the 2-D explore map), fall back to the cached scalars dict.
+    """
+    iq = _peakmap_cache.get("iq")
+    if iq is None:
+        return []
+    n = iq.shape[0]
+    cols: list[str] = []
+    df = w_primary_table.value
+    if df is not None and not df.empty:
+        for c in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                continue
+            try:
+                if int(df[c].shape[0]) == n:
+                    cols.append(str(c))
+            except Exception:
+                continue
+    for k, v in (_peakmap_cache.get("scalars") or {}).items():
+        if k in cols:
+            continue
+        try:
+            if np.asarray(v).shape[0] == n:
+                cols.append(str(k))
+        except Exception:
+            continue
+    return cols
+
+
+def _composite_default_rows_for_peaks(peaks: list[PeakDef]) -> pd.DataFrame:
+    """Build a fresh channel-table DataFrame from the current peak list.
+
+    Default colour cycle from :data:`peakmap_composite.DEFAULT_COLOR_CYCLE`.
+    All peaks default to ``include=True``, ``gain=1.0``, ``log=False``.
+    """
+    rows = []
+    for i, pk in enumerate(peaks):
+        rows.append({
+            "include": True,
+            "label": peak_display_label(pk),
+            "color": _peakcomp.color_to_hex(_peakcomp.default_color_for(i)),
+            "gain": 1.0,
+            "log": False,
+            "kind": "peak",
+            "source": peak_slug(pk),
+        })
+    return pd.DataFrame(rows, columns=_COMP_CHANNEL_COLS)
+
+
+def _composite_merge_rows(peaks: list[PeakDef]) -> pd.DataFrame:
+    """Rebuild the channel table when peaks change, preserving user choices.
+
+    For every peak the user already configured (matched by slug) we keep
+    their ``include`` / ``color`` / ``gain`` / ``log`` settings.  Removed
+    peaks drop out automatically.  Primary-channel rows (``kind='primary'``)
+    are passed through unchanged.
+    """
+    cur = w_peak_comp_table.value
+    by_source: dict[str, dict] = {}
+    primary_rows: list[dict] = []
+    if cur is not None and not cur.empty:
+        for _, row in cur.iterrows():
+            kind = str(row.get("kind") or "peak")
+            if kind == "primary":
+                primary_rows.append({c: row.get(c) for c in _COMP_CHANNEL_COLS})
+                continue
+            src = str(row.get("source") or "")
+            if src:
+                by_source[src] = {c: row.get(c) for c in _COMP_CHANNEL_COLS}
+
+    rows: list[dict] = []
+    cycle_idx = 0
+    for pk in peaks:
+        slug = peak_slug(pk)
+        prev = by_source.get(slug)
+        if prev is not None:
+            prev["label"] = peak_display_label(pk)  # refresh label on q change
+            prev["kind"] = "peak"
+            prev["source"] = slug
+            rows.append(prev)
+        else:
+            rows.append({
+                "include": True,
+                "label": peak_display_label(pk),
+                "color": _peakcomp.color_to_hex(
+                    _peakcomp.default_color_for(cycle_idx)),
+                "gain": 1.0,
+                "log": False,
+                "kind": "peak",
+                "source": slug,
+            })
+            cycle_idx += 1
+    rows.extend(primary_rows)
+    return pd.DataFrame(rows, columns=_COMP_CHANNEL_COLS)
+
+
+def _composite_primary_values(col: str) -> "np.ndarray | None":
+    """Return per-frame values for a primary-channel column."""
+    return _axis_values(col)
+
+
+def _composite_peak_values(slug: str) -> "np.ndarray | None":
+    """Return the per-frame ``area`` map for the peak with ``slug``."""
+    uid = _peakmap_cache.get("uid")
+    if uid is None:
+        return None
+    for pk in _peak_defs_from_table():
+        if peak_slug(pk) != slug:
+            continue
+        res = _peak_fit_cache.get((uid, pk.key()))
+        if res is None:
+            return None
+        z = res.get("area")
+        return None if z is None else np.asarray(z, dtype=float)
+    return None
+
+
+def _composite_specs() -> list[dict]:
+    """Translate the current channel table → channel-spec dicts.
+
+    Excluded rows (``include=False``) and rows whose data isn't available
+    yet (peak not fitted, primary column missing) are dropped.
+    """
+    df = w_peak_comp_table.value
+    if df is None or df.empty:
+        return []
+    specs: list[dict] = []
+    for _, row in df.iterrows():
+        if not bool(row.get("include")):
+            continue
+        kind = str(row.get("kind") or "peak")
+        src = str(row.get("source") or "")
+        if kind == "peak":
+            vals = _composite_peak_values(src)
+            cid = src or str(row.get("label") or "peak")
+        else:
+            col = src.split(":", 1)[1] if src.startswith("primary:") else src
+            vals = _composite_primary_values(col)
+            cid = src or f"primary:{col}"
+        if vals is None or vals.size == 0:
+            continue
+        try:
+            gain = float(row.get("gain") or 1.0)
+        except Exception:
+            gain = 1.0
+        specs.append({
+            "id": cid,
+            "label": str(row.get("label") or cid),
+            "values": vals,
+            "color": str(row.get("color") or "#ffffff"),
+            "gain": gain,
+            "log": bool(row.get("log")),
+            "kind": kind,
+        })
+    return specs
+
+
+def _refresh_composite_primary_options():
+    """Rebuild the "+ Primary" Select options from the available scalars."""
+    used_primaries = set()
+    df = w_peak_comp_table.value
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            if str(row.get("kind") or "") == "primary":
+                src = str(row.get("source") or "")
+                if src.startswith("primary:"):
+                    used_primaries.add(src.split(":", 1)[1])
+    available = [c for c in _primary_axis_columns() if c not in used_primaries]
+    cur = w_peak_comp_add_primary.value
+    w_peak_comp_add_primary.options = available
+    if cur in available:
+        w_peak_comp_add_primary.value = cur
+    elif available:
+        w_peak_comp_add_primary.value = available[0]
+
+
+def _refresh_composite_table(peaks: list[PeakDef] | None = None):
+    """Rebuild the composite channel table after peaks change or UID switch.
+
+    Guarded against re-entrancy so the table watcher doesn't loop.
+    """
+    if _composite_state.get("guard"):
+        return
+    if peaks is None:
+        peaks = _peak_defs_from_table()
+    new_df = _composite_merge_rows(peaks)
+    _composite_state["guard"] = True
+    try:
+        w_peak_comp_table.value = new_df
+    finally:
+        _composite_state["guard"] = False
+    _refresh_composite_primary_options()
+
+
+def _render_composite(event=None):
+    """Compose the active channels into an RGB image; render to Bokeh pane."""
+    if w_peak_view_mode.value != _PEAK_VIEW_COMPOSITE:
+        return
+    uid = _peakmap_cache.get("uid")
+    iq = _peakmap_cache.get("iq")
+    if uid is None or iq is None:
+        w_peak_comp_plot.object = None
+        w_peak_comp_status.object = "*No scan loaded.*"
+        return
+
+    specs = _composite_specs()
+    if not specs:
+        w_peak_comp_plot.object = None
+        w_peak_comp_status.object = (
+            "*No active channels — tick at least one peak (after fitting) "
+            "or add a primary channel.*")
+        return
+
+    x_name = w_peak_map_x.value
+    y_name = w_peak_map_y.value
+    x = _axis_values(x_name)
+    if x is None:
+        w_peak_comp_status.object = "*Chosen X axis is unavailable.*"
+        w_peak_comp_plot.object = None
+        return
+    y = None if y_name == _PEAK_NONE_Y else _axis_values(y_name)
+
+    try:
+        pct_lo = float(w_peak_comp_pct_lo.value)
+        pct_hi = float(w_peak_comp_pct_hi.value)
+    except Exception:
+        pct_lo, pct_hi = _peakcomp.DEFAULT_PCT_LO, _peakcomp.DEFAULT_PCT_HI
+    if not (0.0 <= pct_lo < pct_hi <= 100.0):
+        pct_lo, pct_hi = _peakcomp.DEFAULT_PCT_LO, _peakcomp.DEFAULT_PCT_HI
+
+    try:
+        comp = _peakcomp.compose_rgb(
+            specs, x, y, pct_lo=pct_lo, pct_hi=pct_hi)
+    except Exception as exc:
+        log.exception("composite: compose_rgb failed")
+        w_peak_comp_status.object = f"**Composite error:** `{exc}`"
+        w_peak_comp_plot.object = None
+        return
+
+    try:
+        fig = _peakcomp.build_bokeh_figure(
+            comp, specs,
+            x_label=x_name, y_label=(y_name if y is not None else ""),
+            title=f"Composite — {uid[:12]}…",
+        )
+    except Exception as exc:
+        log.exception("composite: build_bokeh_figure failed")
+        w_peak_comp_status.object = f"**Composite render error:** `{exc}`"
+        w_peak_comp_plot.object = None
+        return
+
+    w_peak_comp_plot.object = fig
+    n_ch = len(specs)
+    skipped = len(comp.skipped)
+    grid_note = "2-D grid" if comp.gridded else "1-D fallback"
+    msg = f"{n_ch} channel(s) · {grid_note} · pct {pct_lo:.1f}–{pct_hi:.1f}"
+    if skipped:
+        msg += f"  ·  *{skipped} channel(s) excluded (length mismatch)*"
+    w_peak_comp_status.object = msg
+
+
+def _on_composite_view_mode(event=None):
+    """Show single-peak or composite controls based on the toggle."""
+    is_comp = w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE
+    _peak_single_box.visible = not is_comp
+    _peak_composite_box.visible = is_comp
+    if is_comp:
+        _refresh_composite_table()
+        _render_composite()
+    else:
+        _update_peak_map()
+
+
+def _on_composite_table_change(event=None):
+    if _composite_state.get("guard"):
+        return
+    _refresh_composite_primary_options()
+    _render_composite()
+
+
+def _on_composite_add_primary(event=None):
+    col = w_peak_comp_add_primary.value
+    if not col:
+        return
+    df = w_peak_comp_table.value
+    df = df.copy() if df is not None else pd.DataFrame(columns=_COMP_CHANNEL_COLS)
+    src = f"primary:{col}"
+    if (df["source"] == src).any():
+        return
+    next_idx = len(df)
+    new_row = {
+        "include": True,
+        "label": col,
+        "color": _peakcomp.color_to_hex(_peakcomp.default_color_for(next_idx)),
+        "gain": 1.0,
+        "log": False,
+        "kind": "primary",
+        "source": src,
+    }
+    _composite_state["guard"] = True
+    try:
+        w_peak_comp_table.value = pd.concat(
+            [df, pd.DataFrame([new_row])], ignore_index=True)
+    finally:
+        _composite_state["guard"] = False
+    _refresh_composite_primary_options()
+    _render_composite()
+
+
+def _on_composite_remove_primary(event=None):
+    df = w_peak_comp_table.value
+    if df is None or df.empty:
+        return
+    sel = list(w_peak_comp_table.selection or [])
+    if sel:
+        keep_mask = [i not in sel or str(df.iloc[i].get("kind") or "") != "primary"
+                     for i in range(len(df))]
+    else:
+        # No selection: drop the last primary row.
+        last_primary = None
+        for i in range(len(df) - 1, -1, -1):
+            if str(df.iloc[i].get("kind") or "") == "primary":
+                last_primary = i
+                break
+        if last_primary is None:
+            return
+        keep_mask = [i != last_primary for i in range(len(df))]
+    _composite_state["guard"] = True
+    try:
+        w_peak_comp_table.value = df[keep_mask].reset_index(drop=True)
+        w_peak_comp_table.selection = []
+    finally:
+        _composite_state["guard"] = False
+    _refresh_composite_primary_options()
+    _render_composite()
 
 
 def _on_peak_cancel(event=None):
@@ -5890,6 +6316,9 @@ def _on_peak_fit(event=None):
             w_btn_peak_cancel.disabled = True
             _update_z_peak_options()
             _update_peak_map()
+            # New fits → composite channels now have data; refresh + render.
+            if w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE:
+                _render_composite()
             if cancelled:
                 w_peak_status.object = "*Fit cancelled.*"
             else:
@@ -5913,9 +6342,51 @@ for _w in (w_peak_z_peak, w_peak_z_param, w_peak_map_x, w_peak_map_y,
            w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect):
     _w.param.watch(_update_peak_map, "value")
 
+# Composite-mode wiring: table edits, percentile inputs, primary add/remove,
+# and view-mode toggle.  Axis selectors are shared with single-peak mode (the
+# composite renderer reads them too) so we additionally re-render on x/y
+# changes when composite mode is active.
+w_peak_view_mode.param.watch(_on_composite_view_mode, "value")
+w_peak_comp_table.param.watch(_on_composite_table_change, "value")
+w_peak_comp_btn_add_primary.on_click(_on_composite_add_primary)
+w_peak_comp_btn_remove_primary.on_click(_on_composite_remove_primary)
+for _w in (w_peak_comp_pct_lo, w_peak_comp_pct_hi):
+    _w.param.watch(lambda _e: _render_composite(), "value")
+for _w in (w_peak_map_x, w_peak_map_y):
+    _w.param.watch(lambda _e: _render_composite(), "value")
+
 # Restore the persisted global peak list (drawn peaks survive a restart).
 _load_peak_defs()
 _update_z_peak_options()
+_refresh_composite_table()  # populate with restored peaks (no UID yet → no render)
+
+# Two layered control boxes: only one is visible at a time, driven by the
+# view-mode toggle.  This keeps the peak table + heatmap + axis selectors
+# shared between modes while swapping the output area underneath.
+_peak_single_box = pn.Column(
+    pn.Row(w_peak_z_peak, w_peak_z_param),
+    pn.Row(w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect),
+    w_peak_map_status,
+    w_peak_map_plot,
+    sizing_mode="stretch_width",
+    visible=(w_peak_view_mode.value == _PEAK_VIEW_SINGLE),
+)
+_peak_composite_box = pn.Column(
+    pn.pane.Markdown(
+        "**Composite** — additive RGB overlay of every ticked channel "
+        "(peaks default to their fitted *area* map; primary scalars can "
+        "be added below).  Each channel is independently percentile-clipped, "
+        "then multiplied by its colour and summed on a black background."),
+    w_peak_comp_table,
+    pn.Row(w_peak_comp_add_primary,
+           w_peak_comp_btn_add_primary,
+           w_peak_comp_btn_remove_primary,
+           w_peak_comp_pct_lo, w_peak_comp_pct_hi),
+    w_peak_comp_status,
+    w_peak_comp_plot,
+    sizing_mode="stretch_width",
+    visible=(w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE),
+)
 
 peak_map_panel = pn.Column(
     pn.pane.Markdown(
@@ -5926,10 +6397,9 @@ peak_map_panel = pn.Column(
     w_peak_table,
     w_peak_status,
     w_peak_heatmap,
-    pn.Row(w_peak_z_peak, w_peak_z_param, w_peak_map_x, w_peak_map_y),
-    pn.Row(w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect),
-    w_peak_map_status,
-    w_peak_map_plot,
+    pn.Row(w_peak_view_mode, w_peak_map_x, w_peak_map_y),
+    _peak_single_box,
+    _peak_composite_box,
     sizing_mode="stretch_width",
 )
 
