@@ -235,6 +235,87 @@ def test_clear_peakfit(isolated_cache_dir):
     assert c.read_peakfit_index() == []
 
 
+def _make_peak_fits_dataset():
+    """Synthesize an apply_peak_fits-shaped xr.Dataset (peak, frame)."""
+    import xarray as xr
+
+    n_peaks, n_frames = 2, 5
+    return xr.Dataset(
+        {
+            "amplitude": (("peak", "frame"), np.arange(n_peaks * n_frames,
+                                                       dtype=float).reshape(n_peaks, n_frames)),
+            "center":    (("peak", "frame"), np.full((n_peaks, n_frames), 5.0)),
+            "fwhm":      (("peak", "frame"), np.full((n_peaks, n_frames), 0.3)),
+            "area":      (("peak", "frame"), np.full((n_peaks, n_frames), 1.5)),
+            "success":   (("peak", "frame"), np.ones((n_peaks, n_frames), dtype=bool)),
+        },
+        coords={
+            "peak": np.array(["alpha", "beta"], dtype=object),
+            "frame": np.arange(n_frames),
+        },
+        attrs={"peaks": [
+            {"name": "alpha", "q_min": 1.1, "q_max": 1.4, "model": "gaussian",
+             "baseline": "linear", "link": "linked", "bg_factor": 2.0},
+            {"name": "beta",  "q_min": 2.1, "q_max": 2.4, "model": "lorentzian",
+             "baseline": "none",   "link": "independent", "bg_factor": 3.0},
+        ]},
+    )
+
+
+def test_write_peakfit_dataset_splits_per_peak(isolated_cache_dir):
+    """Smi-tiled apply_peak_fits returns a (peak, frame) dataset; verify the
+    cache splits it into per-peak entries that round-trip via the existing
+    read_peakfit_full reader (i.e., the format export_scan consumes).
+    """
+    c = ScanCache("uid-pf-ds")
+    n = c.write_peakfit_dataset(_make_peak_fits_dataset())
+    assert n == 2
+
+    entries = c.read_peakfit_full()
+    assert len(entries) == 2
+    # Sort by attr name so test is order-independent.
+    by_name = {e["attrs"]["name"]: e for e in entries}
+    assert set(by_name) == {"alpha", "beta"}
+
+    a = by_name["alpha"]
+    np.testing.assert_allclose(a["arrays"]["amplitude"], [0.0, 1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_allclose(a["arrays"]["center"], 5.0)
+    assert a["attrs"]["model"] == "gaussian"
+    assert a["attrs"]["q_min"] == 1.1
+    assert a["arrays"]["success"].dtype == bool
+
+    b = by_name["beta"]
+    np.testing.assert_allclose(b["arrays"]["amplitude"], [5.0, 6.0, 7.0, 8.0, 9.0])
+    assert b["attrs"]["model"] == "lorentzian"
+    assert b["attrs"]["link"] == "independent"
+    assert b["attrs"]["bg_factor"] == 3.0
+
+
+def test_write_peakfit_dataset_handles_none_and_empty(isolated_cache_dir):
+    """Defensive: ScanCache must be a no-op when there are no peaks to write."""
+    c = ScanCache("uid-pf-empty")
+    assert c.write_peakfit_dataset(None) == 0
+    assert c.read_peakfit_index() == []
+
+    import xarray as xr
+    empty = xr.Dataset(
+        {"amplitude": (("peak", "frame"), np.zeros((0, 0)))},
+        coords={"peak": np.array([], dtype=object), "frame": np.arange(0)},
+    )
+    assert c.write_peakfit_dataset(empty) == 0
+    assert c.read_peakfit_index() == []
+
+
+def test_write_peakfit_dataset_invalidated_by_reduction(isolated_cache_dir):
+    """write_reduction wipes /peakfit; the dataset writer must run after it."""
+    c = ScanCache("uid-pf-inv")
+    c.write_peakfit_dataset(_make_peak_fits_dataset())
+    assert len(c.read_peakfit_index()) == 2
+    # Re-reduction nukes peak fits (they're keyed off the prior pf_iq).
+    c.write_reduction({"pf_iq_I": np.zeros((2, 3))}, {})
+    assert c.read_peakfit_index() == []
+
+
 def test_peak_defs_roundtrip(isolated_cache_dir):
     from smi_browser.cache import read_peak_defs, write_peak_defs
     assert read_peak_defs() == []

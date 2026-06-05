@@ -9246,6 +9246,14 @@ def _build_proc_params(uid: str) -> tuple:
     if waxs_kw:
         params["waxs_kwargs"] = waxs_kw
 
+    # Auto-fit any peaks the user has drawn so reduce_smi_combined runs
+    # apply_peak_fits in-pass and result.peak_fits is populated for cache +
+    # export.  GI is excluded above because reduce_smi_gi has no peak_fits=
+    # kwarg (no per_frame_iq to fit against).
+    peak_defs = _peak_defs_from_table()
+    if peak_defs:
+        params["peak_fits"] = peak_defs
+
     return reduce_smi_combined, params, geometry
 
 
@@ -9296,8 +9304,36 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
         if arrays:
             cache.write_reduction(arrays, safe_params)
             log.info("cache: wrote reduction for %s (%d arrays)", uid[:8], len(arrays))
+
+        # Persist any peak fits computed during reduction so /peakfit/* survives
+        # restarts and is available to subsequent exports.  ``write_reduction``
+        # above wipes /peakfit (re-reduction invalidates fits), so this MUST run
+        # afterwards.  No-op for GI scans (no result.peak_fits attached).
+        _cache_peak_fits(uid, result, cache=cache)
     except Exception:
         log.exception("cache: failed to write reduction for %s", uid[:8])
+
+
+def _cache_peak_fits(uid: str, result, *, cache: ScanCache | None = None) -> None:
+    """Persist ``result.peak_fits`` (one entry per peak) to the disk cache.
+
+    Thin wrapper around :meth:`ScanCache.write_peakfit_dataset` so the
+    interactive ``_on_peak_fit`` path and the batch reduction path produce
+    identical on-disk schemas (``/peakfit/<hash>`` per peak with provenance
+    attrs).  Errors are logged but never propagated — peak-fit caching is
+    best-effort.
+    """
+    pf_ds = getattr(result, "peak_fits", None)
+    if pf_ds is None:
+        return
+    cache = cache or ScanCache(uid)
+    try:
+        n = cache.write_peakfit_dataset(pf_ds)
+    except Exception:
+        log.exception("cache: failed to write peak fits for %s", uid[:8])
+        return
+    if n:
+        log.info("cache: wrote %d peak fit(s) for %s", n, uid[:8])
 
 
 # ---------------------------------------------------------------------------
@@ -9362,6 +9398,11 @@ def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
         if export_config.get("auto_export"):
             out_dir = export_config.get("export_dir")
             if out_dir:
+                # Read peak fits back from the cache we just wrote so the HDF5
+                # /peakfit group + per-peak PNGs match the interactive export
+                # path.  ``use_ui_axis=False`` because Panel widgets are not
+                # safely accessible in the forked child.
+                peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=False)
                 export_scan(
                     out_dir=out_dir,
                     uid=uid,
@@ -9376,6 +9417,8 @@ def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
                     basename_template=export_config.get("basename_template", ""),
                     frame_label_col=export_config.get("frame_label_col"),
                     h5_sections=export_config.get("h5_sections"),
+                    peak_fits=peak_fits,
+                    peak_axis=peak_axis,
                     peak_param=export_config.get("peak_param", "area"),
                 )
 
@@ -9858,7 +9901,7 @@ w_h5_baseline_config = pn.widgets.Checkbox(name="Baseline + config", value=True)
 w_h5_iq = pn.widgets.Checkbox(name="Processed I(q)", value=True)
 w_h5_raw_images = pn.widgets.Checkbox(name="Raw 2D images", value=False)
 w_h5_qchi = pn.widgets.Checkbox(name="Processed q-χ (if available)", value=False)
-w_h5_peakfit = pn.widgets.Checkbox(name="Peak fit results (if available)", value=False)
+w_h5_peakfit = pn.widgets.Checkbox(name="Peak fit results (if available)", value=True)
 
 #: (h5-section key, widget) — drives _h5_sections() and select/clear-all.
 _H5_SECTION_WIDGETS = [

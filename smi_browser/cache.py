@@ -420,6 +420,65 @@ class ScanCache:
         """
         return [(e["key"], e["arrays"]) for e in self.read_peakfit_full()]
 
+    def write_peakfit_dataset(self, peak_fits_ds) -> int:
+        """Split a packed ``apply_peak_fits`` xr.Dataset into per-peak entries.
+
+        The smi-tiled :func:`apply_peak_fits` returns a single dataset with
+        dims ``(peak, frame)``, vars ``amplitude/center/fwhm/area/success``, and
+        a ``ds.attrs["peaks"]`` provenance list (one dict per peak).  The cache
+        layer keys one HDF5 group per peak (``/peakfit/<hash>``), so this
+        helper iterates the peak dim and writes each slice via
+        :meth:`write_peakfit`.  Returns the number of peaks written.
+
+        No-ops when ``peak_fits_ds`` is ``None`` or has zero peaks.
+        """
+        from smi_tiled.derived.peakfit import PeakDef, FIT_PARAMS
+
+        if peak_fits_ds is None:
+            return 0
+        n_peaks = int(peak_fits_ds.sizes.get("peak", 0))
+        if n_peaks == 0:
+            return 0
+        provenance = peak_fits_ds.attrs.get("peaks") or []
+        written = 0
+        for pi in range(n_peaks):
+            try:
+                prov = dict(provenance[pi]) if pi < len(provenance) else {}
+                pk = PeakDef(
+                    name=str(prov.get("name") or f"p{pi + 1}"),
+                    q_min=float(prov.get("q_min", 0.0)),
+                    q_max=float(prov.get("q_max", 0.0)),
+                    model=str(prov.get("model", "gaussian")),
+                    baseline=str(prov.get("baseline", "linear")),
+                    link=str(prov.get("link", "independent")),
+                    bg_factor=float(prov.get("bg_factor", 2.0)),
+                )
+            except (TypeError, ValueError):
+                continue
+            arrays: dict[str, np.ndarray] = {}
+            for p in FIT_PARAMS:
+                if p in peak_fits_ds:
+                    arrays[p] = np.asarray(peak_fits_ds[p].isel(peak=pi).values)
+            if "success" in peak_fits_ds:
+                arrays["success"] = np.asarray(
+                    peak_fits_ds["success"].isel(peak=pi).values)
+            if not arrays:
+                continue
+            self.write_peakfit(
+                pk.key(), arrays,
+                attrs={
+                    "name": pk.name,
+                    "q_min": pk.q_min,
+                    "q_max": pk.q_max,
+                    "model": pk.model,
+                    "baseline": pk.baseline,
+                    "link": pk.link,
+                    "bg_factor": pk.bg_factor,
+                },
+            )
+            written += 1
+        return written
+
     def clear_peakfit(self) -> None:
         import h5py
         if not self.path.exists():
