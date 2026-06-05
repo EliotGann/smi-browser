@@ -297,6 +297,118 @@ def color_to_hex(color) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto-normalize: dim all gains uniformly so no pixel saturates to white
+# ---------------------------------------------------------------------------
+
+#: Default target for the brightest pixel after auto-normalize.  Slight
+#: headroom below 1.0 so light tweaks afterwards don't immediately blow out.
+DEFAULT_AUTO_TARGET = 0.95
+
+
+def _compose_unclipped(
+    channels: Sequence[dict],
+    x: np.ndarray,
+    y: np.ndarray | None = None,
+    pct_lo: float = DEFAULT_PCT_LO,
+    pct_hi: float = DEFAULT_PCT_HI,
+) -> "np.ndarray | None":
+    """Same maths as :func:`compose_rgb` but **without** the final clip.
+
+    Returns the raw ``(H, W, 3)`` float sum, or ``None`` if no channel
+    produced usable data.  Used by :func:`auto_gain_factor` to find the
+    pre-clip maximum.
+    """
+    x = np.asarray(x, dtype=float)
+    n = int(x.size)
+    usable: list[tuple[dict, tuple[float, float]]] = []
+    for ch in channels:
+        vals = np.asarray(ch.get("values"), dtype=float)
+        if vals.size != n or not np.isfinite(vals).any():
+            continue
+        scale = channel_scale(
+            vals, pct_lo=pct_lo, pct_hi=pct_hi, log=bool(ch.get("log")),
+        )
+        usable.append((ch, scale))
+    if not usable:
+        return None
+
+    grid = None
+    y_arr: "np.ndarray | None" = None
+    if y is not None and np.asarray(y, dtype=float).size == n:
+        y_arr = np.asarray(y, dtype=float)
+        for ch, _ in usable:
+            grid = gridded_view(x, y_arr, np.asarray(ch["values"], dtype=float))
+            if grid is not None:
+                break
+
+    if grid is not None and y_arr is not None:
+        H, W = grid.image.shape
+        rgb = np.zeros((H, W, 3), dtype=np.float64)
+        for ch, scale in usable:
+            color = _to_rgb(ch.get("color"))
+            gain = float(ch.get("gain", 1.0) or 1.0)
+            log = bool(ch.get("log"))
+            ch_grid = gridded_view(
+                x, y_arr, np.asarray(ch["values"], dtype=float))
+            if ch_grid is None or ch_grid.image.shape != (H, W):
+                continue
+            norm = normalize_channel(ch_grid.image, *scale, log=log)
+            for c in range(3):
+                rgb[..., c] += norm * color[c] * gain
+        return rgb
+
+    # 1-D fallback
+    order = np.argsort(x)
+    rgb = np.zeros((1, x.size, 3), dtype=np.float64)
+    for ch, scale in usable:
+        color = _to_rgb(ch.get("color"))
+        gain = float(ch.get("gain", 1.0) or 1.0)
+        log = bool(ch.get("log"))
+        vals = np.asarray(ch["values"], dtype=float)[order]
+        norm = normalize_channel(vals, *scale, log=log)
+        for c in range(3):
+            rgb[0, :, c] += norm * color[c] * gain
+    return rgb
+
+
+def auto_gain_factor(
+    channels: Sequence[dict],
+    x: np.ndarray,
+    y: np.ndarray | None = None,
+    pct_lo: float = DEFAULT_PCT_LO,
+    pct_hi: float = DEFAULT_PCT_HI,
+    target: float = DEFAULT_AUTO_TARGET,
+) -> float:
+    """Return a uniform multiplier for every channel's ``gain``.
+
+    Composes ``channels`` *without* the final ``[0, 1]`` clip, finds the
+    largest value across all pixels and the three RGB channels, and returns
+    ``target / max`` so that scaling every channel's gain by the result
+    leaves the brightest composite pixel at ``target``.
+
+    Returns ``1.0`` when:
+      * no channels are usable (length mismatch / all-NaN), or
+      * the pre-clip max is already below ``target`` (no scaling needed).
+
+    The factor is unitless and can be multiplied directly into any
+    pre-existing gain — the function deliberately doesn't mutate the input
+    channel dicts so callers can decide whether to write the new gains
+    back to a UI table or to a config.
+    """
+    rgb = _compose_unclipped(channels, x, y, pct_lo=pct_lo, pct_hi=pct_hi)
+    if rgb is None:
+        return 1.0
+    peak = float(np.nanmax(rgb))
+    if not np.isfinite(peak) or peak <= 0.0:
+        return 1.0
+    if peak <= target:
+        # Already within the target — don't *increase* gains; the user
+        # may have deliberately picked dim weights.
+        return 1.0
+    return float(target) / peak
+
+
+# ---------------------------------------------------------------------------
 # Matplotlib renderer (PNG export, WYSIWYG with the reference script)
 # ---------------------------------------------------------------------------
 

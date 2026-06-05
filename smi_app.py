@@ -5435,6 +5435,8 @@ w_peak_comp_btn_add_primary = pn.widgets.Button(
     name="+ Primary", button_type="default", width=90)
 w_peak_comp_btn_remove_primary = pn.widgets.Button(
     name="− Primary", button_type="default", width=90)
+w_peak_comp_btn_auto_norm = pn.widgets.Button(
+    name="Auto-normalize", button_type="primary", width=130)
 
 w_peak_comp_plot = pn.pane.Bokeh(
     object=None, sizing_mode="stretch_width", height=470)
@@ -6151,8 +6153,17 @@ def _render_composite(event=None):
 def _on_composite_view_mode(event=None):
     """Show single-peak or composite controls based on the toggle."""
     is_comp = w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE
+    # Left-pane control boxes:
     _peak_single_box.visible = not is_comp
     _peak_composite_box.visible = is_comp
+    # Right-pane plot boxes (defined alongside the layout below):
+    try:
+        _peak_single_plot_box.visible = not is_comp
+        _peak_composite_plot_box.visible = is_comp
+    except NameError:
+        # Layout not yet constructed — first paint will pick up the
+        # initial visible= values from w_peak_view_mode directly.
+        pass
     if is_comp:
         _refresh_composite_table()
         _render_composite()
@@ -6222,6 +6233,77 @@ def _on_composite_remove_primary(event=None):
         _composite_state["guard"] = False
     _refresh_composite_primary_options()
     _render_composite()
+
+
+def _on_composite_auto_normalize(event=None):
+    """Scale every channel's gain so the brightest composite pixel ≈ 0.95.
+
+    Uses the same percentile-clip / RGB-add maths as the live render but
+    skips the final clip, so the pre-clip maximum is recoverable.  Writes
+    the new gains back into the channel table and re-renders.
+    """
+    iq = _peakmap_cache.get("iq")
+    if iq is None:
+        w_peak_comp_status.object = "*No scan loaded.*"
+        return
+    specs = _composite_specs()
+    if not specs:
+        w_peak_comp_status.object = "*No active channels to normalize.*"
+        return
+
+    x_name = w_peak_map_x.value
+    y_name = w_peak_map_y.value
+    x = _axis_values(x_name)
+    if x is None:
+        w_peak_comp_status.object = "*Chosen X axis is unavailable.*"
+        return
+    y = None if y_name == _PEAK_NONE_Y else _axis_values(y_name)
+
+    try:
+        pct_lo = float(w_peak_comp_pct_lo.value)
+        pct_hi = float(w_peak_comp_pct_hi.value)
+    except Exception:
+        pct_lo, pct_hi = _peakcomp.DEFAULT_PCT_LO, _peakcomp.DEFAULT_PCT_HI
+
+    factor = _peakcomp.auto_gain_factor(
+        specs, x, y, pct_lo=pct_lo, pct_hi=pct_hi)
+    if factor >= 1.0:
+        w_peak_comp_status.object = (
+            "*Already within target — no scaling applied.*")
+        return
+
+    # Multiply every active channel row's gain by ``factor``.  Match by
+    # channel id (peak slug or "primary:<col>") so disabled rows are left
+    # alone and primary-vs-peak rows are both handled.
+    df = w_peak_comp_table.value
+    if df is None or df.empty:
+        return
+    df = df.copy()
+    active_ids = {str(s["id"]) for s in specs}
+    for i, row in df.iterrows():
+        cid = ""
+        kind = str(row.get("kind") or "peak")
+        src = str(row.get("source") or "")
+        if kind == "peak":
+            cid = src
+        else:
+            cid = src
+        if cid in active_ids:
+            try:
+                df.at[i, "gain"] = round(float(row.get("gain") or 1.0) * factor, 4)
+            except Exception:
+                pass
+
+    _composite_state["guard"] = True
+    try:
+        w_peak_comp_table.value = df
+    finally:
+        _composite_state["guard"] = False
+    _render_composite()
+    # ``_render_composite`` overwrites the status line; restore a short note
+    # documenting what just happened.
+    w_peak_comp_status.object = (
+        f"*Auto-normalized: gains scaled by {factor:.3f} (target 0.95).*")
 
 
 def _on_peak_cancel(event=None):
@@ -6350,6 +6432,7 @@ w_peak_view_mode.param.watch(_on_composite_view_mode, "value")
 w_peak_comp_table.param.watch(_on_composite_table_change, "value")
 w_peak_comp_btn_add_primary.on_click(_on_composite_add_primary)
 w_peak_comp_btn_remove_primary.on_click(_on_composite_remove_primary)
+w_peak_comp_btn_auto_norm.on_click(_on_composite_auto_normalize)
 for _w in (w_peak_comp_pct_lo, w_peak_comp_pct_hi):
     _w.param.watch(lambda _e: _render_composite(), "value")
 for _w in (w_peak_map_x, w_peak_map_y):
@@ -6360,46 +6443,82 @@ _load_peak_defs()
 _update_z_peak_options()
 _refresh_composite_table()  # populate with restored peaks (no UID yet → no render)
 
-# Two layered control boxes: only one is visible at a time, driven by the
-# view-mode toggle.  This keeps the peak table + heatmap + axis selectors
-# shared between modes while swapping the output area underneath.
-_peak_single_box = pn.Column(
+# Layout: tables and controls on the LEFT, heatmap + map plot on the
+# RIGHT.  Each view-mode (single / composite) has its own controls and
+# plot; only one pair is visible at a time, driven by the view-mode
+# toggle.  The peak table, status line, and X/Y axis selectors are
+# shared across both modes.
+_is_single_mode = (w_peak_view_mode.value == _PEAK_VIEW_SINGLE)
+_is_comp_mode = (w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE)
+
+# LEFT-pane sub-boxes
+_peak_single_controls = pn.Column(
     pn.Row(w_peak_z_peak, w_peak_z_param),
     pn.Row(w_peak_map_cmap, w_peak_map_log, w_peak_map_aspect),
     w_peak_map_status,
-    w_peak_map_plot,
     sizing_mode="stretch_width",
-    visible=(w_peak_view_mode.value == _PEAK_VIEW_SINGLE),
+    visible=_is_single_mode,
 )
-_peak_composite_box = pn.Column(
+_peak_composite_controls = pn.Column(
     pn.pane.Markdown(
         "**Composite** — additive RGB overlay of every ticked channel "
         "(peaks default to their fitted *area* map; primary scalars can "
-        "be added below).  Each channel is independently percentile-clipped, "
-        "then multiplied by its colour and summed on a black background."),
+        "be added below).  *Auto-normalize* dims all gains uniformly so "
+        "the brightest pixel sits at 0.95 (no blowout to white)."),
     w_peak_comp_table,
+    pn.Row(w_peak_comp_btn_auto_norm,
+           w_peak_comp_pct_lo, w_peak_comp_pct_hi),
     pn.Row(w_peak_comp_add_primary,
            w_peak_comp_btn_add_primary,
-           w_peak_comp_btn_remove_primary,
-           w_peak_comp_pct_lo, w_peak_comp_pct_hi),
+           w_peak_comp_btn_remove_primary),
     w_peak_comp_status,
+    sizing_mode="stretch_width",
+    visible=_is_comp_mode,
+)
+
+# RIGHT-pane sub-boxes (just the per-mode output plot; the I(q) heatmap
+# above is shared and stays visible in both modes).
+_peak_single_plot_box = pn.Column(
+    w_peak_map_plot,
+    sizing_mode="stretch_width",
+    visible=_is_single_mode,
+)
+_peak_composite_plot_box = pn.Column(
     w_peak_comp_plot,
     sizing_mode="stretch_width",
-    visible=(w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE),
+    visible=_is_comp_mode,
+)
+
+# Back-compat aliases for the old single-Column boxes that
+# ``_on_composite_view_mode`` toggled.  Those names still exist in the
+# handler; rebind them to the new control boxes so the old ``visible=``
+# writes hit the right widgets.
+_peak_single_box = _peak_single_controls
+_peak_composite_box = _peak_composite_controls
+
+_peak_left_pane = pn.Column(
+    pn.Row(w_btn_peak_add, w_btn_peak_remove, w_btn_peak_fit,
+           w_btn_peak_cancel, w_peak_spinner),
+    w_peak_table,
+    w_peak_status,
+    pn.Row(w_peak_view_mode, w_peak_map_x, w_peak_map_y),
+    _peak_single_controls,
+    _peak_composite_controls,
+    width=560,
+)
+_peak_right_pane = pn.Column(
+    w_peak_heatmap,
+    _peak_single_plot_box,
+    _peak_composite_plot_box,
+    sizing_mode="stretch_width",
 )
 
 peak_map_panel = pn.Column(
     pn.pane.Markdown(
         "**Peak Map** — fit peaks across every frame's 1D I(q), then map a fit "
         "parameter against any per-frame axis (1-D when *Y axis* is *none*)."),
-    pn.Row(w_btn_peak_add, w_btn_peak_remove, w_btn_peak_fit,
-           w_btn_peak_cancel, w_peak_spinner),
-    w_peak_table,
-    w_peak_status,
-    w_peak_heatmap,
-    pn.Row(w_peak_view_mode, w_peak_map_x, w_peak_map_y),
-    _peak_single_box,
-    _peak_composite_box,
+    pn.Row(_peak_left_pane, _peak_right_pane,
+           sizing_mode="stretch_width"),
     sizing_mode="stretch_width",
 )
 

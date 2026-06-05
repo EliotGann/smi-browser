@@ -377,3 +377,91 @@ def test_build_bokeh_figure_smoke():
     # Bokeh figures always have at least the renderers we attached.
     assert any(getattr(r, "glyph", None).__class__.__name__ == "ImageRGBA"
                for r in p.renderers)
+
+
+# ---------------------------------------------------------------------------
+# auto_gain_factor: scale all gains so the brightest pixel sits at the target
+# ---------------------------------------------------------------------------
+
+def test_auto_gain_factor_no_blowout_returns_one():
+    """If the composite is already below the target, no scaling needed."""
+    from smi_browser.figures.peakmap_composite import auto_gain_factor
+
+    x, y = _grid_xy(nx=4, ny=3)
+    n = x.size
+    # One channel at gain=0.5 → max contribution ≤ 0.5 (well below 0.95).
+    channels = [{"id": "r", "label": "r",
+                 "values": np.linspace(0, 1, n),
+                 "color": (1.0, 0.0, 0.0), "gain": 0.5, "log": False}]
+    factor = auto_gain_factor(channels, x=x, y=y)
+    assert factor == 1.0
+
+
+def test_auto_gain_factor_scales_blown_out_composite():
+    """Two overlapping bright channels add to >1; factor should bring max to 0.95."""
+    from smi_browser.figures.peakmap_composite import auto_gain_factor
+
+    x, y = _grid_xy(nx=4, ny=3)
+    n = x.size
+    vals = np.linspace(0.1, 1.0, n)  # all positive, finite
+    # Both channels max-out and overlap on R+G channels at the same pixel.
+    channels = [
+        {"id": "r", "label": "r", "values": vals,
+         "color": (1.0, 0.0, 0.0), "gain": 2.0, "log": False},
+        {"id": "y", "label": "y", "values": vals,
+         "color": (1.0, 0.85, 0.0), "gain": 2.0, "log": False},
+    ]
+    factor = auto_gain_factor(channels, x=x, y=y, target=0.95)
+    # Pre-clip max on R-channel = (1.0 * 2.0) + (1.0 * 2.0) = 4.0;
+    # so factor = 0.95 / 4.0 = 0.2375.
+    assert factor == pytest.approx(0.95 / 4.0, rel=1e-6)
+
+
+def test_auto_gain_factor_idempotent():
+    """Applying the factor and re-running auto-normalize should be a no-op."""
+    from smi_browser.figures.peakmap_composite import auto_gain_factor
+
+    x, y = _grid_xy(nx=4, ny=3)
+    n = x.size
+    vals = np.linspace(0.1, 1.0, n)
+    channels = [
+        {"id": "r", "label": "r", "values": vals,
+         "color": (1.0, 0.0, 0.0), "gain": 3.0, "log": False},
+        {"id": "g", "label": "g", "values": vals,
+         "color": (0.0, 1.0, 0.0), "gain": 3.0, "log": False},
+    ]
+    f1 = auto_gain_factor(channels, x=x, y=y)
+    assert f1 < 1.0
+    # Apply the factor and re-check; it should now return ~1.0.
+    for ch in channels:
+        ch["gain"] *= f1
+    f2 = auto_gain_factor(channels, x=x, y=y)
+    assert f2 == pytest.approx(1.0, abs=1e-6)
+
+
+def test_auto_gain_factor_no_usable_channels_returns_one():
+    """Length-mismatched / all-NaN channels yield no usable data → factor=1."""
+    from smi_browser.figures.peakmap_composite import auto_gain_factor
+
+    x, y = _grid_xy(nx=4, ny=3)
+    bad_len = np.array([1.0, 2.0, 3.0])  # wrong length
+    channels = [{"id": "r", "label": "r", "values": bad_len,
+                 "color": (1.0, 0.0, 0.0), "gain": 1.0, "log": False}]
+    assert auto_gain_factor(channels, x=x, y=y) == 1.0
+
+    channels = [{"id": "r", "label": "r",
+                 "values": np.full(x.size, np.nan),
+                 "color": (1.0, 0.0, 0.0), "gain": 1.0, "log": False}]
+    assert auto_gain_factor(channels, x=x, y=y) == 1.0
+
+
+def test_auto_gain_factor_does_not_mutate_inputs():
+    """The helper must not write into the channel dicts (callers decide)."""
+    from smi_browser.figures.peakmap_composite import auto_gain_factor
+
+    x, y = _grid_xy(nx=4, ny=3)
+    n = x.size
+    ch = {"id": "r", "label": "r", "values": np.linspace(0, 1, n),
+          "color": (1.0, 0.0, 0.0), "gain": 5.0, "log": False}
+    auto_gain_factor([ch], x=x, y=y)
+    assert ch["gain"] == 5.0  # unchanged
