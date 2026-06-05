@@ -13138,10 +13138,18 @@ def _load_cycles():
       3. ``DEFAULT_CYCLE`` (``$SMI_BROWSER_DEFAULT_CYCLE`` or "2026-2")
       4. The newest cycle in the option list
     """
-    api_cycles = nsls2api.fetch_cycles()
-    api_current = nsls2api.fetch_current_cycle()
-
     global _nsls2_api_reachable
+
+    # Fast probe first: off the BNL network the heavy fetches below each block
+    # for the full 15 s timeout.  A ~2.5 s reachability check lets us skip
+    # straight to the hardcoded cycles + tiled fallback when the API is down.
+    if not nsls2api.api_reachable():
+        api_cycles: list[str] = []
+        api_current = ""
+    else:
+        api_cycles = nsls2api.fetch_cycles()
+        api_current = nsls2api.fetch_current_cycle()
+
     if api_cycles:
         # API returns oldest-first; reverse so newest appears first.
         recent = list(reversed(api_cycles))
@@ -13298,7 +13306,7 @@ def _refresh_proposals(cycle: str | None = None):
     else:
         w_proposal_status.object = (
             f"*{n} proposal{plural} via tiled "
-            "(NSLS-II API unreachable; titles/PIs unavailable)*"
+            "(NSLS-II API unreachable; titles/PIs from scan metadata)*"
         )
 
 

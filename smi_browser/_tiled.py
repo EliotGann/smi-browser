@@ -312,6 +312,36 @@ def fetch_page_fast(
     return summaries, total
 
 
+def fetch_one_start_doc(
+    cat,
+    unified_filters: list[tuple[str, str, str]] | None = None,
+) -> dict:
+    """Return the ``start`` document of one matching run, or ``{}``.
+
+    A single REST round-trip (``page[limit]=1``, ``fields=metadata``) on the
+    optionally filtered node.  Used to recover proposal title / PI name from a
+    run's ``start.proposal`` block when the NSLS-II API is unreachable.  Stays
+    lazy — no array data is read.
+    """
+    node = _apply_filters(cat, unified_filters)
+    http_client = node.context.http_client
+    search_url = node.item["links"]["search"]
+    # Re-attach filter params so a filtered node returns filtered data.
+    filter_params = getattr(node, "_queries_as_params", {})
+    params = {
+        "page[offset]": "0",
+        "page[limit]": "1",
+        "fields": "metadata",
+        **filter_params,
+    }
+    resp = http_client.get(search_url, params=params)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if not data:
+        return {}
+    return data[0].get("attributes", {}).get("metadata", {}).get("start", {})
+
+
 def fetch_uids_fast(
     cat,
     unified_filters: list[tuple[str, str, str]] | None = None,

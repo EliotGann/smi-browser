@@ -19,6 +19,33 @@ API_BASE = "https://api.nsls2.bnl.gov/v1"
 _TIMEOUT = httpx.Timeout(15.0)
 BEAMLINE = "SMI"
 
+# Short timeout used purely to *probe* whether the API host answers at all.
+# Off the BNL network the connection hangs until the full ``_TIMEOUT`` elapses;
+# a dedicated short connect timeout lets us latch the unreachable state in
+# ~2 s instead of ~15 s per call.
+_PROBE_TIMEOUT = httpx.Timeout(2.5, connect=2.5)
+
+
+def api_reachable(timeout: float = 2.5) -> bool:
+    """Return *True* if ``api.nsls2.bnl.gov`` answers quickly.
+
+    Performs a single short-timeout GET against a tiny endpoint
+    (``/facility/nsls2/cycles/current``).  Any answer (even an HTTP error
+    status) counts as reachable; only a connection/timeout failure counts as
+    unreachable.  Designed to be called *before* the heavier proposal/cycle
+    fetches so an off-network session fails fast instead of waiting out the
+    15 s timeout on every call.
+    """
+    try:
+        resp = httpx.get(
+            f"{API_BASE}/facility/nsls2/cycles/current",
+            timeout=httpx.Timeout(timeout, connect=timeout),
+        )
+        return resp.status_code < 500
+    except Exception:
+        log.info("NSLS-II API probe failed (host unreachable)")
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -375,9 +402,12 @@ def proposals_from_tiled(cat, cycle: str | None) -> list[ProposalInfo]:
 
     Used as a fallback when ``api.nsls2.bnl.gov`` is unreachable.  Issues a
     server-side ``distinct`` query for ``start.data_session`` (optionally
-    restricted to a cycle).  Cannot supply proposal titles or PI names —
-    those require the NSLS-II API — so the returned ``ProposalInfo`` rows
-    use ``"?"`` for the PI and ``"(N scans)"`` as a placeholder title.
+    restricted to a cycle), then fetches one representative run per
+    data-session to recover the proposal **title** and **PI name** from that
+    run's ``start.proposal`` block (modern SMI runs embed
+    ``{"title", "pi_name", "proposal_id"}`` there).  Older runs without a
+    ``proposal`` block fall back to a ``"(N scans)"`` placeholder title and
+    ``"?"`` PI.
 
     Parameters
     ----------
@@ -423,21 +453,45 @@ def proposals_from_tiled(cat, cycle: str | None) -> list[ProposalInfo]:
     if not vals:
         return []
 
-    out: list[ProposalInfo] = []
-    for entry in vals:
+    # ------------------------------------------------------------------
+    # Enrich each data-session with title / PI from one representative run's
+    # ``start.proposal`` block.  Done concurrently — one cheap metadata-only
+    # REST round-trip per proposal.
+    # ------------------------------------------------------------------
+    def _enrich(entry: dict) -> ProposalInfo | None:
         ds = entry.get("value")
         if not ds:
-            continue
-        pid = _proposal_id_from_data_session(str(ds))
+            return None
+        ds = str(ds)
+        pid = _proposal_id_from_data_session(ds)
         cnt = entry.get("count")
+
         title = f"({cnt} scans)" if cnt else "(via tiled — API unreachable)"
-        out.append(ProposalInfo(
+        pi_name = "?"
+        try:
+            start = _tb.fetch_one_start_doc(
+                cat, unified_filters=[("exact", "data_session", ds)]
+            )
+            prop = start.get("proposal") or {}
+            if isinstance(prop, dict):
+                title = prop.get("title") or title
+                pi_name = prop.get("pi_name") or pi_name
+        except Exception:
+            log.debug("Could not fetch proposal start doc for %s", ds)
+
+        return ProposalInfo(
             proposal_id=pid,
-            data_session=str(ds),
+            data_session=ds,
             title=title,
-            pi_name="?",
+            pi_name=pi_name,
             cycles=[cycle_norm] if unified_filters else [],
-        ))
+        )
+
+    out: list[ProposalInfo] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        for info in executor.map(_enrich, vals):
+            if info is not None:
+                out.append(info)
 
     out.sort(key=lambda p: p.proposal_id, reverse=True)
     return out
