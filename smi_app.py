@@ -10124,6 +10124,8 @@ def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
                 # path.  ``use_ui_axis=False`` because Panel widgets are not
                 # safely accessible in the forked child.
                 peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=False)
+                comp_cfg = export_config.get("peak_composite_config")
+                primary_scalars = _gather_primary_scalars(primary_df, comp_cfg)
                 export_scan(
                     out_dir=out_dir,
                     uid=uid,
@@ -10141,6 +10143,8 @@ def _batch_subprocess_target(uid: str, export_config: dict, conn) -> None:
                     peak_fits=peak_fits,
                     peak_axis=peak_axis,
                     peak_param=export_config.get("peak_param", "area"),
+                    peak_composite_config=comp_cfg,
+                    primary_scalars=primary_scalars,
                 )
 
         conn.send(("ok", summary))
@@ -10163,6 +10167,7 @@ def _snapshot_export_config() -> dict:
         "formats": _export_formats(),
         "h5_sections": _h5_sections(),
         "peak_param": w_export_peak_param.value,
+        "peak_composite_config": _snapshot_composite_config(),
         "subdir_template": w_export_subdir.value or "",
         "basename_template": w_export_basename.value or "",
         "frame_label_col": _get_frame_label_cols() or None,
@@ -10997,6 +11002,84 @@ def _gather_peak_fits(uid: str, *, use_ui_axis: bool = False):
     return peak_fits, peak_axis
 
 
+def _snapshot_composite_config() -> dict:
+    """Snapshot the composite (RGB-additive) Peak Map widgets.
+
+    The result is a plain dict (no Bokeh/Panel objects) safe to pass into
+    a forked child process and into :func:`smi_browser.export.export_scan`.
+    Channel ``values`` are *not* included — they are resolved later, per
+    UID, from peak fits and primary scalars.
+
+    ``active`` is ``True`` only when the composite mode is selected and at
+    least one channel row exists; downstream code falls back to per-peak
+    PNGs when ``active`` is false.
+    """
+    try:
+        active = (w_peak_view_mode.value == _PEAK_VIEW_COMPOSITE)
+    except Exception:
+        active = False
+    channels: list[dict] = []
+    df = w_peak_comp_table.value
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            channels.append({
+                "include": bool(row.get("include", True)),
+                "label": str(row.get("label") or ""),
+                "color": str(row.get("color") or "#ffffff"),
+                "gain": float(row.get("gain") or 1.0),
+                "log": bool(row.get("log")),
+                "kind": str(row.get("kind") or "peak"),
+                "source": str(row.get("source") or ""),
+            })
+    try:
+        pct_lo = float(w_peak_comp_pct_lo.value)
+        pct_hi = float(w_peak_comp_pct_hi.value)
+        if not (0.0 <= pct_lo < pct_hi <= 100.0):
+            pct_lo = pct_hi = None
+    except Exception:
+        pct_lo = pct_hi = None
+    return {
+        "active": bool(active and channels),
+        "channels": channels,
+        "pct_lo": pct_lo,
+        "pct_hi": pct_hi,
+    }
+
+
+def _gather_primary_scalars(primary_df, composite_config: dict | None) -> dict:
+    """Extract primary-channel columns referenced by ``composite_config``.
+
+    Returns ``{column → 1-D float array}`` for every ``kind='primary'``
+    channel whose source column exists in ``primary_df``.  Empty when the
+    composite is inactive or no primary channels are configured.
+    """
+    if (primary_df is None or composite_config is None
+            or not composite_config.get("active")):
+        return {}
+    try:
+        empty = primary_df.empty
+    except Exception:
+        empty = False
+    if empty:
+        return {}
+    needed: set[str] = set()
+    for ch in composite_config.get("channels") or ():
+        if str(ch.get("kind") or "") != "primary":
+            continue
+        src = str(ch.get("source") or "")
+        col = src.split(":", 1)[1] if src.startswith("primary:") else src
+        if col:
+            needed.add(col)
+    out: dict[str, np.ndarray] = {}
+    for col in needed:
+        if col in primary_df.columns:
+            try:
+                out[col] = np.asarray(primary_df[col].values, dtype=float)
+            except Exception:
+                pass
+    return out
+
+
 def _resolve_export_dir() -> Path | None:
     """Get export output directory rooted in the proposal directory."""
     ds = w_proposal_select.value
@@ -11168,6 +11251,8 @@ def _do_export_single(uid: str, progress_cb=None) -> tuple[Path, list[str]] | No
             ).tolist()
 
     peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=True)
+    comp_cfg = _snapshot_composite_config()
+    primary_scalars = _gather_primary_scalars(primary_df, comp_cfg)
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -11191,6 +11276,8 @@ def _do_export_single(uid: str, progress_cb=None) -> tuple[Path, list[str]] | No
         peak_fits=peak_fits,
         peak_axis=peak_axis,
         peak_param=w_export_peak_param.value,
+        peak_composite_config=comp_cfg,
+        primary_scalars=primary_scalars,
         progress_cb=progress_cb,
     )
 
@@ -11339,6 +11426,8 @@ def _on_export_multi(uids: list[str]) -> None:
 
             try:
                 peak_fits, peak_axis = _gather_peak_fits(uid)
+                comp_cfg = _snapshot_composite_config()
+                primary_scalars = _gather_primary_scalars(primary_df, comp_cfg)
                 _, files = export_scan(
                     out_dir=out_dir,
                     uid=uid,
@@ -11356,6 +11445,8 @@ def _on_export_multi(uids: list[str]) -> None:
                     peak_fits=peak_fits,
                     peak_axis=peak_axis,
                     peak_param=w_export_peak_param.value,
+                    peak_composite_config=comp_cfg,
+                    primary_scalars=primary_scalars,
                 )
                 total_files += len(files)
             except Exception:
@@ -11428,6 +11519,9 @@ def _on_export_collection(event):
 
             try:
                 coll_peaks, coll_peak_axis = _gather_peak_fits(coll_uid)
+                comp_cfg = _snapshot_composite_config()
+                coll_primary_scalars = _gather_primary_scalars(
+                    coll_primary, comp_cfg)
                 _, files = export_scan(
                     out_dir=out_dir,
                     uid=coll_uid,
@@ -11445,6 +11539,8 @@ def _on_export_collection(event):
                     peak_fits=coll_peaks,
                     peak_axis=coll_peak_axis,
                     peak_param=w_export_peak_param.value,
+                    peak_composite_config=comp_cfg,
+                    primary_scalars=coll_primary_scalars,
                 )
                 total_files += len(files)
             except Exception:
@@ -11584,6 +11680,8 @@ def _do_export_single_to_dir(uid: str, out_dir) -> tuple | None:
             ).tolist()
 
     peak_fits, peak_axis = _gather_peak_fits(uid, use_ui_axis=True)
+    comp_cfg = _snapshot_composite_config()
+    primary_scalars = _gather_primary_scalars(primary_df, comp_cfg)
     return export_scan(
         out_dir=out_dir,
         uid=uid,
@@ -11606,6 +11704,8 @@ def _do_export_single_to_dir(uid: str, out_dir) -> tuple | None:
         peak_fits=peak_fits,
         peak_axis=peak_axis,
         peak_param=w_export_peak_param.value,
+        peak_composite_config=comp_cfg,
+        primary_scalars=primary_scalars,
     )
 
 
@@ -11644,6 +11744,9 @@ def _on_download_collection(event):
 
                     try:
                         coll_peaks, coll_peak_axis = _gather_peak_fits(coll_uid)
+                        comp_cfg = _snapshot_composite_config()
+                        coll_primary_scalars = _gather_primary_scalars(
+                            coll_primary, comp_cfg)
                         _, files = export_scan(
                             out_dir=Path(tmpdir),
                             uid=coll_uid,
@@ -11662,6 +11765,8 @@ def _on_download_collection(event):
                             peak_fits=coll_peaks,
                             peak_axis=coll_peak_axis,
                             peak_param=w_export_peak_param.value,
+                            peak_composite_config=comp_cfg,
+                            primary_scalars=coll_primary_scalars,
                         )
                         # Add files to zip under a scan subdirectory
                         actual_subdir = w_export_subdir.value or "{uid_short}"

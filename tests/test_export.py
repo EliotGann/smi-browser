@@ -287,6 +287,219 @@ def test_export_scan_no_peaks_skips_png(tmp_path):
     assert not any("peak_" in f for f in files)
 
 
+# --- Composite (RGB-additive) PNG export ----------------------------------
+
+def _comp_config_active(channels):
+    return {"active": True, "channels": channels, "pct_lo": 2.0, "pct_hi": 99.0}
+
+
+def test_export_scan_composite_active_writes_one_png(tmp_path):
+    """When the composite config is active, ``png_peaks`` produces a single
+    ``peak_composite.png`` instead of per-peak PNGs."""
+    peaks = [_peak_fit("p1", 2.1, 2.45), _peak_fit("p2", 3.0, 3.4)]
+    from smi_browser.models.peakfit import peak_slug
+    channels = [
+        {"include": True, "label": "p1", "color": "#ff0000", "gain": 1.0,
+         "log": False, "kind": "peak", "source": peak_slug(peaks[0])},
+        {"include": True, "label": "p2", "color": "#00ff00", "gain": 1.0,
+         "log": False, "kind": "peak", "source": peak_slug(peaks[1])},
+    ]
+    _, files = export_scan(
+        out_dir=tmp_path, uid="u1",
+        formats={"png_peaks"}, peak_fits=peaks,
+        peak_composite_config=_comp_config_active(channels),
+        subdir_template="", basename_template="",
+    )
+    assert "peak_composite.png" in files
+    # Per-peak PNGs are *not* written when the composite is active.
+    assert not any(f.startswith("peak_p1_q") for f in files)
+    assert not any(f.startswith("peak_p2_q") for f in files)
+    assert (tmp_path / "peak_composite.png").stat().st_size > 0
+
+
+def test_export_scan_composite_inactive_keeps_per_peak(tmp_path):
+    """``active=False`` falls back to the per-peak PNG path."""
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    cfg = {"active": False, "channels": [], "pct_lo": 2.0, "pct_hi": 99.0}
+    _, files = export_scan(
+        out_dir=tmp_path, uid="u1",
+        formats={"png_peaks"}, peak_fits=peaks,
+        peak_composite_config=cfg,
+        subdir_template="", basename_template="",
+    )
+    assert any(f.startswith("peak_p1_q2.275_") for f in files)
+    assert "peak_composite.png" not in files
+
+
+def test_export_scan_composite_with_primary_channel(tmp_path):
+    """A ``kind='primary'`` channel uses values from ``primary_scalars``."""
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    from smi_browser.models.peakfit import peak_slug
+    n = peaks[0]["results"]["area"].size
+    channels = [
+        {"include": True, "label": "p1", "color": "#ff0000", "gain": 1.0,
+         "log": False, "kind": "peak", "source": peak_slug(peaks[0])},
+        {"include": True, "label": "T", "color": "#0000ff", "gain": 1.0,
+         "log": False, "kind": "primary", "source": "primary:temperature"},
+    ]
+    primary_scalars = {"temperature": np.linspace(20.0, 100.0, n)}
+    _, files = export_scan(
+        out_dir=tmp_path, uid="u1",
+        formats={"png_peaks"}, peak_fits=peaks,
+        peak_composite_config=_comp_config_active(channels),
+        primary_scalars=primary_scalars,
+        subdir_template="", basename_template="",
+    )
+    assert "peak_composite.png" in files
+    assert (tmp_path / "peak_composite.png").stat().st_size > 0
+
+
+def test_export_scan_composite_excluded_channel_dropped(tmp_path):
+    """Channels with ``include=False`` are dropped before rendering."""
+    peaks = [_peak_fit("p1", 2.1, 2.45), _peak_fit("p2", 3.0, 3.4)]
+    from smi_browser.models.peakfit import peak_slug
+    channels = [
+        {"include": True, "label": "p1", "color": "#ff0000", "gain": 1.0,
+         "log": False, "kind": "peak", "source": peak_slug(peaks[0])},
+        {"include": False, "label": "p2", "color": "#00ff00", "gain": 1.0,
+         "log": False, "kind": "peak", "source": peak_slug(peaks[1])},
+    ]
+    _, files = export_scan(
+        out_dir=tmp_path, uid="u1",
+        formats={"png_peaks"}, peak_fits=peaks,
+        peak_composite_config=_comp_config_active(channels),
+        subdir_template="", basename_template="",
+    )
+    # Single PNG written (one active channel still composes).
+    assert "peak_composite.png" in files
+
+
+def test_export_scan_composite_no_resolvable_channels_writes_nothing(tmp_path):
+    """When *all* channels are unresolvable (unknown peak slugs, no primary
+    data), the composite PNG is silently skipped."""
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    channels = [
+        {"include": True, "label": "ghost", "color": "#ffffff", "gain": 1.0,
+         "log": False, "kind": "peak", "source": "no_such_slug_q9.999"},
+    ]
+    _, files = export_scan(
+        out_dir=tmp_path, uid="u1",
+        formats={"png_peaks"}, peak_fits=peaks,
+        peak_composite_config=_comp_config_active(channels),
+        subdir_template="", basename_template="",
+    )
+    assert "peak_composite.png" not in files
+    # And no per-peak PNGs either, because the composite branch was taken.
+    assert not any(f.startswith("peak_p1_q") for f in files)
+
+
+def test_resolve_composite_channels_inactive_returns_empty():
+    from smi_browser.export import _resolve_composite_channels
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    assert _resolve_composite_channels({"active": False, "channels": []},
+                                       peaks, None) == []
+    assert _resolve_composite_channels(None, peaks, None) == []
+
+
+# --- Derived peak-area columns in /primary --------------------------------
+
+def test_h5_primary_includes_derived_peak_area_columns(tmp_path):
+    """Per-peak ``area`` arrays are written as ``peak_<slug>_area`` datasets
+    inside ``/primary`` with ``derived=True`` and q-range attrs."""
+    import h5py
+    import pandas as pd
+    n = 6
+    primary = pd.DataFrame({
+        "temperature": np.linspace(20.0, 100.0, n),
+        "scan_id": np.arange(n),
+    })
+    peaks = [_peak_fit("p1", 2.1, 2.45), _peak_fit("p2", 3.0, 3.4)]
+    path = tmp_path / "r.h5"
+    _save_dataset_h5(
+        None, None, [], None, None, None, "", "", {}, path,
+        primary_df=primary,
+        sections={"primary"},
+        peak_fits=peaks,
+    )
+    with h5py.File(path, "r") as f:
+        assert "primary" in f
+        # Raw columns preserved.
+        assert "temperature" in f["primary"]
+        assert "scan_id" in f["primary"]
+        # Derived peak columns added with the slug naming.
+        assert "peak_p1_q2.275_area" in f["primary"]
+        assert "peak_p2_q3.200_area" in f["primary"]
+        ds = f["primary"]["peak_p1_q2.275_area"]
+        assert ds.attrs["derived"] == np.True_ or bool(ds.attrs["derived"])
+        assert ds.attrs["peak_name"].decode() == "p1" \
+            if isinstance(ds.attrs["peak_name"], bytes) \
+            else ds.attrs["peak_name"] == "p1"
+        assert float(ds.attrs["q_min"]) == pytest.approx(2.1)
+        assert float(ds.attrs["q_max"]) == pytest.approx(2.45)
+        assert ds.shape == (n,)
+
+
+def test_h5_primary_derived_columns_skipped_when_section_off(tmp_path):
+    """No derived peak columns are written when the ``primary`` section is off."""
+    import h5py
+    import pandas as pd
+    primary = pd.DataFrame({"temperature": np.linspace(20.0, 100.0, 6)})
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    path = tmp_path / "r.h5"
+    _save_dataset_h5(
+        None, None, [], None, None, None, "", "", {}, path,
+        primary_df=primary,
+        sections={"metadata"},  # primary section disabled
+        peak_fits=peaks,
+    )
+    with h5py.File(path, "r") as f:
+        assert "primary" not in f
+
+
+def test_h5_primary_derived_columns_length_mismatch_skipped(tmp_path):
+    """A peak whose ``area`` length doesn't match primary rows is skipped."""
+    import h5py
+    import pandas as pd
+    primary = pd.DataFrame({"temperature": np.linspace(20.0, 100.0, 6)})
+    bad_peak = _peak_fit("p1", 2.1, 2.45)
+    bad_peak["results"] = {"area": np.zeros(3)}  # wrong length
+    path = tmp_path / "r.h5"
+    _save_dataset_h5(
+        None, None, [], None, None, None, "", "", {}, path,
+        primary_df=primary,
+        sections={"primary"},
+        peak_fits=[bad_peak],
+    )
+    with h5py.File(path, "r") as f:
+        assert "temperature" in f["primary"]
+        assert not any(k.startswith("peak_") for k in f["primary"].keys())
+
+
+def test_h5_primary_derived_columns_no_clobber(tmp_path):
+    """A user-supplied primary column with the derived name is *not* overwritten."""
+    import h5py
+    import pandas as pd
+    n = 6
+    sentinel = np.full(n, 999.0)
+    primary = pd.DataFrame({
+        "temperature": np.linspace(20.0, 100.0, n),
+        "peak_p1_q2.275_area": sentinel,  # user-supplied column with same name
+    })
+    peaks = [_peak_fit("p1", 2.1, 2.45)]
+    path = tmp_path / "r.h5"
+    _save_dataset_h5(
+        None, None, [], None, None, None, "", "", {}, path,
+        primary_df=primary,
+        sections={"primary"},
+        peak_fits=peaks,
+    )
+    with h5py.File(path, "r") as f:
+        ds = f["primary"]["peak_p1_q2.275_area"]
+        # User data preserved; no `derived` attr because we kept the original.
+        assert np.allclose(ds[:], sentinel)
+        assert "derived" not in ds.attrs
+
+
 # --- Realistic-shape regression tests for HDF5 export gaps ----------------
 
 def test_h5_merged_qchi_writes_all_data_vars(tmp_path):

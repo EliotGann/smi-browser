@@ -638,6 +638,43 @@ def _save_dataset_h5(
                         data=np.array([str(v) for v in arr], dtype=h5py.string_dtype()),
                     )
 
+            # --- Derived per-peak `area` columns ---
+            # For every fitted peak, append a `peak_<slug>_area` dataset to the
+            # `/primary` group so downstream tools can correlate peak intensity
+            # against any other primary scalar without parsing /peakfit.  The
+            # `derived=True` attr distinguishes these from raw beamline data.
+            if peak_fits:
+                from smi_browser.models.peakfit import (
+                    peak_slug as _peak_slug,
+                )
+                n_frames = len(primary_df)
+                for pk in peak_fits:
+                    area = (pk.get("results") or {}).get("area")
+                    if area is None:
+                        continue
+                    arr = np.asarray(area, dtype=np.float64)
+                    if arr.size != n_frames:
+                        # Length mismatch — skip silently rather than write a
+                        # partial column that would mislead downstream
+                        # consumers.
+                        continue
+                    name = f"peak_{_peak_slug(pk)}_area"
+                    if name in p_grp:
+                        # User already has a primary column with this exact
+                        # name — don't clobber raw data.
+                        continue
+                    ds = p_grp.create_dataset(name, data=arr)
+                    ds.attrs["derived"] = True
+                    ds.attrs["peak_name"] = str(pk.get("name") or "")
+                    try:
+                        ds.attrs["q_min"] = float(pk.get("q_min", 0.0))
+                        ds.attrs["q_max"] = float(pk.get("q_max", 0.0))
+                    except (TypeError, ValueError):
+                        pass
+                    model = pk.get("model")
+                    if model:
+                        ds.attrs["model"] = str(model)
+
         # --- Baseline stream scalars ---
         if baseline_df is not None and not baseline_df.empty and on("baseline_config"):
             b_grp = f.create_group("baseline")
@@ -1034,6 +1071,134 @@ def _peak_map_2d(xv, yv, z, x_label, y_label, param, pk):
 
 
 # ---------------------------------------------------------------------------
+# Composite (RGB-additive) peak-map PNG export
+# ---------------------------------------------------------------------------
+
+def _resolve_composite_channels(
+    composite_config: dict | None,
+    peak_fits: "list[dict] | None",
+    primary_scalars: "dict | None",
+) -> list[dict]:
+    """Build a channel-spec list ready for ``compose_rgb`` from a snapshot.
+
+    ``composite_config`` is what :func:`smi_app._snapshot_composite_config`
+    captures: a list of channel descriptors with ``id`` / ``label`` /
+    ``color`` / ``gain`` / ``log`` / ``kind`` / ``source`` (and an optional
+    ``include`` flag).  Per-channel values are looked up here:
+
+      * peaks  → match channel ``source`` (the peak slug) against
+        ``peak_fits[i]["results"]["area"]`` (using
+        :func:`smi_browser.models.peakfit.peak_slug` for matching).
+      * primary → ``source`` is ``"primary:<col>"``; values come from
+        ``primary_scalars[col]``.
+
+    Channels with no resolvable data are silently dropped, mirroring the
+    interactive UI behaviour.
+    """
+    if not composite_config or not composite_config.get("active"):
+        return []
+    from smi_browser.models.peakfit import peak_slug as _peak_slug
+
+    channels: list[dict] = []
+    for spec in composite_config.get("channels") or ():
+        if not spec.get("include", True):
+            continue
+        kind = str(spec.get("kind") or "peak")
+        src = str(spec.get("source") or "")
+        vals = None
+        if kind == "peak":
+            for pk in peak_fits or ():
+                if _peak_slug(pk) != src:
+                    continue
+                vals = (pk.get("results") or {}).get("area")
+                break
+        else:  # primary
+            col = src.split(":", 1)[1] if src.startswith("primary:") else src
+            if primary_scalars:
+                vals = primary_scalars.get(col)
+        if vals is None:
+            continue
+        try:
+            arr = np.asarray(vals, dtype=float)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        channels.append({
+            "id": src or str(spec.get("id") or "channel"),
+            "label": str(spec.get("label") or src),
+            "values": arr,
+            "color": str(spec.get("color") or "#ffffff"),
+            "gain": float(spec.get("gain", 1.0) or 1.0),
+            "log": bool(spec.get("log")),
+            "kind": kind,
+        })
+    return channels
+
+
+def _save_peak_composite_png(
+    channels: list[dict],
+    axis: dict | None,
+    scan_dir: Path,
+    prefix: str,
+    *,
+    pct_lo: float | None = None,
+    pct_hi: float | None = None,
+    title: str = "",
+) -> "Path | None":
+    """Render the additive RGB composite to a single PNG.
+
+    ``channels`` is the resolved channel-spec list (see
+    :func:`_resolve_composite_channels`).  Returns the written path, or
+    ``None`` if no channels are renderable.  Filename:
+    ``{prefix}peak_composite.png``.
+    """
+    if not channels:
+        return None
+    from smi_browser.figures.peakmap_composite import (
+        DEFAULT_PCT_HI, DEFAULT_PCT_LO,
+        build_matplotlib_figure, compose_rgb,
+    )
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    axis = axis or {}
+    n = int(channels[0]["values"].size)
+    x = np.asarray(axis.get("x"), dtype=float) if axis.get("x") is not None else None
+    if x is None or x.size != n:
+        x = np.arange(n, dtype=float)
+        x_label = "frame"
+    else:
+        x_label = str(axis.get("x_label") or "")
+    y = axis.get("y")
+    if y is not None:
+        y = np.asarray(y, dtype=float)
+        if y.size != n:
+            y = None
+    y_label = str(axis.get("y_label") or "") if y is not None else ""
+
+    pct_lo = float(DEFAULT_PCT_LO if pct_lo is None else pct_lo)
+    pct_hi = float(DEFAULT_PCT_HI if pct_hi is None else pct_hi)
+
+    fname = f"{prefix}peak_composite.png" if prefix else "peak_composite.png"
+    path = scan_dir / fname
+    fig = None
+    with _MPL_LOCK:
+        try:
+            comp = compose_rgb(channels, x=x, y=y, pct_lo=pct_lo, pct_hi=pct_hi)
+            fig = build_matplotlib_figure(
+                comp, channels,
+                x_label=x_label, y_label=y_label, title=title,
+            )
+            fig.savefig(path, dpi=150)
+        finally:
+            if fig is not None:
+                plt.close(fig)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Top-level export function
 # ---------------------------------------------------------------------------
 
@@ -1154,6 +1319,8 @@ def export_scan(
     peak_fits: list[dict] | None = None,
     peak_axis: dict | None = None,
     peak_param: str = "area",
+    peak_composite_config: dict | None = None,
+    primary_scalars: dict | None = None,
     progress_cb=None,
 ) -> tuple[Path, list[str]]:
     """Export a single scan's data to *out_dir* with configurable outputs.
@@ -1191,6 +1358,15 @@ def export_scan(
         (defaults to a frame-index x-axis).
     peak_param : str
         Which fit parameter the peak PNGs plot (default ``"area"``).
+    peak_composite_config : dict, optional
+        Snapshot of the composite (RGB-additive) view configuration.  When
+        ``active`` is true, the ``"png_peaks"`` format produces a single
+        composite PNG instead of per-peak PNGs.  See
+        :func:`_resolve_composite_channels` for the expected shape.
+    primary_scalars : dict, optional
+        Map of ``column → 1-D array`` used to resolve composite channels of
+        kind ``"primary"``.  Ignored when ``peak_composite_config`` is
+        inactive.
     subdir_template : str
         Template for the scan sub-directory name.  Leave empty to put files
         directly in ``out_dir`` (with ``basename_template`` as filename prefix).
@@ -1314,11 +1490,29 @@ def export_scan(
         files_written.extend(p.name for p in lc_paths)
 
     # --- Peak-result PNGs (one per peak, chosen parameter) ---
+    # When the composite view is active, render a single RGB-additive PNG
+    # instead of per-peak parameter maps (mirrors the interactive UI).
     if "png_peaks" in formats and peak_fits:
-        peak_paths = _save_peak_pngs(
-            peak_fits, peak_axis, peak_param, scan_dir, prefix,
+        comp_active = bool(
+            peak_composite_config and peak_composite_config.get("active")
         )
-        files_written.extend(p.name for p in peak_paths)
+        if comp_active:
+            channels = _resolve_composite_channels(
+                peak_composite_config, peak_fits, primary_scalars,
+            )
+            comp_path = _save_peak_composite_png(
+                channels, peak_axis, scan_dir, prefix,
+                pct_lo=peak_composite_config.get("pct_lo"),
+                pct_hi=peak_composite_config.get("pct_hi"),
+                title=str(peak_composite_config.get("title") or ""),
+            )
+            if comp_path is not None:
+                files_written.append(comp_path.name)
+        else:
+            peak_paths = _save_peak_pngs(
+                peak_fits, peak_axis, peak_param, scan_dir, prefix,
+            )
+            files_written.extend(p.name for p in peak_paths)
 
     # --- CSV: merged I(q) ---
     if "csv_iq" in formats and result is not None and hasattr(result, "merged_iq"):
