@@ -280,6 +280,12 @@ def enhanced_summary(run) -> dict:
 
 
 from smi_browser.models.collection import ScanCollection
+from smi_browser.models.cached_result import (
+    CachedGiResult as _CachedGiResult,
+    CachedResult as _CachedResult,
+    build_cached_result as _build_cached_result_from_cache,
+    proc_params_differ as _proc_params_differ,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -7528,7 +7534,13 @@ def _load_active_tab(active):
     elif active == 4:
         _load_multiview()
     elif active == 5:
-        pass  # Process tab — no auto-load
+        # Process tab — try to redisplay a previous reduction without
+        # re-running it.  Suppressed in live mode (results would race the
+        # growing scan) and during in-flight reductions.
+        try:
+            _try_load_processed_from_cache(_selected_uid())
+        except Exception:
+            log.exception("Process tab cache reload failed")
     elif active == 6:
         _load_primary()
         _refresh_export_labels()
@@ -9258,18 +9270,40 @@ def _build_proc_params(uid: str) -> tuple:
 
 
 def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> None:
-    """Extract arrays from a reduction result and write to the disk cache."""
+    """Extract arrays from a reduction result and write to the disk cache.
+
+    The arrays written here are everything needed to redisplay the Process
+    tab without re-reducing — see :func:`_try_load_processed_from_cache`.
+    Per-frame q-chi stacks live in a separate (lazy) zarr store managed by
+    smi-tiled and are NOT cached here, so per-frame 2D maps are unavailable
+    on a cached reload (only merged 2D + per-frame I(q)).
+    """
     try:
         cache = ScanCache(uid)
         arrays: dict[str, np.ndarray] = {}
 
         if geometry == "grazing":
-            # GI result: frames list (each is a 2D array)
+            # GI result: cache enough for full _CachedGiResult reconstruction.
             frames = getattr(result, "frames", None)
             if frames is not None and len(frames) > 0:
                 arrays["gi_frames"] = np.asarray(frames)
+            qxy = getattr(result, "qxy_grid", None)
+            if qxy is not None:
+                arrays["gi_qxy"] = np.asarray(qxy)
+            qz = getattr(result, "qz_grid", None)
+            if qz is not None:
+                arrays["gi_qz"] = np.asarray(qz)
+            summed = getattr(result, "summed", None)
+            if summed is not None:
+                arrays["gi_summed"] = np.asarray(summed)
+            ai = getattr(result, "alpha_i_deg", None)
+            if ai is not None:
+                arrays["gi_alpha_i_deg"] = np.asarray(ai)
+            smv = getattr(result, "scan_motor_values", None)
+            if smv is not None:
+                arrays["gi_scan_motor_values"] = np.asarray(smv)
         else:
-            # Transmission: merged_qchi and merged_iq are xarray Datasets
+            # Transmission: merged_qchi and merged_iq are xarray Datasets.
             qchi = getattr(result, "merged_qchi", None)
             if qchi is not None:
                 intensity = qchi["intensity"].values if "intensity" in qchi else None
@@ -9286,6 +9320,14 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
                     arrays["iq_q"] = iq["q"].values
                 if "I" in iq:
                     arrays["iq_I"] = iq["I"].values
+                # Per-detector traces — required for the I(q) overlay toggle
+                # to work on the cached path (see _iq_detector_mode).
+                if "saxs_I" in iq:
+                    arrays["iq_saxs_I"] = iq["saxs_I"].values
+                if "waxs_I" in iq:
+                    arrays["iq_waxs_I"] = iq["waxs_I"].values
+                if "counts" in iq:
+                    arrays["iq_counts"] = iq["counts"].values
 
             # Per-frame I(q) if available
             pf_iq = getattr(result, "per_frame_iq", None)
@@ -9293,6 +9335,10 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
                 arrays["pf_iq_I"] = pf_iq["I"].values
                 if "q" in pf_iq.coords:
                     arrays["pf_iq_q"] = pf_iq["q"].values
+                if "saxs_I" in pf_iq:
+                    arrays["pf_iq_saxs_I"] = pf_iq["saxs_I"].values
+                if "waxs_I" in pf_iq:
+                    arrays["pf_iq_waxs_I"] = pf_iq["waxs_I"].values
 
         # Filter out params that aren't JSON-safe for attr storage
         safe_params = {
@@ -9300,6 +9346,13 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
             if isinstance(v, (str, int, float, bool, type(None), list, tuple))
         }
         safe_params["geometry"] = geometry
+        # Stash GI provenance strings as attrs (they don't fit the params shape
+        # but are needed by display code on reload).
+        if geometry == "grazing":
+            for fld in ("scan_motor", "alpha_i_source", "sample_name"):
+                v = getattr(result, fld, None)
+                if isinstance(v, str):
+                    safe_params[f"gi_{fld}"] = v
 
         if arrays:
             cache.write_reduction(arrays, safe_params)
@@ -9589,42 +9642,170 @@ def _batch_dispatch(snap: dict) -> None:
         log.exception("batch: add_next_tick_callback failed")
 
 
-class _CachedResult:
-    """Minimal stub with .uid and .merged_iq for collection display."""
+def _build_cached_result(uid: str):
+    """Build a ``_CachedResult`` / ``_CachedGiResult`` from the disk cache.
 
-    def __init__(self, uid: str, merged_iq, geometry: str = "transmission"):
-        self.uid = uid
-        self.merged_iq = merged_iq
-        self.merged_qchi = None
-        self.per_frame_iq = None
-        self.timing = None
-        self.geometry = geometry
+    Returns ``(result_or_None, params_dict)``.  Thin wrapper around
+    :func:`smi_browser.models.cached_result.build_cached_result` that
+    constructs a ``ScanCache`` from a UID — used by the Process-tab
+    auto-load path and the batch collection-add-from-cache path.
+    """
+    return _build_cached_result_from_cache(ScanCache(uid))
 
 
 def _batch_add_to_collection_from_cache(uid: str, summary: dict) -> None:
     """Reload cached I(q) arrays and add a lightweight result to collection."""
-    import xarray as xr
-
     try:
-        cache = ScanCache(uid)
-        cached = cache.read_reduction()
-        if cached is None:
+        result, params = _build_cached_result(uid)
+        if result is None or params.get("geometry") == "grazing":
             return
-        arrays = cached.get("arrays", {})
-        params = cached.get("params", {})
-        q = arrays.get("iq_q")
-        I = arrays.get("iq_I")
-        if q is None or I is None:
-            return
-        # Build minimal xarray Dataset matching what collection expects
-        merged_iq = xr.Dataset(
-            {"I": xr.DataArray(I, dims=["q"], coords={"q": q})},
-        )
-        geometry = params.get("geometry", "transmission")
-        stub = _CachedResult(uid, merged_iq, geometry=geometry)
-        _collection.add(stub, summary)
+        _collection.add(result, summary)
     except Exception:
         log.debug("batch: collection add from cache failed for %s", uid[:8])
+
+
+# ---------------------------------------------------------------------------
+# Cache-aware Process-tab reload
+# ---------------------------------------------------------------------------
+
+def _try_load_processed_from_cache(uid: "str | None") -> bool:
+    """Hydrate the Process tab from the disk cache without re-reducing.
+
+    Returns True on cache hit (Process tab now mirrors what a fresh
+    ``_on_process`` would have produced, modulo per-frame q-chi maps and
+    timing); False otherwise.  Suppressed during live mode and while a
+    reduction is already in flight.
+    """
+    if not uid:
+        return False
+    if _live.get("active"):
+        return False
+    if _processing_guard.get("active"):
+        return False
+
+    try:
+        result, cached_params = _build_cached_result(uid)
+    except Exception:
+        log.exception("cache: build cached result failed for %s", uid[:8])
+        return False
+    if result is None:
+        return False
+
+    geometry = cached_params.get("geometry", "transmission")
+
+    # Compute param drift up-front so the status line shows the current state.
+    try:
+        _, current_params, current_geom = _build_proc_params(uid)
+    except Exception:
+        current_params, current_geom = {}, geometry
+    geom_changed = current_geom != geometry
+    diffs = _proc_params_differ(current_params, cached_params)
+    drift_note = ""
+    if geom_changed:
+        drift_note = (
+            f"  ·  *geometry changed (cached `{geometry}`, current `{current_geom}`) — "
+            "click Process to refresh*"
+        )
+    elif diffs:
+        shown = ", ".join(diffs[:5]) + ("…" if len(diffs) > 5 else "")
+        drift_note = (
+            f"  ·  *widget settings differ ({shown}) — click Process to refresh*"
+        )
+
+    # Hydrate the same caches _on_process feeds.
+    _per_frame_qchi_lru.clear()
+    if geometry == "grazing":
+        _proc_result_cache.update(result=None, gi_result=result)
+    else:
+        _proc_result_cache.update(result=result, gi_result=None)
+    _last_result["result"] = result
+    _last_result["params"] = dict(cached_params)
+
+    # --- Render: same side-effects as the post-reduction branch ----------
+    try:
+        if geometry == "grazing":
+            n_fr = len(result.frames)
+            w_proc_frame_slider.end = max(0, n_fr - 1)
+            w_proc_frame_slider.value = 0
+            w_proc_iq_mode.visible = n_fr > 1
+            if w_proc_iq_mode.value == "per-frame" and n_fr > 1:
+                w_proc_frame_slider.visible = True
+                w_proc_2d_plot.object = _plot_2d_gi(result, frame_idx=0)
+            else:
+                w_proc_frame_slider.visible = False
+                w_proc_2d_plot.object = _plot_2d_gi(result)
+            w_proc_iq_plot.object = None
+            n_label = f"{n_fr} frame{'s' if n_fr != 1 else ''}"
+            w_proc_status.object = (
+                f"**Cached** — GI-WAXS, {n_label}{drift_note}"
+            )
+            w_btn_add_collection.disabled = True
+        else:
+            pf_iq = result.per_frame_iq
+            qchi = result.merged_qchi
+            has_perframe = (
+                pf_iq is not None and "frame" in pf_iq.dims
+                and pf_iq.sizes["frame"] > 1
+            )
+            # No per-frame qchi on the cached path; the slider stays hidden.
+            n_fr = pf_iq.sizes["frame"] if has_perframe else 0
+            if has_perframe:
+                w_proc_frame_slider.end = max(0, n_fr - 1)
+                w_proc_frame_slider.value = 0
+            w_proc_iq_mode.visible = has_perframe
+            if not w_proc_iq_mode.visible:
+                w_proc_iq_mode.value = "merged"
+            w_proc_frame_slider.visible = False  # no qchi frame stack from cache
+            try:
+                if qchi is not None:
+                    w_proc_2d_plot.object = _plot_2d_transmission(result)
+                else:
+                    w_proc_2d_plot.object = None
+            except Exception:
+                log.exception("cached 2D plot failed")
+                w_proc_2d_plot.object = None
+
+            # Frame label selector — same source-of-truth as _on_process.
+            label_options = ["(frame #)"]
+            if pf_iq is not None:
+                iq_vars = {"I", "saxs_I", "waxs_I"}
+                label_options += [
+                    v for v in pf_iq.data_vars
+                    if v not in iq_vars and pf_iq[v].ndim == 1
+                ]
+            df = w_primary_table.value
+            if df is not None and not df.empty:
+                existing = set(label_options)
+                label_options += [
+                    c for c in df.columns
+                    if pd.api.types.is_numeric_dtype(df[c]) and c not in existing
+                ]
+            if list(w_proc_iq_label.options) != label_options:
+                w_proc_iq_label.options = label_options
+            w_proc_iq_label.visible = w_proc_iq_mode.visible
+
+            _build_proc_iq_plot()
+            _update_frame_slider_label()
+
+            n_peaks = (
+                int(result.peak_fits.sizes.get("peak", 0))
+                if result.peak_fits is not None else 0
+            )
+            peaks_note = f", {n_peaks} peak fit(s)" if n_peaks else ""
+            w_proc_status.object = (
+                f"**Cached** — transmission{peaks_note}{drift_note}"
+            )
+            w_btn_add_collection.disabled = False
+
+        # Keep the Peak Map tab populated if the user wanders there next —
+        # the existing _peakmap_load reads /peakfit directly from the cache,
+        # so no extra wiring needed here.
+    except Exception:
+        log.exception("cached process display failed for %s", uid[:8])
+        return False
+
+    log.info("cache: hydrated Process tab for %s (%s)", uid[:8], geometry)
+    return True
 
 
 def _batch_add_fn(result, summary, params):
