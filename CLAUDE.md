@@ -32,6 +32,17 @@ Two monkey-patches are applied at startup and must remain near the top of `smi_a
 - **Bokeh property descriptor patch** — BokehJS 3.9 sends visual properties as `{"type": "value", "value": X}`; the patch unwraps these silently to prevent noisy `ValueError`s on every PATCH-DOC round-trip.
 - **Tiled `Container` sort patch** (also duplicated in `smi_browser/_tiled.py`) — the SMI tiled server bakes an empty sort string (`sort=''`) into catalog containers; newer tiled servers reject it with 422. The patch clears `_sorting_params` and `_reversed_sorting_params` globally.
 
+### UI layout design standard
+
+The detail tabs follow a consistent **controls-left / visuals-right** convention. Keep new tabs and panels consistent with it:
+
+- **Two-column split.** Wrap a tab's body in a `pn.Row`: a fixed-width **left control column** (`width=460`, `scroll=True`, `sizing_mode="stretch_height"`) and a **right visual column** (`sizing_mode="stretch_both"`) holding the figure(s). The image/plot gets the full viewport height and all remaining width; tall control content scrolls inside the left column instead of pushing the visual down. (Reference: Explore tab and Process → 2D in `smi_app.py`.)
+- **Controls stack vertically.** Inside the left column, lay widgets out top-to-bottom. Use `pn.Column` for option groups (one widget per line); only pair widgets `pn.Row`-wise when they're naturally a unit, and never put **more than 2 across**. Checkboxes are always stacked one-per-line.
+- **Group controls into sub-tabs, not stacked collapsible cards.** When a tab has several control groups (e.g. Explore's Scalars / Color scale / Mask / Alignment), put each group in its own `pn.Tabs` tab rather than a vertical pile of `pn.Card(collapsed=...)`. Reserve open `pn.Card` tiles for dense parameter sets laid out 3-across (Process → Parameters).
+- **Everything is width-responsive.** Prefer `sizing_mode="stretch_width"` over fixed `width=` on text inputs, progress bars, and tables so content compresses to the available space and never forces horizontal scrolling. Tabulators use `layout="fit_columns"`.
+- **Dynamic tab labels** (e.g. `Collection (3)`) are set by reassigning the tab tuple (`tabs[i] = (name, obj)`) only when the label actually changes, to avoid re-rendering stateful content.
+- **Collapse/show panels with `.visible`,** never by reassigning `*.objects` — the latter tears down and rebuilds heavy widgets (Tabulator) and is visibly slow. `.visible=False` drops a child out of the flex row instantly and the sibling reclaims the space.
+
 ### `smi_browser/` package
 
 | Module | Responsibility |

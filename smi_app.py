@@ -1445,7 +1445,7 @@ def _sync_explore_plot_visibility(*_):
 
 w_explore_plot.param.watch(_sync_explore_plot_visibility, "object")
 w_explore_x = pn.widgets.Select(name="X", options=[], width=120)
-w_explore_y = pn.widgets.MultiChoice(name="Y", options=[], width=300, max_items=6)
+w_explore_y = pn.widgets.MultiChoice(name="Y", options=[], sizing_mode="stretch_width", max_items=6)
 
 # 2D plot for the Explore tab (mirrors the Primary-tab 2D plot, with the same
 # tap-to-jump-to-frame interaction).
@@ -1476,7 +1476,7 @@ w_mask_edit = pn.widgets.Checkbox(
     name="Edit mode", value=False, width=100,
 )
 w_mask_path = pn.widgets.TextInput(
-    name="Save / load path", value="", width=320,
+    name="Save / load path", value="", sizing_mode="stretch_width",
     placeholder="e.g. ~/my_pil2M_mask.json",
 )
 w_btn_mask_reload = pn.widgets.Button(
@@ -3437,8 +3437,8 @@ w_proc_nqxy = pn.widgets.IntInput(
 w_proc_nqz = pn.widgets.IntInput(
     name="n_qz", value=DEFAULT_N_QZ, start=100, end=2000, step=50, width=90,
 )
-w_trans_row = pn.Row(w_proc_nq, w_proc_nchi)
-w_gi_grid_row = pn.Row(w_proc_nqxy, w_proc_nqz)
+w_trans_row = pn.Column(w_proc_nq, w_proc_nchi)
+w_gi_grid_row = pn.Column(w_proc_nqxy, w_proc_nqz)
 
 # --- Masks ---
 w_proc_saxs_mask = pn.widgets.TextInput(
@@ -3489,7 +3489,7 @@ w_proc_waxs_col_per_arc = pn.widgets.FloatInput(
 )
 w_saxs_geom_section = pn.Column(
     pn.pane.Markdown("**SAXS beam-centre Δ (px)**"),
-    pn.Row(w_proc_saxs_row_delta, w_proc_saxs_col_delta, w_proc_dist_delta),
+    pn.Column(w_proc_saxs_row_delta, w_proc_saxs_col_delta, w_proc_dist_delta),
 )
 
 # --- Hot-pixel rejection ---
@@ -3792,7 +3792,7 @@ w_card_grid = pn.Card(
 
 w_card_masks = pn.Card(
     _card_restore_buttons["masks"],
-    pn.Row(w_proc_saxs_mask, w_proc_waxs_mask),
+    pn.Column(w_proc_saxs_mask, w_proc_waxs_mask),
     pn.pane.Markdown(
         "*Leave blank to use the bundled smi-tiled defaults.  "
         "Use the **Explore → mask editor** to draw, edit, and save masks "
@@ -3804,7 +3804,7 @@ w_card_masks = pn.Card(
 
 w_card_saxs_qrange = pn.Card(
     _card_restore_buttons["saxs_qrange"],
-    pn.Row(w_proc_saxs_q_cutoff, w_proc_saxs_agbh_ring, w_proc_saxs_q_margin),
+    pn.Column(w_proc_saxs_q_cutoff, w_proc_saxs_agbh_ring, w_proc_saxs_q_margin),
     pn.pane.Markdown(
         "*q cutoff = 0 → auto from silver behenate calibration.  "
         "Ring order and margin fraction control the AgBh auto-calculation.*",
@@ -3817,7 +3817,7 @@ w_card_geometry = pn.Card(
     _card_restore_buttons["geometry"],
     w_saxs_geom_section,
     pn.pane.Markdown("**WAXS beam-centre Δ (px)**"),
-    pn.Row(w_proc_waxs_row_delta, w_proc_waxs_col_delta, w_proc_waxs_col_per_arc),
+    pn.Column(w_proc_waxs_row_delta, w_proc_waxs_col_delta, w_proc_waxs_col_per_arc),
     pn.pane.Markdown(
         "*Beam-centre deltas are added to values from metadata.  "
         "\"WAXS col/arc°\" compensates column drift per degree of "
@@ -3829,7 +3829,7 @@ w_card_geometry = pn.Card(
 
 w_card_dezinger = pn.Card(
     _card_restore_buttons["dezinger"],
-    pn.Row(w_proc_dezinger, w_proc_dezinger_kernel, w_proc_pixel_splitting),
+    pn.Column(w_proc_dezinger, w_proc_dezinger_kernel, w_proc_pixel_splitting),
     pn.pane.Markdown(
         "*σ = 0 disables hot-pixel rejection.  Kernel is the median-filter "
         "window size (odd integer).  GI default σ is 30 000.  "
@@ -3849,7 +3849,7 @@ w_card_intensity = pn.Card(
 
 w_card_gi = pn.Card(
     _card_restore_buttons["gi"],
-    pn.Row(
+    pn.Column(
         w_proc_incident_angle, w_proc_incident_angle_auto,
         w_proc_theta_offset,
     ),
@@ -3865,26 +3865,26 @@ w_card_gi = pn.Card(
 
 w_card_backend = pn.Card(
     _card_restore_buttons["backend"],
-    pn.Row(w_proc_saxs_rotate, w_proc_waxs_flip),
-    pn.Row(w_proc_waxs_qx_shift, w_proc_waxs_qy_shift),
+    pn.Column(w_proc_saxs_rotate, w_proc_waxs_flip),
+    pn.Column(w_proc_waxs_qx_shift, w_proc_waxs_qy_shift),
     pn.pane.Markdown(
         "*Display orientation and global q-space shift for the WAXS "
         "detector.*",
     ),
     title="Backend / display options",
-    collapsed=True, sizing_mode="stretch_width",
+    collapsed=False, sizing_mode="stretch_width",
 )
 
 w_card_dynamic_mask = pn.Card(
     _card_restore_buttons["dynamic_mask"],
     w_proc_dynamic_mask,
     pn.pane.Markdown("**WAXS shadow on SAXS**"),
-    pn.Row(
+    pn.Column(
         w_proc_dyn_shadow_enabled, w_proc_dyn_shadow_beam_deg,
         w_proc_dyn_shadow_clear_deg,
     ),
     pn.pane.Markdown("**Aperture mask**"),
-    pn.Row(
+    pn.Column(
         w_proc_dyn_aper_enabled, w_proc_dyn_aper_agbh_ring,
         w_proc_dyn_aper_q_margin, w_proc_dyn_aper_q_cutoff,
     ),
@@ -3893,20 +3893,20 @@ w_card_dynamic_mask = pn.Card(
         "detector.  q cutoff = 0 → auto from AgBh ring.*",
     ),
     title="Dynamic SAXS masking",
-    collapsed=True, sizing_mode="stretch_width",
+    collapsed=False, sizing_mode="stretch_width",
 )
 
 w_card_waxs_cal = pn.Card(
     _card_restore_buttons["waxs_cal"],
-    pn.Row(w_proc_waxs_energy, w_proc_waxs_dist, w_proc_waxs_pixel),
-    pn.Row(w_proc_waxs_beam_row, w_proc_waxs_beam_col),
+    pn.Column(w_proc_waxs_energy, w_proc_waxs_dist, w_proc_waxs_pixel),
+    pn.Column(w_proc_waxs_beam_row, w_proc_waxs_beam_col),
     w_proc_waxs_panel_cols,
-    pn.Row(w_proc_waxs_panel_offsets, w_proc_waxs_panel_delta),
-    pn.Row(w_proc_waxs_panel_row_shifts, w_proc_waxs_panel_col_shifts),
-    pn.Row(
+    pn.Column(w_proc_waxs_panel_offsets, w_proc_waxs_panel_delta),
+    pn.Column(w_proc_waxs_panel_row_shifts, w_proc_waxs_panel_col_shifts),
+    pn.Column(
         w_proc_waxs_theta_zero, w_proc_waxs_offset_x, w_proc_waxs_offset_z,
     ),
-    pn.Row(
+    pn.Column(
         w_proc_waxs_col_arc_cal, w_proc_waxs_qh_sign,
         w_proc_waxs_qv_sign, w_proc_waxs_rot_k,
     ),
@@ -3916,7 +3916,7 @@ w_card_waxs_cal = pn.Card(
         "passed as `waxs_cal_overrides`.*",
     ),
     title="Advanced WAXS calibration",
-    collapsed=True, sizing_mode="stretch_width",
+    collapsed=False, sizing_mode="stretch_width",
 )
 
 w_card_waxs_mask_adv = pn.Card(
@@ -3927,7 +3927,7 @@ w_card_waxs_mask_adv = pn.Card(
         "Beamstop max |arc| is set in the GI parameters card above.*",
     ),
     title="Advanced WAXS masking",
-    collapsed=True, sizing_mode="stretch_width",
+    collapsed=False, sizing_mode="stretch_width",
 )
 
 
@@ -4626,8 +4626,8 @@ def _build_calibrate_panel(slot):
     )
     fit_row_1 = pn.Row(slot["ring"], slot["q_min"], slot["q_max"])
     fit_row_2 = pn.Row(slot["chi_min"], slot["chi_max"], slot["snr"], slot["bg_order"])
-    btn_row = pn.Row(slot["pick_btn"], slot["fit_btn"],
-                     slot["apply_btn"], slot["reset_btn"])
+    btn_row = pn.Row(slot["pick_btn"], slot["fit_btn"])
+    btn_row_2 = pn.Row(slot["apply_btn"], slot["reset_btn"])
     # Multi-ring section
     multi_row = pn.Row(
         slot["multi_start"], slot["multi_end"], slot["multi_q_half"],
@@ -4656,6 +4656,7 @@ def _build_calibrate_panel(slot):
         fit_row_1,
         fit_row_2,
         btn_row,
+        btn_row_2,
         slot["status"],
         slot["result"],
         pn.layout.Divider(),
@@ -6501,7 +6502,8 @@ _peak_left_pane = pn.Column(
            w_btn_peak_cancel, w_peak_spinner),
     w_peak_table,
     w_peak_status,
-    pn.Row(w_peak_view_mode, w_peak_map_x, w_peak_map_y),
+    w_peak_view_mode,
+    pn.Row(w_peak_map_x, w_peak_map_y),
     _peak_single_controls,
     _peak_composite_controls,
     width=560,
@@ -9542,11 +9544,12 @@ w_batch_status = pn.pane.Markdown(
     margin=(0, 5),
 )
 w_batch_progress = pn.indicators.Progress(
-    name="Batch progress", value=0, max=1, width=400, visible=False,
+    name="Batch progress", value=0, max=1, visible=False,
+    sizing_mode="stretch_width",
 )
 w_batch_table = pn.widgets.Tabulator(
     pd.DataFrame(columns=["uid_short", "label", "state", "duration_s", "error"]),
-    height=320, layout="fit_data_stretch", show_index=False, disabled=True,
+    height=320, layout="fit_columns", show_index=False, disabled=True,
     sizing_mode="stretch_width",
 )
 
@@ -9560,9 +9563,6 @@ _BATCH_ROW_COLORS = {
 }
 w_batch_max_workers = pn.widgets.IntInput(
     name="Workers", value=1, start=1, end=16, width=90,
-)
-w_batch_low_memory_mode = pn.widgets.Checkbox(
-    name="Low-memory mode (force 1 worker)", value=True,
 )
 w_batch_skip_existing = pn.widgets.Checkbox(
     name="Skip uids already in collection", value=True,
@@ -9637,10 +9637,7 @@ def _batch_memory_status_text() -> str:
 
 
 def _batch_effective_workers() -> int:
-    requested = max(1, int(w_batch_max_workers.value or 1))
-    if w_batch_low_memory_mode.value:
-        return 1
-    return requested
+    return max(1, int(w_batch_max_workers.value or 1))
 
 
 def _batch_processed_contains(uid: str) -> bool:
@@ -9686,11 +9683,6 @@ def _batch_trim_allocator_now() -> None:
 
 def _batch_post_job_cleanup() -> None:
     """Aggressive cleanup after each batch job to limit RSS growth."""
-    if w_batch_low_memory_mode.value:
-        try:
-            clear_geometry_cache()
-        except Exception:
-            pass
     _batch_cleanup_memory()
     prune_lock_table()
     _batch_trim_allocator_now()
@@ -9831,7 +9823,7 @@ def _build_proc_params(uid: str) -> tuple:
         geometry=geometry,
         saxs_mask_path=saxs_mask_path,
         waxs_mask_path=waxs_mask_path,
-        cache_geometry=(w_cache_enabled.value and not w_batch_low_memory_mode.value),
+        cache_geometry=w_cache_enabled.value,
     )
     # Supply pre-cached images if available
     _cp = cache_path(uid)
@@ -10556,11 +10548,6 @@ def _on_batch_queue(event):
         _batch_state["doc"] = None
     _batch_state["rss_peak_mb"] = 0.0
 
-    if w_batch_low_memory_mode.value and (w_batch_max_workers.value or 1) > 1:
-        pn.state.notifications.info(
-            "Low-memory mode is on; batch workers are forced to 1."
-        )
-
     max_jobs = max(1, int(w_batch_max_jobs.value or 25))
     skip_existing = w_batch_skip_existing.value
     skip_processed = w_batch_skip_processed.value
@@ -10679,15 +10666,10 @@ batch_panel = pn.Column(
         "of the Scan Collection to reduce memory usage; processed uid "
         "history can be used to skip repeats.",
     ),
-    pn.Row(
-        w_btn_batch_queue,
-        w_btn_batch_cancel,
-        w_btn_batch_clear,
-        w_btn_batch_clear_processed,
-    ),
+    pn.Row(w_btn_batch_queue, w_btn_batch_cancel),
+    pn.Row(w_btn_batch_clear, w_btn_batch_clear_processed),
     pn.Row(w_batch_max_jobs, w_batch_max_workers),
-    pn.Row(w_batch_low_memory_mode),
-    pn.Row(
+    pn.Column(
         w_batch_skip_existing,
         w_batch_skip_processed,
         w_batch_add_to_collection,
@@ -10712,19 +10694,19 @@ w_export_dir = pn.widgets.TextInput(
     name="Relative path (within proposal directory)",
     value="projects/{project_name}/analysis",
     placeholder="projects/{project_name}/analysis",
-    width=500,
+    sizing_mode="stretch_width",
 )
 w_export_resolved_path = pn.pane.Markdown("", sizing_mode="stretch_width")
 w_export_subdir = pn.widgets.TextInput(
     name="Subdirectory template",
     value="",
     placeholder="e.g. {uid_short}_{sample_name}",
-    width=300,
+    sizing_mode="stretch_width",
 )
 w_export_basename = pn.widgets.TextInput(
     name="Base filename template",
     value="{sample_name}_{scan_id}",
-    width=300,
+    sizing_mode="stretch_width",
 )
 w_export_frame_label_1 = pn.widgets.Select(
     name="Frame label 1",
@@ -11921,11 +11903,12 @@ w_bxp_status = pn.pane.Markdown(
     margin=(0, 5),
 )
 w_bxp_progress = pn.indicators.Progress(
-    name="Batch export progress", value=0, max=1, width=400, visible=False,
+    name="Batch export progress", value=0, max=1, visible=False,
+    sizing_mode="stretch_width",
 )
 w_bxp_table = pn.widgets.Tabulator(
     pd.DataFrame(columns=["uid_short", "label", "state", "duration_s", "error"]),
-    height=320, layout="fit_data_stretch", show_index=False, disabled=True,
+    height=320, layout="fit_columns", show_index=False, disabled=True,
     sizing_mode="stretch_width",
 )
 w_bxp_max_workers = pn.widgets.IntInput(
@@ -12668,11 +12651,9 @@ def _live_set_lockout(on: bool) -> None:
         # Snapshot current tab + force Explore.
         _live_save(w_detail_tabs, "active")
         w_detail_tabs.active = EXPLORE_TAB_INDEX
-        # Hide collection/search cards so they don't tempt clicks.
+        # Hide the search card so it doesn't tempt clicks.
         _live_save(search_card, "collapsed")
         search_card.collapsed = True
-        _live_save(collection_card, "collapsed")
-        collection_card.collapsed = True
     else:
         _live_restore_all()
 
@@ -13521,41 +13502,48 @@ left_panel = pn.Column(
 
 # Process sub-tabs.  Defined as a standalone object so the Peak Map sub-tab can
 # lazily load its (memory-heavy) per-frame data only when first activated.
-_proc_advanced_card = pn.Card(
-    pn.Tabs(
-        (
-            "Cross sections",
-            pn.Column(
-                pn.pane.Markdown(
-                    "*Click **+ Horizontal cut** or **+ Vertical cut** to drop "
-                    "a dashed slice rectangle on the 2D plot above. Drag it to "
-                    "move; drag a corner/edge to resize the slice width. Hold "
-                    "shift+drag on empty space to draw a new box; click a box "
-                    "and press Backspace to delete. Cuts persist across scans "
-                    "-- they are re-applied to every newly processed result.*",
-                ),
-                pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts,
-                       w_cuts_log_x, w_cuts_log_y, w_plot_style),
-                w_cuts_table,
-                w_proc_cuts_plot,
-                sizing_mode="stretch_width",
+# The "advanced" controls (cross-section cuts + calibration) live in a narrow
+# left column of the 2D sub-tab, next to the q-χ plot — no longer a collapsible
+# card.
+_proc_advanced_tabs = pn.Tabs(
+    (
+        "Cross sections",
+        pn.Column(
+            pn.pane.Markdown(
+                "*Click **+ Horizontal cut** or **+ Vertical cut** to drop "
+                "a dashed slice rectangle on the 2D plot. Drag it to "
+                "move; drag a corner/edge to resize the slice width. Hold "
+                "shift+drag on empty space to draw a new box; click a box "
+                "and press Backspace to delete. Cuts persist across scans "
+                "-- they are re-applied to every newly processed result.*",
             ),
+            pn.Row(w_btn_add_hcut, w_btn_add_vcut, w_btn_clear_cuts),
+            pn.Row(w_cuts_log_x, w_cuts_log_y, w_plot_style),
+            w_cuts_table,
+            w_proc_cuts_plot,
+            sizing_mode="stretch_width",
         ),
-        ("Calibrate SAXS", _build_calibrate_panel(_CAL_SAXS)),
-        ("Calibrate WAXS", _build_calibrate_panel(_CAL_WAXS)),
-        sizing_mode="stretch_width",
     ),
-    title="Advanced",
-    collapsed=False, sizing_mode="stretch_width",
+    ("Calibrate SAXS", _build_calibrate_panel(_CAL_SAXS)),
+    ("Calibrate WAXS", _build_calibrate_panel(_CAL_WAXS)),
+    sizing_mode="stretch_width",
 )
 
 w_proc_inner_tabs = pn.Tabs(
     (
         "2D (q-chi)",
-        pn.Column(
-            w_proc_2d_plot,
-            _proc_advanced_card,
-            sizing_mode="stretch_width",
+        pn.Row(
+            pn.Column(
+                _proc_advanced_tabs,
+                width=460,
+                scroll=True,
+                sizing_mode="stretch_height",
+            ),
+            pn.Column(
+                w_proc_2d_plot,
+                sizing_mode="stretch_both",
+            ),
+            sizing_mode="stretch_both",
         ),
     ),
     (
@@ -13568,18 +13556,30 @@ w_proc_inner_tabs = pn.Tabs(
     (_PEAK_MAP_TAB_TITLE, peak_map_panel),
     (
         "Parameters",
-        pn.Column(
-            w_card_grid,
-            w_card_masks,
-            w_card_saxs_qrange,
-            w_card_geometry,
-            w_card_dezinger,
-            w_card_intensity,
-            w_card_gi,
-            w_card_backend,
-            w_card_dynamic_mask,
-            w_card_waxs_cal,
-            w_card_waxs_mask_adv,
+        # Tiled 3-across layout: every card open by default so the whole
+        # parameter set is visible at a glance instead of a tall stack of
+        # collapsibles.  Three stretching columns keep the cards even.
+        pn.Row(
+            pn.Column(
+                w_card_grid,
+                w_card_masks,
+                w_card_saxs_qrange,
+                w_card_geometry,
+                sizing_mode="stretch_width",
+            ),
+            pn.Column(
+                w_card_dezinger,
+                w_card_intensity,
+                w_card_gi,
+                w_card_backend,
+                sizing_mode="stretch_width",
+            ),
+            pn.Column(
+                w_card_dynamic_mask,
+                w_card_waxs_cal,
+                w_card_waxs_mask_adv,
+                sizing_mode="stretch_width",
+            ),
             sizing_mode="stretch_width",
         ),
     ),
@@ -13678,51 +13678,53 @@ w_detail_tabs = pn.Tabs(
                 pn.Row(w_image_field, w_image_frame_input,
                        sizing_mode="stretch_width"),
                 w_image_slider,
-                # Linked plot of the scalar table: 1D line plot or 2D map.
-                # Tapping a 2D point jumps the image to that frame.
+                # All single-image tooling lives in one tabbed panel so the
+                # left column stays compact: linked scalar plots, colour scale,
+                # mask overlay, and alignment / line profile.
                 pn.Tabs(
-                    ("1D", pn.Column(
-                        pn.Row(w_explore_x, w_explore_y, sizing_mode="stretch_width"),
-                        w_explore_plot_container,
+                    ("📈 Scalars", pn.Tabs(
+                        ("1D", pn.Column(
+                            w_explore_x,
+                            w_explore_y,
+                            w_explore_plot_container,
+                            sizing_mode="stretch_width",
+                        )),
+                        ("2D", pn.Column(
+                            pn.Row(w_explore_2d_x, w_explore_2d_y),
+                            pn.Row(w_explore_2d_z, w_explore_2d_cmap),
+                            pn.Row(w_explore_2d_log, w_explore_2d_aspect),
+                            w_explore_2d_status,
+                            w_explore_2d_plot,
+                            sizing_mode="stretch_width",
+                        )),
                         sizing_mode="stretch_width",
                     )),
-                    ("2D", pn.Column(
-                        pn.Row(w_explore_2d_x, w_explore_2d_y, w_explore_2d_z,
-                               w_explore_2d_cmap, w_explore_2d_log, w_explore_2d_aspect,
-                               sizing_mode="stretch_width"),
-                        w_explore_2d_status,
-                        w_explore_2d_plot,
-                        sizing_mode="stretch_width",
-                    )),
-                    sizing_mode="stretch_width",
-                ),
-                # Plotting tools card — color scale, mask overlay, alignment.
-                pn.Card(
-                    pn.Card(
-                        pn.Row(w_cs_cmap, w_cs_log, w_cs_lock),
+                    ("🎨 Color scale", pn.Column(
+                        w_cs_cmap,
+                        pn.Row(w_cs_log, w_cs_lock),
                         w_cs_range,
                         pn.Row(w_cs_min, w_cs_max),
                         w_cs_hist,
-                        title="🎨 Color scale",
-                        collapsed=False, sizing_mode="stretch_width",
-                    ),
-                    pn.Card(
-                        pn.Row(w_mask_show, w_mask_dynamic, w_mask_edit,
-                               w_btn_mask_reload),
-                        pn.Row(w_mask_path, w_btn_mask_save, w_btn_mask_use),
+                        sizing_mode="stretch_width",
+                    )),
+                    ("🛡 Mask", pn.Column(
+                        w_mask_show,
+                        w_mask_dynamic,
+                        w_mask_edit,
+                        w_btn_mask_reload,
+                        w_mask_path,
+                        pn.Row(w_btn_mask_save, w_btn_mask_use),
                         w_mask_status,
-                        title="🛡 Mask overlay",
-                        collapsed=True, sizing_mode="stretch_width",
-                    ),
-                    pn.Card(
-                        pn.Row(w_align_enable, w_align_width, w_btn_align_clear),
+                        sizing_mode="stretch_width",
+                    )),
+                    ("📐 Alignment", pn.Column(
+                        w_align_enable,
+                        pn.Row(w_align_width, w_btn_align_clear),
                         w_align_stats,
                         w_align_profile,
-                        title="📐 Alignment / line profile",
-                        collapsed=True, sizing_mode="stretch_width",
-                    ),
-                    title="🛠 Plotting tools",
-                    collapsed=False, sizing_mode="stretch_width",
+                        sizing_mode="stretch_width",
+                    )),
+                    sizing_mode="stretch_width",
                 ),
                 width=460,
                 scroll=True,
@@ -13779,11 +13781,19 @@ w_btn_toggle_sidebar = pn.widgets.Toggle(
     name="◀", value=False, button_type="light", width=32,
     stylesheets=[":host { font-size: 14px; padding: 0; }"],
 )
+# Gap between the (optional) sidebar and the detail panel; swapped in/out with
+# the sidebar by the toggle handler below.
+_sidebar_spacer = pn.Spacer(width=10)
 
 def _on_toggle_sidebar(event):
     hidden = event.new
-    left_panel.visible = not hidden
     w_btn_toggle_sidebar.name = "▶" if hidden else "◀"
+    # Toggle visibility only — a cheap front-end property update that drops the
+    # column out of the flex row (so the detail panel reclaims the space)
+    # WITHOUT tearing down / rebuilding the heavy Tabulator (which made the
+    # object-swap approach take seconds).
+    _sidebar_spacer.visible = not hidden
+    left_panel.visible = not hidden
 
 w_btn_toggle_sidebar.param.watch(_on_toggle_sidebar, "value")
 
@@ -14119,7 +14129,7 @@ _coll_ns.refresh = _coll_refresh_with_export
 
 # ---------------------------------------------------------------------------
 
-collection_card = pn.Card(
+collection_panel_content = pn.Column(
     pn.Tabs(
         (
             "Compare",
@@ -14130,6 +14140,7 @@ collection_card = pn.Card(
                         w_btn_coll_remove, w_btn_coll_clear_unpinned,
                     ),
                     pn.Row(w_coll_pinned_only, w_coll_label),
+                    w_coll_summary,
                     w_coll_table,
                     sizing_mode="stretch_width",
                     min_width=300,
@@ -14150,20 +14161,47 @@ collection_card = pn.Card(
         ),
         sizing_mode="stretch_width",
     ),
-    title="📊 Processed Collection",
-    collapsed=True,
     sizing_mode="stretch_width",
-    margin=(0, 0, 10, 0),
 )
+
+# Appended as the last tab of ``w_detail_tabs`` below (after the tabs object is
+# fully built).  Index is captured then so callbacks can switch to it.
+_COLLECTION_TAB_IDX = len(w_detail_tabs)
+w_detail_tabs.append(("Collection", collection_panel_content))
+_collection_tab_name = "Collection"
+
+
+def _update_collection_tab_title(*_events) -> None:
+    """Reflect the live collection size in the Collection tab label."""
+    global _collection_tab_name
+    n = len(_collection)
+    name = f"Collection ({n})" if n else "Collection"
+    if name == _collection_tab_name:
+        return
+    try:
+        # Rewrite the tab tuple only when the label changes, to avoid needless
+        # re-renders of the (stateful) collection content.
+        w_detail_tabs[_COLLECTION_TAB_IDX] = (name, collection_panel_content)
+        _collection_tab_name = name
+    except Exception:
+        log.debug("collection tab title update failed", exc_info=True)
+
+
+# ``w_coll_summary.object`` is rewritten by the collection refresh() on every
+# add/remove/pin, so watch it to keep the tab count in sync.
+w_coll_summary.param.watch(_update_collection_tab_title, "object")
 
 
 def _open_collection_panel(_event=None):
-    """Pop the Scan Collection card open (called after add / compare)."""
-    collection_card.collapsed = False
+    """Switch the detail view to the Collection tab (called after add/compare)."""
+    try:
+        w_detail_tabs.active = _COLLECTION_TAB_IDX
+    except Exception:
+        log.debug("could not activate collection tab", exc_info=True)
 
 browse_row = pn.Row(
     left_panel,
-    pn.Spacer(width=10),
+    _sidebar_spacer,
     detail_panel,
     sizing_mode="stretch_width",
 )
@@ -14181,10 +14219,6 @@ dashboard = pn.Column(
     ),
     w_login_form,
     w_live_banner,
-    # Collection card sits ABOVE the browse area so it can never overlap
-    # tall scrolling content (e.g. a full-resolution detector image).
-    pn.Row(w_coll_summary, sizing_mode="stretch_width"),
-    collection_card,
     browse_row,
     sizing_mode="stretch_width",
 )
