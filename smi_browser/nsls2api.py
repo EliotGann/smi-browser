@@ -165,12 +165,18 @@ def fetch_commissioning_proposals(beamline: str = BEAMLINE) -> list[str]:
 def fetch_proposal_directory(proposal_id: str) -> str | None:
     """Return the filesystem path for a proposal's working directory.
 
-    Calls ``GET /v1/proposal/{id}/directories`` and returns the first
-    directory path, or *None* if unavailable.
+    Calls ``GET /v1/proposal/{id}/directories``.  When a proposal spans
+    multiple beamlines (so multiple directory roots exist), the entry whose
+    ``beamline`` matches :data:`BEAMLINE` is preferred; otherwise the first
+    directory path is returned, or *None* if unavailable.
     """
     dirs = fetch_proposal_directories(proposal_id)
-    if dirs:
-        return dirs[0].get("path")
+    if not dirs:
+        return None
+    for entry in _filter_dirs_by_beamline(dirs, BEAMLINE) or dirs:
+        path = entry.get("path")
+        if path:
+            return path
     return None
 
 
@@ -189,29 +195,82 @@ def fetch_proposal_directories(proposal_id: str) -> list[dict[str, Any]]:
     return []
 
 
+def _filter_dirs_by_beamline(
+    dirs: list[dict[str, Any]],
+    beamline: str,
+) -> list[dict[str, Any]]:
+    """Return the subset of *dirs* whose ``beamline`` matches *beamline*.
+
+    Matching is case-insensitive.  Entries with no ``beamline`` field are
+    excluded.  Returns an empty list when nothing matches (callers fall back
+    to the full list so single-beamline proposals keep working).
+    """
+    if not beamline:
+        return []
+    target = str(beamline).strip().lower()
+    return [
+        e for e in dirs
+        if str(e.get("beamline") or "").strip().lower() == target
+    ]
+
+
 def fetch_proposal_directory_for_cycle(
     proposal_id: str,
     cycle: str | None,
+    beamline: str | None = BEAMLINE,
 ) -> str | None:
-    """Return a proposal directory path matching *cycle* when possible.
+    """Return a proposal directory path matching *beamline* and *cycle*.
 
-    If *cycle* is not provided or no matching directory exists, returns the
-    first directory entry as a fallback for backward compatibility.
+    A proposal may have directory entries on several beamlines (and several
+    cycles).  Selection precedence:
+
+    1. exact ``beamline`` **and** ``cycle`` match,
+    2. ``beamline`` match (most recent cycle entry),
+    3. ``cycle`` match on any beamline,
+    4. first entry overall (backward-compatible fallback).
+
+    Passing ``beamline=None`` disables beamline filtering and restores the
+    original cycle-only behaviour.
     """
     dirs = fetch_proposal_directories(proposal_id)
     if not dirs:
         return None
 
-    if cycle:
-        cycle_norm = str(cycle).strip().lower()
+    cycle_norm = str(cycle).strip().lower() if cycle else None
+
+    # Restrict to the requested beamline when it has any entries; otherwise
+    # keep the full list so single-beamline proposals are unaffected.
+    bl_dirs = _filter_dirs_by_beamline(dirs, beamline) if beamline else []
+    scope = bl_dirs or dirs
+
+    # 1./2. Within the beamline scope, prefer a cycle match, else the last
+    # (most recent) entry in that scope.
+    if cycle_norm:
+        for entry in scope:
+            entry_cycle = str(entry.get("cycle", "")).strip().lower()
+            path = entry.get("path")
+            if entry_cycle == cycle_norm and path:
+                return path
+
+    if bl_dirs:
+        # Beamline matched but the requested cycle (if any) had no entry.
+        # Fall back to the most recent directory for this beamline rather
+        # than to another beamline's path.
+        for entry in reversed(bl_dirs):
+            path = entry.get("path")
+            if path:
+                return path
+
+    # 3. No beamline match at all — honour a cycle match on any beamline.
+    if cycle_norm:
         for entry in dirs:
             entry_cycle = str(entry.get("cycle", "")).strip().lower()
             path = entry.get("path")
             if entry_cycle == cycle_norm and path:
                 return path
 
-    first = dirs[0]
-    return first.get("path")
+    # 4. Last resort.
+    return dirs[0].get("path")
 
 
 # ---------------------------------------------------------------------------
