@@ -334,7 +334,8 @@ class ScanCache:
 
     # -- raw image stacks ---------------------------------------------
 
-    def read_image_stack(self, field: str) -> np.ndarray | None:
+    def read_image_stack(self, field: str,
+                         stream: str = "primary") -> np.ndarray | None:
         """Return the full image stack for ``field`` or ``None``.
 
         For very large stacks the caller should prefer ``open_image_dataset``
@@ -346,7 +347,7 @@ class ScanCache:
         with self._lock:
             try:
                 with h5py.File(self.path, "r") as f:
-                    ds = f.get(f"images/{field}")
+                    ds = f.get(_image_path(stream, field))
                     if ds is None:
                         return None
                     return ds[...]
@@ -354,27 +355,28 @@ class ScanCache:
                 log.warning("ScanCache.read_image_stack(%s): %s", field, exc)
                 return None
 
-    def write_image_stack(self, field: str, arr: np.ndarray) -> None:
+    def write_image_stack(self, field: str, arr: np.ndarray,
+                          stream: str = "primary") -> None:
         import h5py
         arr = np.asarray(arr)
+        path = _image_path(stream, field)
         with self._lock:
             with h5py.File(self.path, "a") as f:
-                grp = f.require_group("images")
-                if field in grp:
-                    del grp[field]
+                if path in f:
+                    del f[path]
                 # Per-frame chunks keep random-access reads cheap.
                 if arr.ndim >= 3:
                     chunks = (1,) + tuple(arr.shape[1:])
                 else:
                     chunks = True
-                grp.create_dataset(
-                    field, data=arr, chunks=chunks,
+                f.create_dataset(
+                    path, data=arr, chunks=chunks,
                     compression="gzip", compression_opts=2,
                 )
         _maybe_evict()
 
-    def has_image_field(self, field: str) -> bool:
-        return self.has_group(f"images/{field}")
+    def has_image_field(self, field: str, stream: str = "primary") -> bool:
+        return self.has_group(_image_path(stream, field))
 
     # -- reduction -----------------------------------------------------
 
@@ -730,6 +732,27 @@ def _maybe_evict() -> None:
 # Cache-aware fetch helpers
 # ---------------------------------------------------------------------------
 
+def _image_path(stream: str, field: str) -> str:
+    """HDF5 dataset path for a detector ``field`` in a given ``stream``.
+
+    The ``primary`` stream keeps the legacy ``images/<field>`` layout so
+    caches written before per-stream support are still read.  Any other
+    stream (e.g. the arc-economy ``arc0`` / ``arc20`` streams) is namespaced
+    as ``images/<stream>/<field>`` so two streams that expose the *same*
+    detector field name don't clobber each other.
+    """
+    if not stream or stream == "primary":
+        return f"images/{field}"
+    return f"images/{stream.replace('/', '_')}/{field}"
+
+
+def _image_fill_path(stream: str, field: str) -> str:
+    """Companion per-frame fill-mask path for :func:`_image_path`."""
+    if not stream or stream == "primary":
+        return f"images_filled/{field}"
+    return f"images_filled/{stream.replace('/', '_')}/{field}"
+
+
 def get_or_fetch_scalars(uid: str, stream: str, fetch_fn) -> dict[str, np.ndarray]:
     """Return cached scalars or fetch + cache.
 
@@ -754,13 +777,14 @@ def get_or_fetch_scalars(uid: str, stream: str, fetch_fn) -> dict[str, np.ndarra
     return data
 
 
-def get_or_fetch_image_stack(uid: str, field: str, fetch_fn) -> np.ndarray | None:
+def get_or_fetch_image_stack(uid: str, field: str, fetch_fn,
+                             stream: str = "primary") -> np.ndarray | None:
     """Return cached image stack or fetch + cache.
 
     ``fetch_fn`` is a zero-arg callable returning the ndarray.
     """
     cache = ScanCache(uid)
-    cached = cache.read_image_stack(field)
+    cached = cache.read_image_stack(field, stream=stream)
     if cached is not None:
         return cached
     from . import memlog
@@ -774,7 +798,7 @@ def get_or_fetch_image_stack(uid: str, field: str, fetch_fn) -> np.ndarray | Non
         return None
     memlog.report(f"img_stack:fetched {field}", {"stack": arr})
     try:
-        cache.write_image_stack(field, arr)
+        cache.write_image_stack(field, arr, stream=stream)
     except Exception:
         log.exception("cache: write_image_stack failed for %s/%s", uid, field)
     return arr
@@ -788,6 +812,7 @@ def get_or_fetch_image_frame(
     *,
     fetch_one_fn=None,
     n_frames: int | None = None,
+    stream: str = "primary",
 ) -> np.ndarray | None:
     """Return a single image frame, caching frames *individually* on miss.
 
@@ -804,8 +829,8 @@ def get_or_fetch_image_frame(
     import h5py
 
     cache = ScanCache(uid)
-    dset_name = f"images/{field}"
-    fill_name = f"images_filled/{field}"
+    dset_name = _image_path(stream, field)
+    fill_name = _image_fill_path(stream, field)
 
     # Fast path: read just the requested frame from disk.  When a fill mask is
     # present (lazy per-frame cache) the frame is only valid if marked filled;
@@ -830,7 +855,7 @@ def get_or_fetch_image_frame(
     if fetch_one_fn is not None:
         if n_frames:
             return _cache_one_frame(cache, field, int(frame_idx),
-                                    int(n_frames), fetch_one_fn)
+                                    int(n_frames), fetch_one_fn, stream=stream)
         # Unknown length — serve a single uncached frame (still bounded RAM).
         try:
             fr = fetch_one_fn(frame_idx)
@@ -856,7 +881,7 @@ def get_or_fetch_image_frame(
     stack = np.asarray(stack)
     memlog.report(f"img_stack:fetched {field}", {"stack": stack})
     try:
-        cache.write_image_stack(field, stack)
+        cache.write_image_stack(field, stack, stream=stream)
     except Exception:
         log.exception("cache: write_image_stack failed for %s/%s", uid, field)
     if stack.ndim >= 3:
@@ -864,7 +889,8 @@ def get_or_fetch_image_frame(
     return stack
 
 
-def _cache_one_frame(cache, field, frame_idx, n_frames, fetch_one_fn):
+def _cache_one_frame(cache, field, frame_idx, n_frames, fetch_one_fn,
+                     stream: str = "primary"):
     """Fetch one frame and store it in a per-frame-chunked, partially-filled
     HDF5 dataset — never holding more than a single frame in RAM."""
     import h5py
@@ -877,8 +903,8 @@ def _cache_one_frame(cache, field, frame_idx, n_frames, fetch_one_fn):
     if frame is None:
         return None
     frame = np.asarray(frame)
-    dset_name = f"images/{field}"
-    fill_name = f"images_filled/{field}"
+    dset_name = _image_path(stream, field)
+    fill_name = _image_fill_path(stream, field)
     with cache._lock:
         try:
             with h5py.File(cache.path, "a") as f:

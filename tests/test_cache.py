@@ -80,6 +80,39 @@ def test_image_stack_roundtrip(isolated_cache_dir):
     np.testing.assert_array_equal(out, stack)
 
 
+def test_image_stack_per_stream_no_collision(isolated_cache_dir):
+    """Same detector field in two streams must not clobber each other."""
+    c = ScanCache("uid-arc")
+    waxs_arc0 = np.zeros((2, 3, 3), dtype=np.float32)
+    waxs_arc20 = np.ones((2, 3, 3), dtype=np.float32)
+    # 'primary' uses the legacy images/<field> path; arc20 is namespaced.
+    c.write_image_stack("pil900KW_image", waxs_arc0, stream="primary")
+    c.write_image_stack("pil900KW_image", waxs_arc20, stream="arc20")
+
+    np.testing.assert_array_equal(
+        c.read_image_stack("pil900KW_image", stream="primary"), waxs_arc0)
+    np.testing.assert_array_equal(
+        c.read_image_stack("pil900KW_image", stream="arc20"), waxs_arc20)
+    assert c.has_image_field("pil900KW_image", stream="primary")
+    assert c.has_image_field("pil900KW_image", stream="arc20")
+    # A stream we never wrote is absent.
+    assert c.read_image_stack("pil900KW_image", stream="arc0") is None
+    assert not c.has_image_field("pil900KW_image", stream="arc0")
+
+
+def test_image_primary_uses_legacy_path(isolated_cache_dir):
+    """primary writes must remain readable at the bare images/<field> path
+    so caches written before per-stream support still load."""
+    import h5py
+    c = ScanCache("uid-legacy")
+    stack = np.arange(2 * 2 * 2, dtype=np.float32).reshape(2, 2, 2)
+    c.write_image_stack("pil2M_image", stack, stream="primary")
+    with h5py.File(c.path, "r") as f:
+        assert "images/pil2M_image" in f
+        assert "images/primary" not in f  # no extra nesting for primary
+
+
+
 # ---------------------------------------------------------------------------
 # Reduction
 # ---------------------------------------------------------------------------
@@ -128,6 +161,39 @@ def test_lazy_per_frame_fetch_only_loads_requested(isolated_cache_dir):
     with h5py.File(ScanCache(uid).path, "r") as h:
         assert h[f"images/{field}"].shape == (n, 3, 4)
         assert int(h[f"images_filled/{field}"][...].sum()) == 2
+
+
+def test_lazy_per_frame_is_stream_isolated(isolated_cache_dir):
+    """Per-frame caching keeps streams in separate datasets + fill masks."""
+    from smi_browser.cache import get_or_fetch_image_frame
+    import h5py
+
+    uid, field, n = "lazy-arc", "pil900KW_image", 10
+
+    a = get_or_fetch_image_frame(
+        uid, field, 3, fetch_one_fn=lambda i: np.full((2, 2), 10 + i, "int32"),
+        n_frames=n, stream="arc0")
+    b = get_or_fetch_image_frame(
+        uid, field, 3, fetch_one_fn=lambda i: np.full((2, 2), 90 + i, "int32"),
+        n_frames=n, stream="arc20")
+    assert a[0, 0] == 13 and b[0, 0] == 93  # no cross-stream clobber
+
+    # Re-view of arc0 returns arc0's value from disk (not arc20's).
+    a2 = get_or_fetch_image_frame(
+        uid, field, 3, fetch_one_fn=lambda i: (_ for _ in ()).throw(
+            AssertionError("should not refetch")),
+        n_frames=n, stream="arc0")
+    assert a2[0, 0] == 13
+
+    with h5py.File(ScanCache(uid).path, "r") as h:
+        # arc0/arc20 are both namespaced (neither is 'primary'), so the bare
+        # legacy path is NOT used.
+        assert "images/pil900KW_image" not in h
+        assert "images/arc0/pil900KW_image" in h
+        assert "images/arc20/pil900KW_image" in h
+        assert "images_filled/arc0/pil900KW_image" in h
+        assert "images_filled/arc20/pil900KW_image" in h
+
 
 
 def test_lazy_unknown_length_serves_uncached(isolated_cache_dir):

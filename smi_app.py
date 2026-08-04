@@ -333,6 +333,7 @@ _detail_cache = {
     "uid":              None,
     "run":              None,
     "summary":          None,
+    "stream":           "primary",
     "primary_loaded":   False,
     "baseline_loaded":  False,
     "images_loaded":    False,
@@ -1337,6 +1338,14 @@ w_primary_table = pn.widgets.Tabulator(
 )
 w_primary_status = pn.pane.Markdown("*Click tab to load.*")
 w_primary_spinner = pn.indicators.LoadingSpinner(value=False, size=20, visible=False)
+# Event-stream selector. Most scans have a single ``primary`` stream, but
+# arc-economy GIWAXS runs split data into per-arc streams (arc0, arc20, …);
+# this lets the Primary scalars + Explore/Grid image tabs target any of them.
+# Hidden unless a run actually has more than one (non-baseline) stream.
+w_stream_select = pn.widgets.Select(
+    name="Stream", options=["primary"], value="primary", width=160,
+    visible=False,
+)
 w_primary_x = pn.widgets.Select(
     name="X axis", options=[], width=180,
 )
@@ -2003,15 +2012,17 @@ def _cached_fetch_frame(run, field: str, frame_idx: int, ds=None) -> np.ndarray 
     freezes the UI.  Read just the requested frame straight from tiled instead.
     """
     uid = _selected_uid()
+    stream = _active_stream()
     if uid and not _live.get("active"):
         arr = get_or_fetch_image_frame(
             uid, field, frame_idx,
-            fetch_one_fn=lambda i: tb.fetch_frame(run, "primary", field,
+            fetch_one_fn=lambda i: tb.fetch_frame(run, stream, field,
                                                   frame_idx=i),
             n_frames=_image_cache.get("n_frames") or 0,
+            stream=stream,
         )
     else:
-        arr = tb.fetch_frame(run, "primary", field, frame_idx=frame_idx, _dataset=ds)
+        arr = tb.fetch_frame(run, stream, field, frame_idx=frame_idx, _dataset=ds)
     return _coerce_to_2d_frame(arr)
 
 
@@ -2484,10 +2495,10 @@ def _load_multiview():
         return
     w_mv_status.object = "*Loading…*"
 
-    # Re-use primary stream info (loaded by Explore / Primary tabs too)
+    # Re-use stream info (loaded by Explore / Primary tabs too)
     info = _detail_cache.get("primary_info")
-    if info is None and "primary" in tb.stream_names(run):
-        info = tb.stream_info_for(run, "primary")
+    if info is None and _active_stream() in tb.stream_names(run):
+        info = tb.stream_info_for(run, _active_stream())
         _detail_cache["primary_info"] = info
         _detail_cache["primary_dataset"] = info.get("dataset")
 
@@ -2791,7 +2802,7 @@ def _fetch_and_build_multiview_multi(field: str) -> None:
             continue
         runs[uid] = run
         try:
-            info = tb.stream_info_for(run, "primary")
+            info = tb.stream_info_for(run, _active_stream())
             shape = info["fields"].get(field, ())
             n_per_scan[uid] = shape[0] if len(shape) >= 3 else 1
         except Exception:
@@ -2830,8 +2841,9 @@ def _fetch_and_build_multiview_multi(field: str) -> None:
                 arr = get_or_fetch_image_frame(
                     uid, field, i,
                     fetch_one_fn=lambda j, r=run: tb.fetch_frame(
-                        r, "primary", field, frame_idx=j),
+                        r, _active_stream(), field, frame_idx=j),
                     n_frames=n_per_scan.get(uid, 0),
+                    stream=_active_stream(),
                 )
             except Exception:
                 log.exception("multiview-multi: fetch failed %s [%d]",
@@ -2940,12 +2952,14 @@ def _fetch_and_build_multiview(field: str, *, page: int = 0):
         if uid and not live:
             arr = get_or_fetch_image_frame(
                 uid, field, i,
-                fetch_one_fn=lambda j: tb.fetch_frame(run, "primary", field,
-                                                      frame_idx=j),
+                fetch_one_fn=lambda j: tb.fetch_frame(run, _active_stream(),
+                                                      field, frame_idx=j),
                 n_frames=total_frames,
+                stream=_active_stream(),
             )
         else:
-            arr = tb.fetch_frame(run, "primary", field, frame_idx=i, _dataset=ds)
+            arr = tb.fetch_frame(run, _active_stream(), field, frame_idx=i,
+                                 _dataset=ds)
         arr = _coerce_to_2d_frame(arr)
         if arr is None:
             continue
@@ -7312,6 +7326,98 @@ def _ensure_run():
     return run
 
 
+def _active_stream() -> str:
+    """The event stream the Primary/Explore/Grid tabs currently target.
+
+    Defaults to ``"primary"``; set to a per-arc stream (``arc0``/``arc20``/…)
+    via :data:`w_stream_select` for arc-economy GIWAXS runs.
+    """
+    return _detail_cache.get("stream") or "primary"
+
+
+# Guard against the stream-select ``value`` watcher firing while we
+# programmatically repopulate the dropdown on a new scan.
+_stream_guard = {"loading": False}
+
+
+def _data_stream_names(run) -> list[str]:
+    """Streams a run exposes for data display, ``primary`` first, ``baseline``
+    excluded (it's shown in its own Baseline/Config tab)."""
+    names = [s for s in tb.stream_names(run) if s != "baseline"]
+    names.sort(key=lambda s: (s != "primary", s))  # primary first, then a→z
+    return names
+
+
+def _populate_stream_select(run) -> None:
+    """Refresh the stream dropdown from a run's actual streams.
+
+    Keeps the current selection if still present; otherwise falls back to
+    ``primary`` (or the first stream). The widget is only shown when a run has
+    more than one selectable stream so single-stream scans are unchanged.
+    """
+    names = _data_stream_names(run) or ["primary"]
+    prev = _detail_cache.get("stream") or "primary"
+    new_val = prev if prev in names else (
+        "primary" if "primary" in names else names[0]
+    )
+    _stream_guard["loading"] = True
+    try:
+        if list(w_stream_select.options) != names:
+            w_stream_select.options = names
+        w_stream_select.value = new_val
+    finally:
+        _stream_guard["loading"] = False
+    _detail_cache["stream"] = new_val
+    # Only worth showing when there's a genuine choice.
+    w_stream_select.visible = len(names) > 1
+
+
+def _on_stream_select(event) -> None:
+    """Switch the active data stream: reset Primary + image caches and reload
+    whichever of those tabs is currently visible."""
+    if _stream_guard.get("loading"):
+        return
+    new_stream = event.new or "primary"
+    if new_stream == _detail_cache.get("stream"):
+        return
+    _detail_cache["stream"] = new_stream
+    # Force the scalar + image tabs to refetch for the new stream.
+    _detail_cache["primary_loaded"] = False
+    _detail_cache["images_loaded"] = False
+    _detail_cache["primary_info"] = None
+    _detail_cache["primary_dataset"] = None
+    _image_cache.update(field=None, n_frames=0, dataset=None, fields=[],
+                        raw_shape=None)
+    # Reload the active tab so the change is visible immediately.
+    try:
+        _load_active_tab(w_detail_tabs.active)
+    except Exception:
+        log.exception("stream switch reload failed")
+    _refresh_primary_tab_label()
+
+
+def _refresh_primary_tab_label() -> None:
+    """Title the Primary tab with the active stream when it isn't ``primary``
+    (e.g. ``Primary (arc20)``), per the dynamic-tab-label convention.
+
+    Rewrites the tab tuple only when the label actually changes, to avoid
+    needless re-renders of the (stateful) Primary content.
+    """
+    global _primary_tab_name
+    stream = _active_stream()
+    label = "Primary" if stream == "primary" else f"Primary ({stream})"
+    if label == _primary_tab_name:
+        return
+    try:
+        w_detail_tabs[1] = (label, w_detail_tabs[1])
+        _primary_tab_name = label
+    except Exception:
+        log.debug("primary tab title update failed", exc_info=True)
+
+
+_primary_tab_name = "Primary"
+
+
 def _sanitize_meta(obj, _key=None):
     """Recursively coerce a metadata blob to JSON-serialisable values.
 
@@ -7471,8 +7577,9 @@ def _load_primary():
     run = _ensure_run()
     if run is None:
         return
-    if "primary" not in tb.stream_names(run):
-        w_primary_status.object = "*No primary stream.*"
+    stream = _active_stream()
+    if stream not in tb.stream_names(run):
+        w_primary_status.object = f"*No {stream} stream.*"
         _detail_cache["primary_loaded"] = True
         return
     t0 = time.perf_counter()
@@ -7480,16 +7587,16 @@ def _load_primary():
     w_primary_spinner.value = True
     w_primary_spinner.visible = True
     # Single read: get dataset, extract scalars from it
-    info = tb.stream_info_for(run, "primary")
+    info = tb.stream_info_for(run, stream)
     ds = info.get("dataset")
     uid = _selected_uid()
     if uid:
         scalar_data = get_or_fetch_scalars(
-            uid, "primary",
-            lambda: tb.fetch_scalars(run, "primary", _dataset=ds),
+            uid, stream,
+            lambda: tb.fetch_scalars(run, stream, _dataset=ds),
         )
     else:
-        scalar_data = tb.fetch_scalars(run, "primary", _dataset=ds)
+        scalar_data = tb.fetch_scalars(run, stream, _dataset=ds)
     df = _scalars_to_dataframe(scalar_data)
     dt_ms = (time.perf_counter() - t0) * 1000
     w_primary_table.value = df
@@ -7793,7 +7900,7 @@ def _render_explore_multi_grid(field: str | None = None,
         # Detect frame count so we can clamp frame_idx per-scan (scans may
         # have different lengths).
         try:
-            info = tb.stream_info_for(run, "primary")
+            info = tb.stream_info_for(run, _active_stream())
             shape = info["fields"].get(field, ())
             n_total = shape[0] if len(shape) >= 3 else 1
         except Exception:
@@ -7804,8 +7911,9 @@ def _render_explore_multi_grid(field: str | None = None,
         arr = get_or_fetch_image_frame(
             uid, field, idx,
             fetch_one_fn=lambda j, r=run: tb.fetch_frame(
-                r, "primary", field, frame_idx=j),
+                r, _active_stream(), field, frame_idx=j),
             n_frames=n_total,
+            stream=_active_stream(),
         )
         if arr is not None:
             arr = _coerce_to_2d_frame(arr)
@@ -8007,15 +8115,16 @@ def _load_images():
     run = _ensure_run()
     if run is None:
         return
+    stream = _active_stream()
     t0 = time.perf_counter()
     w_image_status.object = "*Loading thumbnail…*"
     w_image_spinner.value = True
     w_image_spinner.visible = True
 
-    # Re-use primary info if already loaded; otherwise get it with one read
+    # Re-use stream info if already loaded; otherwise get it with one read
     info = _detail_cache.get("primary_info")
-    if info is None and "primary" in tb.stream_names(run):
-        info = tb.stream_info_for(run, "primary")
+    if info is None and stream in tb.stream_names(run):
+        info = tb.stream_info_for(run, stream)
         _detail_cache["primary_info"] = info
         _detail_cache["primary_dataset"] = info.get("dataset")
 
@@ -8064,12 +8173,12 @@ def _load_images():
         if frame is not None:
             _image_cache["raw_shape"] = tuple(frame.shape)
             frame = _orient_frame(frame, field)
-            _update_image_in_place(frame, f"primary/{field} frame 0")
+            _update_image_in_place(frame, f"{stream}/{field} frame 0")
             dt_ms = (time.perf_counter() - t0) * 1000
             w_image_spinner.value = False
             w_image_spinner.visible = False
             w_image_status.object = (
-                f"**primary/{field}** — {n_frames} frames ({dt_ms:.0f} ms)"
+                f"**{stream}/{field}** — {n_frames} frames ({dt_ms:.0f} ms)"
             )
             # Refresh dynamic mask if it was already enabled by the user
             if w_mask_dynamic.value:
@@ -8181,6 +8290,13 @@ def _on_row_select(event):
     _set_selected_uids(new_uids)  # _reset_detail clears it
     try:
         _load_metadata(new_primary)
+        # Refresh the stream dropdown for this run (arc-economy GIWAXS scans
+        # expose per-arc streams); keeps the prior choice if still present.
+        try:
+            _populate_stream_select(_detail_cache.get("run"))
+            _refresh_primary_tab_label()
+        except Exception:
+            log.exception("stream selector refresh failed")
         # Set tab (may not fire watch if same value), then force-load content
         w_detail_tabs.active = active_tab
         _load_active_tab(active_tab)
@@ -8384,12 +8500,13 @@ def _get_primary_df_for(uid: str) -> pd.DataFrame | None:
     except Exception:
         log.exception("primary fetch: cannot resolve run %s", uid[:8])
         return None
-    if "primary" not in tb.stream_names(run):
+    stream = _active_stream()
+    if stream not in tb.stream_names(run):
         return None
     try:
         scalar_data = get_or_fetch_scalars(
-            uid, "primary",
-            lambda: tb.fetch_scalars(run, "primary"),
+            uid, stream,
+            lambda: tb.fetch_scalars(run, stream),
         )
     except Exception:
         log.exception("primary fetch failed for %s", uid[:8])
@@ -13700,7 +13817,7 @@ w_detail_tabs = pn.Tabs(
     (
         "Primary",
         pn.Column(
-            pn.Row(w_primary_status, w_primary_spinner),
+            pn.Row(w_stream_select, w_primary_status, w_primary_spinner),
             w_primary_table,
             pn.Tabs(
                 (
@@ -13847,6 +13964,7 @@ w_detail_tabs = pn.Tabs(
 )
 
 w_detail_tabs.param.watch(_on_detail_tab, "active")
+w_stream_select.param.watch(_on_stream_select, "value")
 
 # Toggle button to collapse / expand the left search panel
 w_btn_toggle_sidebar = pn.widgets.Toggle(

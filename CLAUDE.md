@@ -70,6 +70,10 @@ The detail tabs follow a consistent **controls-left / visuals-right** convention
 
 `tiled_browser.py` / `smi_browser/_tiled.py` enforces a strict rule: **never call `.read()` during search or browsing**. Catalog nodes are kept as lazy references. The `fetch_page_fast()` function bypasses the Python client for pagination and calls the REST endpoint directly (one HTTP round-trip) to retrieve metadata for an entire page. Data arrays are fetched only when a specific scan is selected and a detail tab is opened.
 
+### Multi-stream display (per-arc GIWAXS)
+
+Most runs have a single `primary` event stream, but arc-economy GIWAXS runs (`giwaxs_bar_arc_economy` in `smi-plans`) split data into **one stream per WAXS arc** (`arc0`, `arc20`, `arcm1p5`, …), each with its own detector set (low arc = WAXS-only, high arc = SAXS+WAXS). A **`Stream` dropdown** on the Primary tab (`w_stream_select`, hidden unless a run exposes >1 non-`baseline` stream) selects which stream the **Primary scalars, Explore image viewer, and Grid** target; the Primary tab relabels to e.g. `Primary (arc20)`. The selection lives in `_detail_cache["stream"]` and is read via `_active_stream()`; the low-level `_tiled.py` fetchers and the disk cache are already stream-parameterized. **Reduction, Export, Collection, and live-following remain `primary`-only** for now — see `docs/per_arc_stream_reduction_plan.md` for the `smi-tiled` work needed to reduce non-`primary` streams.
+
 ### Data reduction
 
 All reduction goes through `smi-tiled` (local editable install at `../smi-tiled`, see `pixi.toml`). `processing.build_proc_params()` constructs the kwargs and returns the function name (`reduce_smi_combined` or `reduce_smi_gi`). The caller imports the actual callable from `smi_tiled` (both are top-level re-exports). Calibrated defaults (beam-centre deltas, mask filenames, detector names) flow from `smi_tiled.defaults` → `smi_browser/config.py`.
@@ -77,6 +81,8 @@ All reduction goes through `smi-tiled` (local editable install at `../smi-tiled`
 ### Disk cache
 
 `ScanCache` stores per-scan HDF5 files under `$SMI_BROWSER_CACHE_DIR` (default `$TMPDIR/smi_browser_cache`). Capacity is capped at `$SMI_BROWSER_CACHE_MAX_GB` (default 50 GB) with LRU eviction. Image datasets use per-frame chunking for cheap random-access reads.
+
+Scalar and image caches are **stream-aware**. Scalars live under `/<stream>` (`/primary`, `/baseline`, or a sanitized custom name). Images use the legacy `images/<field>` path for the `primary` stream (back-compat) and `images/<stream>/<field>` (plus a parallel `images_filled/<stream>/<field>` mask) for any other stream, so arc-economy GIWAXS runs whose per-arc streams (`arc0`/`arc20`/…) share a detector field name don't clobber each other. The path convention is centralized in `cache._image_path` / `_image_fill_path`. Reduction (`/reduction`) and peak-fit (`/peakfit`) outputs remain per-UID with no stream dimension (reduction is still `primary`-only — see `docs/per_arc_stream_reduction_plan.md`).
 
 Per-frame I(q) (`pf_iq_I` / `pf_iq_q`) is written into `/reduction` at reduction time, so the Peak Map tab and exports reuse it across restarts with no recompute. Peak-fit result maps are stored under `/peakfit/<hash>` (keyed by `PeakDef.key()`) and are **invalidated whenever `write_reduction` runs** (re-processing overwrites `pf_iq`). The drawn peak list itself persists globally in `peak_defs.json` under the cache root. **Caveat:** the default cache dir lives under `$TMPDIR`, which survives a browser restart but may be wiped on reboot — set `$SMI_BROWSER_CACHE_DIR` to a persistent path to keep cached results permanently.
 

@@ -9,11 +9,16 @@ python = "3.11.*"
 numpy = ">=1.26,<3"
 xarray = ">=2025.6,<2027"
 pandas = ">=2.0,<3"
-matplotlib = ">=3.9,<4"
+# Use the *-base variants: this is a headless Bokeh/Panel web app rendering
+# Matplotlib via the Agg backend, so the GUI meta-packages (matplotlib,
+# pyfai) only drag in the Qt5/Qt6 stacks (qt-main, qt6-main, pyqt, pyside6,
+# qtconsole, …) — ~130 MiB of unused dependencies. The -base packages carry
+# the full compute/plotting core without any Qt.
+matplotlib-base = ">=3.9,<4"
 bokeh = ">=3.9,<4"
 panel = ">=1.8,<2"
 scipy = ">=1.11"
-pyfai = ">=2024.9"
+pyfai-base = ">=2024.9"
 tiled = "*"
 bluesky-tiled-plugins = "*"
 httpx = "*"
