@@ -10,8 +10,12 @@ import pytest
 from smi_browser import cache as cache_mod
 from smi_browser.cache import (
     ScanCache,
+    clear_disk_cache,
+    disk_cache_info,
     get_or_fetch_image_stack,
     get_or_fetch_scalars,
+    peak_defs_path,
+    write_peak_defs,
 )
 
 
@@ -403,6 +407,60 @@ def test_eviction_drops_oldest_when_over_cap(isolated_cache_dir, monkeypatch):
     # Newer file must still exist; the older one should have been evicted.
     assert c2.path.exists()
     assert not old_path.exists(), "oldest cache file should be evicted"
+
+
+# ---------------------------------------------------------------------------
+# Disk cache management
+# ---------------------------------------------------------------------------
+
+def test_disk_cache_info_breaks_down_cache_entries(isolated_cache_dir):
+    c = ScanCache("uid-info")
+    c.write_scalars("primary", {"a": np.arange(5)})
+    qchi = Path(isolated_cache_dir) / "uid-info_qchi"
+    qchi.mkdir()
+    (qchi / "chunk.bin").write_bytes(b"1234")
+    write_peak_defs([{"name": "peak", "q_min": 1.0, "q_max": 2.0}])
+    (Path(isolated_cache_dir) / "misc.tmp").write_bytes(b"xx")
+
+    info = disk_cache_info()
+
+    assert info["root"] == str(isolated_cache_dir)
+    assert info["total_bytes"] >= c.path.stat().st_size + 6
+    assert info["h5_files"] == 1
+    assert info["h5_bytes"] == c.path.stat().st_size
+    assert info["qchi_dirs"] == 1
+    assert info["qchi_bytes"] == 4
+    assert info["peak_defs_bytes"] == peak_defs_path().stat().st_size
+    assert info["other_entries"] == 1
+    assert info["other_bytes"] == 2
+
+
+def test_clear_disk_cache_preserves_peak_defs_by_default(isolated_cache_dir):
+    c = ScanCache("uid-clear")
+    c.write_scalars("primary", {"a": np.arange(5)})
+    qchi = Path(isolated_cache_dir) / "uid-clear_qchi"
+    qchi.mkdir()
+    (qchi / "chunk.bin").write_bytes(b"1234")
+    write_peak_defs([{"name": "peak", "q_min": 1.0, "q_max": 2.0}])
+
+    stats = clear_disk_cache()
+
+    assert stats["errors"] == []
+    assert stats["deleted_entries"] == 2
+    assert stats["preserved_entries"] == 1
+    assert not c.path.exists()
+    assert not qchi.exists()
+    assert peak_defs_path().exists()
+
+
+def test_clear_disk_cache_can_delete_peak_defs(isolated_cache_dir):
+    write_peak_defs([{"name": "peak", "q_min": 1.0, "q_max": 2.0}])
+
+    stats = clear_disk_cache(include_peak_defs=True)
+
+    assert stats["errors"] == []
+    assert stats["deleted_entries"] == 1
+    assert not peak_defs_path().exists()
 
 
 # ---------------------------------------------------------------------------

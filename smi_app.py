@@ -55,6 +55,7 @@ from smi_browser.data.scalars import derive_virtual_columns
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
     prune_lock_table, read_peak_defs, write_peak_defs,
+    disk_cache_info, clear_disk_cache,
 )
 
 log = logging.getLogger(__name__)
@@ -4738,33 +4739,68 @@ _processing_guard = {"active": False}
 # Geometry cache monitoring / control
 # ---------------------------------------------------------------------------
 
+def _format_bytes(n: int | float | None) -> str:
+    """Human-readable byte count for cache status displays."""
+    try:
+        value = float(n or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if abs(value) < 1024.0 or unit == units[-1]:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+
+
 w_cache_enabled = pn.widgets.Checkbox(
     name="Cache geometry between reductions", value=False, width=250,  # TEMP test default
 )
-w_cache_info = pn.pane.Markdown("*Click Refresh to view geometry cache status.*")
+w_cache_info = pn.pane.Markdown("*Click Refresh to view cache status.*")
 w_btn_cache_refresh = pn.widgets.Button(
-    name="🔄 Refresh", button_type="default", width=100,
+    name="Refresh", button_type="default", width=100,
 )
 w_btn_cache_clear = pn.widgets.Button(
-    name="🗑 Clear cache", button_type="warning", width=120,
+    name="Clear geometry", button_type="warning", width=130,
+)
+w_cache_clear_confirm = pn.widgets.Checkbox(
+    name="Confirm disk cache clear", value=False, width=220,
+)
+w_cache_clear_peak_defs = pn.widgets.Checkbox(
+    name="Also delete saved peak definitions", value=False, width=260,
+)
+w_btn_disk_cache_clear = pn.widgets.Button(
+    name="Clear disk cache", button_type="danger", width=140,
 )
 
 
 def _refresh_cache_info(_event=None):
     """Update the cache info display."""
-    info = geometry_cache_info()
-    n = info.get("size", 0)
-    mb = info.get("estimated_mb", 0.0)
-    keys = info.get("keys", [])
+    geo = geometry_cache_info()
+    waxs_entries = geo.get("waxs_entries", 0)
+    waxs_angles = geo.get("waxs_angles_total", 0)
+    saxs_entries = geo.get("saxs_entries", 0)
+    mb = geo.get("estimated_mb", 0.0)
+    disk = disk_cache_info()
     lines = [
-        f"**Cached geometries:** {n}",
+        "### Disk cache",
+        f"**Path:** `{disk.get('root', '')}`",
+        f"**Total used:** {_format_bytes(disk.get('total_bytes', 0))}",
+        f"**HDF5 scan caches:** {disk.get('h5_files', 0)} files, "
+        f"{_format_bytes(disk.get('h5_bytes', 0))}",
+        f"**Per-frame q-chi stores:** {disk.get('qchi_dirs', 0)} dirs, "
+        f"{_format_bytes(disk.get('qchi_bytes', 0))}",
+        f"**Saved peak definitions:** "
+        f"{_format_bytes(disk.get('peak_defs_bytes', 0))}",
+        f"**Other cache files:** {disk.get('other_entries', 0)} entries, "
+        f"{_format_bytes(disk.get('other_bytes', 0))}",
+        "",
+        "### Geometry cache",
+        f"**WAXS geometries:** {waxs_entries} keys / {waxs_angles} arc maps",
+        f"**SAXS geometries:** {saxs_entries}",
         f"**Estimated memory:** {mb:.1f} MB",
     ]
-    if keys:
-        lines.append("")
-        lines.append("**Entries:**")
-        for k in keys:
-            lines.append(f"- `{k}`")
+    if disk.get("error"):
+        lines.extend(["", f"**Disk cache error:** `{disk['error']}`"])
     w_cache_info.object = "\n".join(lines)
 
 
@@ -4775,8 +4811,32 @@ def _clear_cache(_event=None):
     pn.state.notifications.info("Geometry cache cleared.")
 
 
+def _clear_disk_cache(_event=None):
+    """Clear the shared smi-browser/smi-tiled disk cache after confirmation."""
+    if not w_cache_clear_confirm.value:
+        pn.state.notifications.warning("Tick 'Confirm disk cache clear' first.")
+        return
+    stats = clear_disk_cache(include_peak_defs=w_cache_clear_peak_defs.value)
+    # Drop in-memory views of files/directories that may have just been removed.
+    _per_frame_qchi_lru.clear()
+    prune_lock_table(max_size=0)
+    w_cache_clear_confirm.value = False
+    _refresh_cache_info()
+    msg = (
+        f"Cleared {_format_bytes(stats.get('deleted_bytes', 0))} "
+        f"from {stats.get('deleted_entries', 0)} cache entries."
+    )
+    if stats.get("errors"):
+        pn.state.notifications.error(
+            f"{msg} {len(stats['errors'])} entries could not be deleted."
+        )
+    else:
+        pn.state.notifications.success(msg)
+
+
 w_btn_cache_refresh.on_click(_refresh_cache_info)
 w_btn_cache_clear.on_click(_clear_cache)
+w_btn_disk_cache_clear.on_click(_clear_disk_cache)
 
 # ---------------------------------------------------------------------------
 # Cross-sections — interactive horizontal/vertical slices on the 2D map
@@ -13586,14 +13646,26 @@ w_proc_inner_tabs = pn.Tabs(
     (
         "Cache",
         pn.Column(
-            w_cache_enabled,
-            pn.Row(w_btn_cache_refresh, w_btn_cache_clear),
+            pn.pane.Markdown(
+                "Disk cache is shared by smi-browser and the smi-tiled backend. "
+                "Clearing it frees disk space but cached reductions, raw read "
+                "data, and peak-fit maps will need to be regenerated. Saved "
+                "peak definitions are preserved unless explicitly selected."
+            ),
+            pn.Row(w_btn_cache_refresh, w_btn_disk_cache_clear),
+            pn.Column(
+                w_cache_clear_confirm,
+                w_cache_clear_peak_defs,
+                sizing_mode="stretch_width",
+            ),
             w_cache_info,
+            pn.pane.Markdown("---"),
+            w_cache_enabled,
+            pn.Row(w_btn_cache_clear),
             pn.pane.Markdown(
                 "*Geometry cache stores pre-computed integrator objects (poni "
-                "files, solid-angle corrections, etc.) to speed up repeated "
-                "reductions. Clear it if you change calibration parameters or "
-                "to free memory.*",
+                "files, solid-angle corrections, etc.) in memory to speed up "
+                "repeated reductions. Clear it to free memory.*",
             ),
             sizing_mode="stretch_width",
         ),

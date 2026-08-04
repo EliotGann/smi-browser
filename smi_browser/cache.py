@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -98,6 +99,110 @@ def cache_path(uid: str) -> Path:
     # Keep the full uid in the filename for traceability.
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in uid)
     return cache_root() / f"{safe}.h5"
+
+
+def _path_size(path: Path) -> int:
+    """Return recursive disk usage for a file or directory, best effort."""
+    try:
+        if path.is_file() or path.is_symlink():
+            return path.stat().st_size
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file() or child.is_symlink():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def disk_cache_info() -> dict[str, Any]:
+    """Summarize on-disk cache usage under :func:`cache_root`.
+
+    The root is shared by smi-browser and smi-tiled.  Per-scan HDF5 files hold
+    raw read caches plus browser-derived reduction/peak-fit outputs; ``*_qchi``
+    directories are smi-tiled zarr stores for large per-frame q-chi stacks.
+    """
+    root = cache_root()
+    info: dict[str, Any] = {
+        "root": str(root),
+        "exists": root.exists(),
+        "total_bytes": 0,
+        "h5_bytes": 0,
+        "qchi_bytes": 0,
+        "peak_defs_bytes": 0,
+        "other_bytes": 0,
+        "h5_files": 0,
+        "qchi_dirs": 0,
+        "other_entries": 0,
+    }
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        info["error"] = str(exc)
+        return info
+
+    peak_path = peak_defs_path()
+    for path in entries:
+        size = _path_size(path)
+        info["total_bytes"] += size
+        if path == peak_path:
+            info["peak_defs_bytes"] += size
+        elif path.is_file() and path.suffix == ".h5":
+            info["h5_bytes"] += size
+            info["h5_files"] += 1
+        elif path.is_dir() and path.name.endswith("_qchi"):
+            info["qchi_bytes"] += size
+            info["qchi_dirs"] += 1
+        else:
+            info["other_bytes"] += size
+            info["other_entries"] += 1
+    return info
+
+
+def clear_disk_cache(*, include_peak_defs: bool = False) -> dict[str, Any]:
+    """Delete the shared disk cache contents, returning deletion stats.
+
+    Saved peak definitions are preserved by default because they are user-drawn
+    ranges, not a derived read/reduction cache.
+    """
+    root = cache_root()
+    stats: dict[str, Any] = {
+        "root": str(root),
+        "deleted_bytes": 0,
+        "deleted_entries": 0,
+        "preserved_entries": 0,
+        "errors": [],
+    }
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        stats["errors"].append(str(exc))
+        return stats
+
+    peak_path = peak_defs_path()
+    for path in entries:
+        if path == peak_path and not include_peak_defs:
+            stats["preserved_entries"] += 1
+            continue
+        size = _path_size(path)
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            stats["errors"].append(f"{path}: {exc}")
+            continue
+        stats["deleted_bytes"] += size
+        stats["deleted_entries"] += 1
+    return stats
 
 
 # ---------------------------------------------------------------------------
