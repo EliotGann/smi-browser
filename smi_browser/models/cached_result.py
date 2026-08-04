@@ -21,6 +21,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .reduction_params import attach_attrs, dumps_params, flat_attrs, loads_params
+
 
 # Connection / storage hints + already-discriminated keys we do NOT diff.
 _PARAM_DIFF_SKIP = frozenset({
@@ -115,12 +117,14 @@ class CachedResult:
         per_frame_iq=None,
         peak_fits=None,
         geometry: str = "transmission",
+        reduction_parameters: dict[str, Any] | None = None,
     ):
         self.uid = uid
         self.merged_iq = merged_iq
         self.merged_qchi = merged_qchi
         self.per_frame_iq = per_frame_iq
         self.peak_fits = peak_fits
+        self.reduction_parameters = reduction_parameters
         # No lazy per-frame zarr stacks on the cached path.
         self.saxs = None
         self.waxs = None
@@ -149,6 +153,7 @@ class CachedGiResult:
         scan_motor_values=None,
         alpha_i_source: str = "cached",
         sample_name: str = "",
+        reduction_parameters: dict[str, Any] | None = None,
     ):
         self.uid = uid
         self.frames = list(frames) if frames is not None else []
@@ -166,6 +171,7 @@ class CachedGiResult:
         self.line_cuts = None
         self.peak_fits = None
         self.geometry = "grazing"
+        self.reduction_parameters = reduction_parameters
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +238,7 @@ def build_cached_result(cache):
     arrays = cached.get("arrays", {})
     params = cached.get("params", {})
     geometry = params.get("geometry", "transmission")
+    reduction_parameters = loads_params(params.get("smi_reduction_parameters"))
 
     if geometry == "grazing":
         frames = arrays.get("gi_frames")
@@ -248,6 +255,7 @@ def build_cached_result(cache):
             scan_motor=str(params.get("gi_scan_motor", "")),
             alpha_i_source=str(params.get("gi_alpha_i_source", "cached")),
             sample_name=str(params.get("gi_sample_name", "")),
+            reduction_parameters=reduction_parameters,
         )
         return gi, params
 
@@ -263,6 +271,7 @@ def build_cached_result(cache):
         if v is not None:
             iq_vars[opt] = (("q",), v)
     merged_iq = xr.Dataset(iq_vars, coords={"q": q})
+    attach_attrs(merged_iq, reduction_parameters)
 
     merged_qchi = None
     qchi_intensity = arrays.get("qchi_intensity")
@@ -276,6 +285,7 @@ def build_cached_result(cache):
             {"intensity": (("q", "chi"), qchi_intensity)},
             coords=coords,
         )
+        attach_attrs(merged_qchi, reduction_parameters)
 
     per_frame_iq = None
     pf_I = arrays.get("pf_iq_I")
@@ -290,6 +300,7 @@ def build_cached_result(cache):
             pf_vars,
             coords={"q": pf_q, "frame": np.arange(pf_I.shape[0])},
         )
+        attach_attrs(per_frame_iq, reduction_parameters)
 
     peak_fits = peak_fits_from_cache(cache)
 
@@ -301,6 +312,18 @@ def build_cached_result(cache):
             per_frame_iq=per_frame_iq,
             peak_fits=peak_fits,
             geometry=geometry,
+            reduction_parameters=reduction_parameters,
         ),
         params,
     )
+
+
+def reduction_params_to_attrs(params: dict[str, Any] | None) -> dict[str, Any]:
+    """Return cache-safe attrs for resolved reduction parameters."""
+    if not params:
+        return {}
+    return {
+        "smi_reduction_parameters_schema": "smi_tiled.resolved_reduction_parameters.v1",
+        "smi_reduction_parameters": dumps_params(params),
+        **flat_attrs(params),
+    }

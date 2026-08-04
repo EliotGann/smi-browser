@@ -286,6 +286,11 @@ from smi_browser.models.cached_result import (
     CachedResult as _CachedResult,
     build_cached_result as _build_cached_result_from_cache,
     proc_params_differ as _proc_params_differ,
+    reduction_params_to_attrs as _reduction_params_to_attrs,
+)
+from smi_browser.models.reduction_params import (
+    from_result as _reduction_params_from_result,
+    summary_lines as _reduction_param_summary_lines,
 )
 
 
@@ -9325,6 +9330,14 @@ def _render_multi_process_views(uids: list[str]) -> None:
     w_proc_iq_label.visible = False
 
 
+def _reduction_param_status_text(result) -> str:
+    """Short Markdown block with physically resolved geometry parameters."""
+    lines = _reduction_param_summary_lines(_reduction_params_from_result(result))
+    if not lines:
+        return ""
+    return "\n" + "\n".join(f"- {line}" for line in lines)
+
+
 def _on_process_multi(uids: list[str]) -> None:
     """Process every selected scan, staging each result into the collection
     with ``pinned=False`` so the user can compare before promoting."""
@@ -9599,6 +9612,7 @@ def _on_process(event):
             timing_str = ", ".join(f"{k}: {v:.1f}s" for k, v in timing.items())
             w_proc_status.object = (
                 f"**Done** in {dt:.1f}s — {result.geometry}\n\n"
+                f"{_reduction_param_status_text(result)}\n\n"
                 f"_{timing_str}_"
             )
             w_btn_add_collection.disabled = False
@@ -10182,6 +10196,9 @@ def _cache_reduction_result(uid: str, result, geometry: str, params: dict) -> No
             k: v for k, v in params.items()
             if isinstance(v, (str, int, float, bool, type(None), list, tuple))
         }
+        safe_params.update(
+            _reduction_params_to_attrs(_reduction_params_from_result(result))
+        )
         safe_params["geometry"] = geometry
         # Stash GI provenance strings as attrs (they don't fit the params shape
         # but are needed by display code on reload).
@@ -10636,6 +10653,7 @@ def _try_load_processed_from_cache(uid: "str | None") -> bool:
             peaks_note = f", {n_peaks} peak fit(s)" if n_peaks else ""
             w_proc_status.object = (
                 f"**Cached** — transmission{peaks_note}{drift_note}"
+                f"\n\n{_reduction_param_status_text(result)}"
             )
             w_btn_add_collection.disabled = False
 

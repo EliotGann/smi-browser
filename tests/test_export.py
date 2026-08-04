@@ -49,6 +49,24 @@ def _fake_transmission_result():
     )
 
 
+def _resolved_params():
+    return {
+        "schema": "smi_tiled.resolved_reduction_parameters.v1",
+        "saxs": {
+            "sample_detector_distance_mm": 5020.0,
+            "beam_center_row_px": 1165.2,
+            "beam_center_col_px": 746.4,
+            "energy_kev": 13.5,
+        },
+        "waxs": {
+            "sample_detector_distance_mm": 278.0,
+            "beam_center_row_px": 217.0,
+            "beam_center_col_px": 314.5,
+            "energy_kev": 13.5,
+        },
+    }
+
+
 def _full_transmission_result(n_frames: int = 4):
     """Realistic transmission result mirroring smi-tiled output shape.
 
@@ -124,6 +142,7 @@ def _full_transmission_result(n_frames: int = 4):
         incident_angle_deg=0.12,
         scan_info={"sample_name": "demo", "n_frames": n_frames,
                    "step_candidates": ["stage_x", "stage_y"]},
+        reduction_parameters=_resolved_params(),
     )
 
 
@@ -575,6 +594,27 @@ def test_h5_transmission_provenance_attrs(tmp_path):
         info = json.loads(attrs["scan_info"])
         assert info["sample_name"] == "demo"
         assert info["n_frames"] == 4
+
+
+def test_h5_transmission_resolved_reduction_parameters(tmp_path):
+    import h5py, json
+    result = _full_transmission_result()
+    path = tmp_path / "r.h5"
+    _save_dataset_h5(
+        result, None, [], None, None, None, "", "", {}, path,
+        sections={"processed_iq", "processed_qchi"},
+    )
+    with h5py.File(path, "r") as f:
+        attrs = f["transmission"].attrs
+        assert attrs["smi_reduction_parameters_schema"] == (
+            "smi_tiled.resolved_reduction_parameters.v1"
+        )
+        decoded = json.loads(attrs["smi_reduction_parameters"])
+        assert decoded["saxs"]["sample_detector_distance_mm"] == pytest.approx(5020.0)
+        assert float(attrs["saxs_sdd_mm"]) == pytest.approx(5020.0)
+        assert float(attrs["waxs_beam_center_col_px"]) == pytest.approx(314.5)
+        assert float(f["transmission/merged_iq"].attrs["saxs_sdd_mm"]) == pytest.approx(5020.0)
+        assert float(f["transmission/merged_qchi"].attrs["waxs_sdd_mm"]) == pytest.approx(278.0)
 
 
 def test_h5_gi_per_frame_qxy_qz_written(tmp_path):

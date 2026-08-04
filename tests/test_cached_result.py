@@ -21,6 +21,24 @@ from smi_browser.models.cached_result import (
 )
 
 
+def _resolved_params():
+    return {
+        "schema": "smi_tiled.resolved_reduction_parameters.v1",
+        "saxs": {
+            "sample_detector_distance_mm": 5020.0,
+            "beam_center_row_px": 1165.2,
+            "beam_center_col_px": 746.4,
+            "energy_kev": 13.5,
+        },
+        "waxs": {
+            "sample_detector_distance_mm": 278.0,
+            "beam_center_row_px": 217.0,
+            "beam_center_col_px": 314.5,
+            "energy_kev": 13.5,
+        },
+    }
+
+
 @pytest.fixture(autouse=True)
 def isolated_cache_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SMI_BROWSER_CACHE_DIR", str(tmp_path))
@@ -218,6 +236,29 @@ def test_build_cached_result_transmission_full_shape():
     # No q_chi_frames stub (lazy zarr; caller falls back to merged map)
     assert result.saxs is None
     assert result.waxs is None
+
+
+def test_build_cached_result_restores_resolved_parameter_attrs():
+    from smi_browser.models.reduction_params import dumps_params
+
+    c = ScanCache("uid-trans-params")
+    arrays = _write_transmission_arrays(c)
+    resolved = _resolved_params()
+    c.write_reduction(
+        arrays,
+        {
+            "geometry": "transmission",
+            "smi_reduction_parameters": dumps_params(resolved),
+            "saxs_sdd_mm": 5020.0,
+            "waxs_sdd_mm": 278.0,
+        },
+    )
+
+    result, _ = build_cached_result(c)
+
+    assert result.reduction_parameters["saxs"]["sample_detector_distance_mm"] == 5020.0
+    assert result.merged_iq.attrs["saxs_sdd_mm"] == pytest.approx(5020.0)
+    assert result.merged_qchi.attrs["waxs_sdd_mm"] == pytest.approx(278.0)
 
 
 def test_build_cached_result_transmission_minimal_no_per_detector_or_pf():

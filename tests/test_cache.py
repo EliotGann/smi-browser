@@ -133,6 +133,34 @@ def test_reduction_roundtrip_with_params(isolated_cache_dir):
     assert str(blob["params"]["geometry"]) == "transmission"
 
 
+def test_reduction_roundtrip_with_resolved_parameters(isolated_cache_dir):
+    import json
+
+    c = ScanCache("uid-red-params")
+    resolved = {
+        "schema": "smi_tiled.resolved_reduction_parameters.v1",
+        "saxs": {
+            "sample_detector_distance_mm": 5020.0,
+            "beam_center_row_px": 1165.2,
+            "beam_center_col_px": 746.4,
+        },
+        "waxs": {
+            "sample_detector_distance_mm": 278.0,
+            "beam_center_row_px": 217.0,
+            "beam_center_col_px": 314.5,
+        },
+    }
+    c.write_reduction(
+        {"q": np.array([1.0]), "I": np.array([2.0])},
+        {"geometry": "transmission", "smi_reduction_parameters": resolved},
+    )
+    blob = c.read_reduction()
+
+    params = blob["params"]
+    decoded = json.loads(params["smi_reduction_parameters"])
+    assert decoded["saxs"]["sample_detector_distance_mm"] == 5020.0
+
+
 def test_lazy_per_frame_fetch_only_loads_requested(isolated_cache_dir):
     from smi_browser.cache import get_or_fetch_image_frame
 

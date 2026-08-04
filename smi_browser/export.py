@@ -13,6 +13,12 @@ from typing import Any
 import numpy as np
 
 from . import nsls2api
+from .models.reduction_params import (
+    SCHEMA as _REDUCTION_PARAMS_SCHEMA,
+    dumps_params as _dump_reduction_params,
+    flat_attrs as _flat_reduction_attrs,
+    from_result as _reduction_params_from_result,
+)
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +35,36 @@ def _json_default(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
     return str(o)
+
+
+def _write_attrs(group, values: dict[str, Any]) -> None:
+    """Best-effort HDF5 attr writer for scalar/list/string metadata."""
+    for k, v in values.items():
+        try:
+            if v is None:
+                group.attrs[k] = "None"
+            elif isinstance(v, (list, tuple)):
+                group.attrs[k] = list(v)
+            elif isinstance(v, (str, int, float, bool, np.integer, np.floating)):
+                group.attrs[k] = v
+            else:
+                group.attrs[k] = str(v)
+        except (TypeError, ValueError):
+            group.attrs[k] = str(v)
+
+
+def _write_reduction_parameter_attrs(group, result) -> dict[str, Any] | None:
+    """Write resolved physical reduction parameters to an HDF5 group."""
+    resolved = _reduction_params_from_result(result)
+    if not resolved:
+        return None
+    attrs = {
+        "smi_reduction_parameters_schema": _REDUCTION_PARAMS_SCHEMA,
+        "smi_reduction_parameters": _dump_reduction_params(resolved),
+        **_flat_reduction_attrs(resolved),
+    }
+    _write_attrs(group, attrs)
+    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +778,7 @@ def _save_dataset_h5(
             grp = f.create_group("transmission")
             grp.attrs["geometry"] = result.geometry or ""
             grp.attrs["uid"] = result.uid or ""
+            resolved_attrs = _write_reduction_parameter_attrs(grp, result) or {}
             # Provenance: incident angle + scan_info (best-effort serialisation)
             inc_ang = getattr(result, "incident_angle_deg", None)
             if inc_ang is not None:
@@ -764,6 +801,7 @@ def _save_dataset_h5(
                 iq = result.merged_iq
                 if iq is not None:
                     iq_grp = grp.create_group("merged_iq")
+                    _write_attrs(iq_grp, resolved_attrs)
                     for var in iq.data_vars:
                         iq_grp.create_dataset(var, data=iq[var].values)
                     if "q" in iq.coords:
@@ -776,12 +814,14 @@ def _save_dataset_h5(
                 waxs_iq = waxs.get("iq") if waxs else None
                 if saxs_iq is not None:
                     sg = grp.create_group("saxs_iq")
+                    _write_attrs(sg, resolved_attrs)
                     for var in saxs_iq.data_vars:
                         sg.create_dataset(var, data=saxs_iq[var].values)
                     if "q" in saxs_iq.coords:
                         sg.create_dataset("q", data=saxs_iq["q"].values)
                 if waxs_iq is not None:
                     wg = grp.create_group("waxs_iq")
+                    _write_attrs(wg, resolved_attrs)
                     for var in waxs_iq.data_vars:
                         wg.create_dataset(var, data=waxs_iq[var].values)
                     if "q" in waxs_iq.coords:
@@ -791,6 +831,7 @@ def _save_dataset_h5(
                 pf_iq = getattr(result, "per_frame_iq", None)
                 if pf_iq is not None and "I" in pf_iq and "frame" in pf_iq.dims:
                     pf_iq_grp = grp.create_group("per_frame_iq")
+                    _write_attrs(pf_iq_grp, resolved_attrs)
                     pf_iq_grp.attrs["n_frames"] = pf_iq.sizes["frame"]
                     pf_iq_grp.create_dataset("q", data=pf_iq["q"].values)
                     pf_iq_grp.create_dataset("I", data=pf_iq["I"].values)
@@ -818,6 +859,7 @@ def _save_dataset_h5(
                 qchi = result.merged_qchi
                 if qchi is not None:
                     qchi_grp = grp.create_group("merged_qchi")
+                    _write_attrs(qchi_grp, resolved_attrs)
                     for var in qchi.data_vars:
                         qchi_grp.create_dataset(var, data=qchi[var].values)
                     if "q" in qchi.coords:
@@ -832,6 +874,7 @@ def _save_dataset_h5(
                 waxs_qchi_frames = waxs.get("q_chi_frames") if waxs else None
                 if saxs_qchi_frames is not None or waxs_qchi_frames is not None:
                     pf_qchi_grp = grp.create_group("per_frame_qchi")
+                    _write_attrs(pf_qchi_grp, resolved_attrs)
                     # Use the merged grid coords
                     if qchi is not None and "q" in qchi.coords:
                         pf_qchi_grp.create_dataset("q", data=qchi["q"].values)
