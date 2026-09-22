@@ -304,7 +304,9 @@ class ScanCollection:
 
     def iq_comparison_bokeh(self, uids: list[str] | None = None,
                             label_column: str | None = None,
-                            plot_style: str = "markers"):
+                            plot_style: str = "markers", *,
+                            q_power: float = 0.0, log_x: bool = True,
+                            log_y: bool = True):
         """Bokeh figure overlaying I(q) for selected uids (or all).
 
         Uses stored per-scan colours (matching the table swatch) and
@@ -316,21 +318,28 @@ class ScanCollection:
         label_column : str, optional
             If given, the chosen primary/baseline value is appended to
             the hover tooltip label for each curve.
+        q_power : float
+            Display I(q) multiplied by this power of q, without modifying data.
+        log_x, log_y : bool
+            Use logarithmic axes (both default to True).
         """
         from bokeh.events import MouseLeave
         from bokeh.models import CustomJS, HoverTool
         from bokeh.models.glyphs import Line as BkLine
         from bokeh.plotting import figure as bk_figure
+        from smi_browser.figures.iq import iq_axis_label, scaled_iq_data
 
         subset = uids if uids else list(self._results.keys())
         subset = [u for u in subset if u in self._results]
         if not subset:
             return None
 
+        y_label = iq_axis_label(q_power)
         p = bk_figure(
-            title="Processed Collection — I(q) Comparison",
+            title=f"Processed Collection — {y_label} Comparison",
             width=1000, height=500,
-            x_axis_type="log", y_axis_type="log",
+            x_axis_type="log" if log_x else "linear",
+            y_axis_type="log" if log_y else "linear",
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
             sizing_mode="stretch_both",
@@ -350,18 +359,18 @@ class ScanCollection:
                 continue
             q = iq["q"].values
             I = iq["I"].values
-            mask = np.isfinite(I) & (I > 0)
-            if mask.any():
+            x, y = scaled_iq_data(q, I, q_power=q_power, log_x=log_x, log_y=log_y)
+            if x.size:
                 r = None
                 if plot_style in ("line", "both"):
                     r = p.line(
-                        q[mask], I[mask],
+                        x, y,
                         line_width=1.2, line_alpha=0.4,
                         color=color, name=label,
                     )
                 if plot_style in ("markers", "both"):
                     r_s = p.scatter(
-                        q[mask], I[mask],
+                        x, y,
                         size=4, alpha=0.4,
                         color=color, name=label,
                     )
@@ -378,7 +387,7 @@ class ScanCollection:
                     renderers.append(r)
 
         p.xaxis.axis_label = "q (nm⁻¹)"
-        p.yaxis.axis_label = "I(q)"
+        p.yaxis.axis_label = y_label
         if p.legend:
             p.legend.visible = False
 
@@ -411,7 +420,7 @@ class ScanCollection:
                 tooltips=[
                     ("scan", "$name"),
                     ("q", "$x{0.000}"),
-                    ("I", "$y{0.00e+0}"),
+                    (y_label, "$y{0.00e+0}"),
                 ],
                 line_policy="nearest",
                 mode="mouse",

@@ -52,6 +52,7 @@ from smi_browser import nsls2api
 from smi_browser import memlog
 from smi_browser.config import DEFAULT_CYCLE, RECENT_CYCLES
 from smi_browser.data.scalars import derive_virtual_columns
+from smi_browser.figures.iq import iq_axis_label, scaled_iq_data
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
     prune_lock_table, read_peak_defs, write_peak_defs,
@@ -4730,6 +4731,17 @@ w_proc_progress = pn.indicators.Progress(
     visible=False, sizing_mode="stretch_width",
 )
 w_proc_iq_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=400)
+w_proc_scaled_iq_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=400)
+w_proc_q_power = pn.widgets.FloatInput(
+    name="q exponent (n): I(q) × qⁿ", value=2.0, step=0.5,
+    sizing_mode="stretch_width",
+)
+w_proc_scaled_log_x = pn.widgets.Checkbox(name="Log q axis", value=False)
+w_proc_scaled_log_y = pn.widgets.Checkbox(name="Log scaled intensity axis", value=False)
+w_proc_scaled_iq_status = pn.pane.Markdown(
+    "*Process a scan with I(q) data to see the scaled curve.*",
+    sizing_mode="stretch_width",
+)
 w_proc_2d_plot = pn.pane.Bokeh(object=None, sizing_mode="stretch_width", height=500)
 w_proc_frame_slider = pn.widgets.IntSlider(
     name="Frame", start=0, end=1, value=0, step=1, width=400,
@@ -4750,6 +4762,7 @@ w_plot_style = pn.widgets.Select(
 )
 
 _proc_result_cache = {"result": None, "gi_result": None}
+_proc_iq_display = {"uids": []}  # scans currently shown in the multi-scan overlay
 
 # Guard: suppress _update_proc_2d while _on_process is building its own plot
 _processing_guard = {"active": False}
@@ -5336,6 +5349,12 @@ w_cuts_log_y.param.watch(_on_cuts_log_change, "value")
 
 def _on_plot_style_change(*_events):
     _render_cuts_plot()
+    if _proc_iq_display["uids"]:
+        w_proc_iq_plot.object = _collection.iq_comparison_bokeh(
+            uids=_proc_iq_display["uids"], plot_style=w_plot_style.value,
+        )
+    else:
+        _build_proc_iq_plot()
 
 
 w_plot_style.param.watch(_on_plot_style_change, "value")
@@ -6915,15 +6934,20 @@ def _get_frame_labels():
 
 
 def _build_proc_iq_plot():
-    """Build the I(q) Bokeh figure in either merged or per-frame mode."""
+    """Refresh the ordinary I(q) view (and its linked scaled view)."""
+    _proc_iq_display["uids"] = []
+    w_proc_iq_plot.object = _build_proc_iq_figure()
+
+
+def _build_proc_iq_figure(*, q_power=0.0, log_x=True, log_y=True):
+    """Build an ordinary or q-scaled I(q) figure from the current result."""
     from bokeh.plotting import figure as bk_figure
 
     result = _proc_result_cache.get("result")
-    if result is None or not hasattr(result, "merged_iq"):
-        w_proc_iq_plot.object = None
+    if result is None or getattr(result, "merged_iq", None) is None:
         return
 
-    iq = result.merged_iq
+    y_label = iq_axis_label(q_power)
     mode = w_proc_iq_mode.value
     uid = _selected_uid() or ""
 
@@ -6943,9 +6967,10 @@ def _build_proc_iq_plot():
             colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
 
         p = bk_figure(
-            title=f"{uid[:8]} — per-frame I(q)",
+            title=f"{uid[:8]} — per-frame {y_label}",
             width=1000, height=400,
-            x_axis_type="log", y_axis_type="log",
+            x_axis_type="log" if log_x else "linear",
+            y_axis_type="log" if log_y else "linear",
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
@@ -6959,27 +6984,29 @@ def _build_proc_iq_plot():
 
         for i in range(n_frames):
             I_frame = pf_iq[y_key].isel(frame=i).values
-            mask = np.isfinite(I_frame) & (I_frame > 0)
-            if mask.any():
+            x, y = scaled_iq_data(q, I_frame, q_power=q_power, log_x=log_x, log_y=log_y)
+            if x.size:
                 lbl = frame_labels[i] if i < len(frame_labels) else f"frame {i}"
-                _add_trace(p, q[mask], I_frame[mask], color=colors[i],
+                _add_trace(p, x, y, color=colors[i],
                            width=0.9, alpha=0.8, legend_label=lbl)
         p.xaxis.axis_label = "q (nm⁻¹)"
-        p.yaxis.axis_label = "I(q)"
+        p.yaxis.axis_label = y_label
         if n_frames <= 20:
             p.legend.click_policy = "hide"
             p.legend.label_text_font_size = "8pt"
         else:
             p.legend.visible = False
-        w_proc_iq_plot.object = p
+        return p
 
     elif mode == "per-frame":
         # Fallback: per-frame from merged_qchi by integrating over chi
         qchi = getattr(result, "merged_qchi", None)
         if qchi is None or "frame" not in qchi.dims:
             # No per-frame data available — show merged with a note
-            _build_merged_iq_plot(result, uid, note=" (no per-frame data)")
-            return
+            return _build_merged_iq_plot(
+                result, uid, note=" (no per-frame data)",
+                q_power=q_power, log_x=log_x, log_y=log_y,
+            )
         q = qchi["q"].values if "q" in qchi.coords else np.arange(qchi["intensity"].shape[-1])
         n_frames = qchi.sizes["frame"]
         frame_labels = _get_frame_labels()
@@ -6992,9 +7019,10 @@ def _build_proc_iq_plot():
             colors = [Turbo256[i * step % len(Turbo256)] for i in range(n_frames)]
 
         p = bk_figure(
-            title=f"{uid[:8]} — per-frame I(q) (χ-integrated)",
+            title=f"{uid[:8]} — per-frame {y_label} (χ-integrated)",
             width=1000, height=400,
-            x_axis_type="log", y_axis_type="log",
+            x_axis_type="log" if log_x else "linear",
+            y_axis_type="log" if log_y else "linear",
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
@@ -7004,63 +7032,100 @@ def _build_proc_iq_plot():
             if img_frame.shape == (len(q), len(qchi["chi"].values)):
                 img_frame = img_frame.T
             I_frame = np.nanmean(img_frame, axis=0)
-            mask = np.isfinite(I_frame) & (I_frame > 0)
-            if mask.any():
+            x, y = scaled_iq_data(q, I_frame, q_power=q_power, log_x=log_x, log_y=log_y)
+            if x.size:
                 lbl = frame_labels[i] if i < len(frame_labels) else f"frame {i}"
-                _add_trace(p, q[mask], I_frame[mask], color=colors[i],
+                _add_trace(p, x, y, color=colors[i],
                            width=0.9, alpha=0.8, legend_label=lbl)
         p.xaxis.axis_label = "q (nm⁻¹)"
-        p.yaxis.axis_label = "I(q)"
+        p.yaxis.axis_label = y_label
         if n_frames <= 20:
             p.legend.click_policy = "hide"
             p.legend.label_text_font_size = "8pt"
         else:
             p.legend.visible = False
-        w_proc_iq_plot.object = p
+        return p
 
     else:
         # Merged mode (default)
-        _build_merged_iq_plot(result, uid)
+        return _build_merged_iq_plot(result, uid, q_power=q_power, log_x=log_x, log_y=log_y)
 
 
-def _build_merged_iq_plot(result, uid, note=""):
-    """Render the standard merged I(q) plot."""
+def _build_merged_iq_plot(result, uid, note="", *, q_power=0.0, log_x=True, log_y=True):
+    """Build merged I(q), optionally multiplied by a power of q."""
     from bokeh.plotting import figure as bk_figure
 
     iq = result.merged_iq
     q = iq["q"].values
     I = iq["I"].values
+    y_label = iq_axis_label(q_power)
 
     p = bk_figure(
-        title=f"{uid[:8]} — merged I(q){note}", width=1000, height=400,
-        x_axis_type="log", y_axis_type="log",
+        title=f"{uid[:8]} — merged {y_label}{note}", width=1000, height=400,
+        x_axis_type="log" if log_x else "linear",
+        y_axis_type="log" if log_y else "linear",
         tools="pan,wheel_zoom,box_zoom,reset,save",
         active_scroll="wheel_zoom",
     )
 
     det_mode = _iq_detector_mode(iq)
 
-    mask = np.isfinite(I) & (I > 0)
-    if det_mode != "saxs_only" and det_mode != "waxs_only" and mask.any():
-        _add_trace(p, q[mask], I[mask], color="black", width=1.2, legend_label="merged")
+    x, y = scaled_iq_data(q, I, q_power=q_power, log_x=log_x, log_y=log_y)
+    if det_mode != "saxs_only" and det_mode != "waxs_only" and x.size:
+        _add_trace(p, x, y, color="black", width=1.2, legend_label="merged")
     if "saxs_I" in iq:
         sI = iq["saxs_I"].values
-        sm = np.isfinite(sI) & (sI > 0)
-        if sm.any():
+        x, y = scaled_iq_data(q, sI, q_power=q_power, log_x=log_x, log_y=log_y)
+        if x.size:
             width = 1.2 if det_mode == "saxs_only" else 0.8
             alpha = 0.9 if det_mode == "saxs_only" else 0.6
-            _add_trace(p, q[sm], sI[sm], color="blue", width=width, alpha=alpha, legend_label="SAXS")
+            _add_trace(p, x, y, color="blue", width=width, alpha=alpha, legend_label="SAXS")
     if "waxs_I" in iq:
         wI = iq["waxs_I"].values
-        wm = np.isfinite(wI) & (wI > 0)
-        if wm.any():
+        x, y = scaled_iq_data(q, wI, q_power=q_power, log_x=log_x, log_y=log_y)
+        if x.size:
             width = 1.2 if det_mode == "waxs_only" else 0.8
             alpha = 0.9 if det_mode == "waxs_only" else 0.6
-            _add_trace(p, q[wm], wI[wm], color="red", width=width, alpha=alpha, legend_label="WAXS")
+            _add_trace(p, x, y, color="red", width=width, alpha=alpha, legend_label="WAXS")
     p.xaxis.axis_label = "q (nm⁻¹)"
-    p.yaxis.axis_label = "I(q)"
-    p.legend.click_policy = "hide"
-    w_proc_iq_plot.object = p
+    p.yaxis.axis_label = y_label
+    if p.legend:
+        p.legend.click_policy = "hide"
+    return p
+
+
+def _update_scaled_iq_plot(*_events):
+    """Keep scaling synchronized with result changes, resets and display options."""
+    power = w_proc_q_power.value
+    if power is None or not np.isfinite(power):
+        w_proc_scaled_iq_plot.object = None
+        w_proc_scaled_iq_status.object = "*Enter a finite q exponent.*"
+        return
+    options = dict(q_power=power, log_x=w_proc_scaled_log_x.value,
+                   log_y=w_proc_scaled_log_y.value)
+    if w_proc_iq_plot.object is None:
+        _proc_iq_display["uids"] = []
+        fig = None
+    elif _proc_iq_display["uids"]:
+        fig = _collection.iq_comparison_bokeh(
+            uids=_proc_iq_display["uids"],
+            plot_style=w_plot_style.value, **options,
+        )
+    else:
+        fig = _build_proc_iq_figure(**options)
+    if fig is not None:
+        fig.sizing_mode = "stretch_width"
+        fig.height = 400
+    w_proc_scaled_iq_plot.object = fig
+    w_proc_scaled_iq_status.object = (
+        f"**{iq_axis_label(power)} vs q** (q in nm⁻¹)" if fig is not None
+        else "*Process a scan with I(q) data to see the scaled curve.*"
+    )
+
+
+w_proc_iq_plot.param.watch(_update_scaled_iq_plot, "object")
+for _widget in (w_proc_q_power, w_proc_scaled_log_x, w_proc_scaled_log_y):
+    _widget.param.watch(_update_scaled_iq_plot, "value")
 
 
 def _iq_detector_mode(iq) -> str:
@@ -9303,6 +9368,7 @@ def _render_multi_process_views(uids: list[str]) -> None:
     results_by_uid = {uid: _collection.get_result(uid) for uid in uids
                       if uid in _collection}
     valid_uids = [u for u, r in results_by_uid.items() if r is not None]
+    _proc_iq_display["uids"] = valid_uids
 
     # I(q) overlay — reuse the collection's plot builder so colors match the
     # Collection panel and the existing axis-style options are honored.
@@ -13748,6 +13814,30 @@ w_proc_inner_tabs = pn.Tabs(
             sizing_mode="stretch_width",
         ),
     ),
+    (
+        "q scaling",
+        pn.Row(
+            pn.Column(
+                pn.pane.Markdown(
+                    "### q-scaled intensity\n"
+                    "Plot **I(q) × qⁿ vs q**. Set the exponent **n** to "
+                    "**2** for a Kratky plot, **4** for Porod scaling, or "
+                    "**0** for unscaled I(q). Changes update immediately "
+                    "using the processed curves."
+                ),
+                w_proc_q_power,
+                w_proc_scaled_log_x,
+                w_proc_scaled_log_y,
+                w_plot_style,
+                w_proc_scaled_iq_status,
+                width=460,
+                scroll=True,
+                sizing_mode="stretch_height",
+            ),
+            pn.Column(w_proc_scaled_iq_plot, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        ),
+    ),
     (_PEAK_MAP_TAB_TITLE, peak_map_panel),
     (
         "Parameters",
@@ -13811,7 +13901,7 @@ w_proc_inner_tabs = pn.Tabs(
 
 
 #: Fixed position of the Peak Map sub-tab in ``w_proc_inner_tabs``.
-_PEAK_MAP_TAB_IDX = 2
+_PEAK_MAP_TAB_IDX = 3
 
 
 def _on_proc_inner_tab(event=None):
@@ -13971,7 +14061,7 @@ w_detail_tabs = pn.Tabs(
             # so they live above the sub-tabs.
             pn.Row(w_proc_iq_mode, w_proc_iq_label),
             w_proc_frame_slider,
-            # 2D / 1D / Peak Map / Parameters / Cache / Batch (built above).
+            # 2D / 1D / q scaling / Peak Map / Parameters / Cache / Batch.
             w_proc_inner_tabs,
         ),
     ),
