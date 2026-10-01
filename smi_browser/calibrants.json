@@ -1,0 +1,16 @@
+[
+  {
+    "id": "silver_behenate",
+    "name": "Silver behenate (AgBh)",
+    "q1_angstrom_inv": 0.10762564760499461,
+    "max_order": 9
+  },
+  {
+    "id": "gold",
+    "name": "Gold (Au)",
+    "peaks": [
+      {"label": "111", "q_angstrom_inv": 2.668},
+      {"label": "200", "q_angstrom_inv": 3.081}
+    ]
+  }
+]

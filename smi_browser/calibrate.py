@@ -1,7 +1,7 @@
-"""AgBh ring-based beam-centre / distance calibration.
+"""Calibrant ring-based beam-centre / distance calibration.
 
 The math layer is pure numpy/xarray and knows nothing about Bokeh or Panel.
-Phase 1 fits a *single* AgBh ring per detector:
+The single-ring workflow fits one calibrant reflection per detector:
 
 1. ``fit_ring_peaks`` slices the supplied ``q-vs-chi`` map inside a
    ``(q_min, q_max, chi_min, chi_max)`` window and fits a Gaussian-on-poly
@@ -435,7 +435,7 @@ def q_offset_to_pixel_delta(
 
 @dataclass(frozen=True)
 class MultiRingResult:
-    """Joint beam-offset + distance from fitting multiple AgBh rings.
+    """Joint beam-offset + distance from fitting multiple calibrant rings.
 
     The model fits ``q_n(chi) = q0_n + A_r * sin(chi) + A_c * cos(chi)``
     with a *shared* ``(A_r, A_c)`` across all rings.  The per-ring q0
@@ -461,6 +461,7 @@ def fit_multi_ring(
     qchi,
     *,
     orders: Sequence[int],
+    expected_q: dict[int, float] | None = None,
     chi_min: float = -180.0,
     chi_max: float = 180.0,
     q_half_width: float = 0.15,
@@ -471,10 +472,12 @@ def fit_multi_ring(
     min_rings: int = 2,
     min_chi_per_ring: int = 8,
 ) -> MultiRingResult:
-    """Fit multiple AgBh rings simultaneously for joint beam-offset + distance.
+    """Fit multiple calibrant rings for joint beam-offset + distance.
 
-    For each ring order in ``orders``, the corresponding q-window is
-    ``[n*q1 - q_half_width, n*q1 + q_half_width]``.  Per-chi Gaussian
+    For each peak index in ``orders``, the corresponding q-window is
+    ``[expected_q[n] - q_half_width, expected_q[n] + q_half_width]``.
+    Without an explicit mapping, expected_q[n] is the AgBh harmonic n*q1.
+    Per-chi Gaussian
     peaks are fit independently per ring via :func:`fit_ring_peaks`, then
     a joint linear least-squares solves for the shared beam-offset
     ``(A_r, A_c)`` and per-ring intercepts ``q0_n``.
@@ -485,7 +488,10 @@ def fit_multi_ring(
         Dataset/DataArray with ``intensity(q, chi)`` covering the full q
         range needed for all requested rings.
     orders
-        Which AgBh ring orders to fit (e.g. ``[1, 2, 3, 4]`` for SAXS).
+        One-based peak indices to fit (harmonic orders for lamellar standards).
+    expected_q
+        Mapping from peak index to expected q in nm⁻¹. If omitted, uses AgBh
+        harmonics for backward compatibility. Explicit peaks need not be harmonic.
     chi_min, chi_max
         Azimuthal window (degrees).
     q_half_width
@@ -506,10 +512,17 @@ def fit_multi_ring(
     """
     if len(orders) < 1:
         raise ValueError("Must specify at least one ring order")
+    if len(set(orders)) != len(orders):
+        raise ValueError("Peak indices must be unique")
+    if expected_q is None:
+        expected_q = {n: agbh_q(n) for n in orders}
+    if any(n not in expected_q or not np.isfinite(expected_q[n]) or expected_q[n] <= 0
+           for n in orders):
+        raise ValueError("Every selected peak needs a finite positive expected q")
 
     peak_fits: dict[int, PeakFitResult] = {}
     for n in orders:
-        q_centre = agbh_q(n)
+        q_centre = expected_q[n]
         q_min = q_centre - q_half_width
         q_max = q_centre + q_half_width
         try:
@@ -579,7 +592,7 @@ def fit_multi_ring(
 
     # Distance ratio: weighted mean of q0_n / q_expected_n
     # Weight by number of accepted chi slices per ring.
-    ratios = np.array([q0_vals[i] / agbh_q(n) for i, n in enumerate(ring_order_list)])
+    ratios = np.array([q0_vals[i] / expected_q[n] for i, n in enumerate(ring_order_list)])
     weights = np.array([peak_fits[n].n_accepted for n in ring_order_list], dtype=float)
     dist_ratio = float(np.average(ratios, weights=weights))
 

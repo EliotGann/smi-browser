@@ -3998,7 +3998,7 @@ w_card_waxs_mask_adv = pn.Card(
 
 
 # ---------------------------------------------------------------------------
-# Calibrate — AgBh ring fit → beam-centre / distance deltas
+# Calibrate — reference ring fit → beam-centre / distance deltas
 # ---------------------------------------------------------------------------
 #
 # Two cards (SAXS, WAXS) live inside the Process → Results sub-tab next to
@@ -4013,15 +4013,15 @@ w_card_waxs_mask_adv = pn.Card(
 # widget wiring and the overlay on the q-χ figure.
 
 from smi_browser.calibrate import (
-    AGBH_Q1_NM,
-    agbh_q,
     fit_beam_offset_qspace,
     fit_multi_ring,
     fit_ring_peaks,
-    nearest_agbh_order,
     q_offset_to_pixel_delta,
     q_offset_to_pixel_delta_multi,
 )
+from smi_browser.calibrants import load_calibrants
+
+_CALIBRANTS = load_calibrants()
 
 
 def _make_calibrate_widgets(
@@ -4038,11 +4038,16 @@ def _make_calibrate_widgets(
     pick_btn, status, result``.
     """
     label = detector.upper()
-    q_default = agbh_q(default_ring_order)
-    ring = pn.widgets.IntInput(
-        name="AgBh ring order", value=default_ring_order,
-        start=1, end=9, width=110,
-        description="Which AgBh order to fit (1-9).",
+    standard = _CALIBRANTS["silver_behenate"]
+    default_ring_order = min(default_ring_order, len(standard.q_nm))
+    q_default = standard.q(default_ring_order)
+    calibrant = pn.widgets.Select(
+        name="Calibrant", options={c.name: key for key, c in _CALIBRANTS.items()},
+        value="silver_behenate", sizing_mode="stretch_width",
+    )
+    ring = pn.widgets.Select(
+        name="Reflection / order", value=default_ring_order,
+        options=standard.options(), sizing_mode="stretch_width",
     )
     q_min = pn.widgets.FloatInput(
         name="q min (nm⁻¹)", value=round(q_default - 0.15, 3),
@@ -4098,16 +4103,13 @@ def _make_calibrate_widgets(
     result = pn.pane.Markdown("")
 
     # Multi-ring widgets
-    multi_start = pn.widgets.IntInput(
-        name="Orders from", value=default_ring_order - 2 if default_ring_order > 2 else 1,
-        start=1, end=9, width=90,
-    )
-    multi_end = pn.widgets.IntInput(
-        name="Orders to", value=default_ring_order + 2 if default_ring_order < 8 else 9,
-        start=1, end=9, width=90,
+    multi_peaks = pn.widgets.MultiChoice(
+        name="Reflections / orders to fit", options=standard.options(),
+        value=list(range(max(1, default_ring_order - 2), min(len(standard.q_nm), default_ring_order + 2) + 1)),
+        sizing_mode="stretch_width",
     )
     multi_q_half = pn.widgets.FloatInput(
-        name="q half-width", value=0.15, step=0.01, start=0.02, width=100,
+        name="q half-width (nm⁻¹)", value=0.15, step=0.01, start=0.02, sizing_mode="stretch_width",
         description="Half-width of q-window around each ring centre.",
     )
     multi_fit_btn = pn.widgets.Button(
@@ -4123,6 +4125,8 @@ def _make_calibrate_widgets(
     return {
         "detector": detector,
         "expose_distance": expose_distance,
+        "calibrant": calibrant,
+        "updating": False,
         "ring": ring,
         "q_min": q_min,
         "q_max": q_max,
@@ -4140,8 +4144,7 @@ def _make_calibrate_widgets(
         "status": status,
         "result": result,
         # Multi-ring
-        "multi_start": multi_start,
-        "multi_end": multi_end,
+        "multi_peaks": multi_peaks,
         "multi_q_half": multi_q_half,
         "multi_fit_btn": multi_fit_btn,
         "multi_apply_btn": multi_apply_btn,
@@ -4194,22 +4197,51 @@ def _calibrate_geometry_for(slot) -> tuple[float, float, float]:
 
 
 def _on_calibrate_ring_change(slot):
-    """When the ring-order widget moves, auto-update default q window."""
+    """Re-centre the window around the chosen standard's reflection."""
     def _cb(event):
-        n = int(event.new)
-        q_centre = agbh_q(n)
-        # Only re-centre if window currently looks "default-ish".
-        cur_centre = (slot["q_min"].value + slot["q_max"].value) / 2.0
+        if slot["updating"]:
+            return
+        q_centre = _CALIBRANTS[slot["calibrant"].value].q(int(event.new))
         cur_width = slot["q_max"].value - slot["q_min"].value
-        if cur_width <= 0 or abs(cur_centre - agbh_q(max(1, n - 0))) > cur_width:
-            half = max(cur_width / 2.0, 0.10)
-            slot["q_min"].value = round(q_centre - half, 3)
-            slot["q_max"].value = round(q_centre + half, 3)
+        half = max(cur_width / 2.0, 0.10)
+        slot["q_min"].value = round(q_centre - half, 3)
+        slot["q_max"].value = round(q_centre + half, 3)
+        _invalidate_calibrate_fit(slot)
+    return _cb
+
+
+def _invalidate_calibrate_fit(slot):
+    slot["last_fit_px"] = slot["last_multi_fit_px"] = None
+    slot["apply_btn"].disabled = slot["multi_apply_btn"].disabled = True
+    slot["result"].object = slot["multi_result"].object = ""
+
+
+def _on_calibrant_change(slot):
+    def _cb(event):
+        standard = _CALIBRANTS[event.new]
+        slot["updating"] = True
+        try:
+            slot["ring"].options = standard.options()
+            slot["ring"].value = 1
+            slot["multi_peaks"].options = standard.options()
+            slot["multi_peaks"].value = list(range(1, len(standard.q_nm) + 1))
+        finally:
+            slot["updating"] = False
+        half = float(slot["multi_q_half"].value)
+        slot["q_min"].value = round(standard.q(1) - half, 3)
+        slot["q_max"].value = round(standard.q(1) + half, 3)
+        slot["pick_btn"].value = False
+        _invalidate_calibrate_fit(slot)
+        slot["status"].object = f"*{standard.name} selected — choose a reflection and fit again.*"
+        slot["multi_status"].object = ""
     return _cb
 
 
 _CAL_SAXS["ring"].param.watch(_on_calibrate_ring_change(_CAL_SAXS), "value")
 _CAL_WAXS["ring"].param.watch(_on_calibrate_ring_change(_CAL_WAXS), "value")
+for _slot in (_CAL_SAXS, _CAL_WAXS):
+    _slot["calibrant"].param.watch(_on_calibrant_change(_slot), "value")
+    _slot["multi_peaks"].param.watch(lambda _, slot=_slot: _invalidate_calibrate_fit(slot), "value")
 
 
 def _current_qchi_for_detector(detector: str):
@@ -4290,7 +4322,8 @@ def _on_calibrate_fit(slot):
             slot["apply_btn"].disabled = True
             return
 
-        ring_q = agbh_q(int(slot["ring"].value))
+        standard = _CALIBRANTS[slot["calibrant"].value]
+        ring_q = standard.q(int(slot["ring"].value))
         try:
             fit_q = fit_beam_offset_qspace(
                 pf.chi_deg, pf.q_peak, ring_q_expected=ring_q,
@@ -4313,7 +4346,8 @@ def _on_calibrate_fit(slot):
 
         slot["last_fit_px"] = fit_px
         slot["status"].object = (
-            f"*Fit OK — {pf.n_accepted}/{pf.n_total} χ slices.  "
+            f"*{standard.name}, {standard.labels[int(slot['ring'].value) - 1]}: "
+            f"fit OK — {pf.n_accepted}/{pf.n_total} χ slices.  "
             f"Click **↪ Apply to Process** to add the Δ values to the "
             f"Process-tab widgets, then re-Process.*"
         )
@@ -4377,7 +4411,7 @@ def _on_calibrate_reset(slot):
     return _cb
 
 
-def _format_multi_ring_result(fit, expose_distance: bool) -> str:
+def _format_multi_ring_result(fit, expose_distance: bool, standard=None) -> str:
     """Markdown summary for multi-ring fit results."""
     parts = [
         f"**Δrow = {fit.drow_px:+.2f} px**",
@@ -4385,10 +4419,12 @@ def _format_multi_ring_result(fit, expose_distance: bool) -> str:
     ]
     if expose_distance and fit.ddist_mm is not None:
         parts.append(f"**Δdist = {fit.ddist_mm:+.2f} mm**")
-    parts.append(f"rings used: {list(fit.orders)}")
+    labels = [standard.labels[n - 1] if standard else str(n) for n in fit.orders]
+    parts.append(f"reflections used: {', '.join(labels)}")
     parts.append(f"dist ratio = {fit.dist_ratio:.5f}")
     for n in fit.orders:
-        parts.append(f"  ring {n}: q₀={fit.q0_per_ring[n]:.4f} nm⁻¹, "
+        label = standard.labels[n - 1] if standard else f"ring {n}"
+        parts.append(f"  {label}: q₀={fit.q0_per_ring[n]:.4f} nm⁻¹, "
                      f"n_χ={fit.n_per_ring[n]}")
     parts.append(f"rms = {fit.rms:.4f} nm⁻¹")
     parts.append(f"total χ slices = {fit.n_total}")
@@ -4408,16 +4444,16 @@ def _on_multi_ring_fit(slot):
             slot["multi_apply_btn"].disabled = True
             return
 
-        start = int(slot["multi_start"].value)
-        end = int(slot["multi_end"].value)
-        if start > end:
-            start, end = end, start
-        orders = list(range(start, end + 1))
+        standard = _CALIBRANTS[slot["calibrant"].value]
+        orders = sorted(slot["multi_peaks"].value)
 
         try:
+            if len(orders) < 2:
+                raise ValueError("Select at least two reflections for a multi-ring fit.")
             result = fit_multi_ring(
                 qchi,
                 orders=orders,
+                expected_q={n: standard.q(n) for n in orders},
                 chi_min=float(slot["chi_min"].value),
                 chi_max=float(slot["chi_max"].value),
                 q_half_width=float(slot["multi_q_half"].value),
@@ -4450,12 +4486,12 @@ def _on_multi_ring_fit(slot):
 
         slot["last_multi_fit_px"] = result_px
         slot["multi_status"].object = (
-            f"*Multi-ring fit OK — {len(result_px.orders)} rings, "
+            f"*{standard.name} multi-ring fit OK — {len(result_px.orders)} rings, "
             f"{result_px.n_total} total χ slices.  "
             f"Click **↪ Apply multi to Process** to add deltas.*"
         )
         slot["multi_result"].object = _format_multi_ring_result(
-            result_px, expose_distance=slot["expose_distance"],
+            result_px, expose_distance=slot["expose_distance"], standard=standard,
         )
         slot["multi_apply_btn"].disabled = False
         _draw_multi_ring_overlay(result_px)
@@ -4537,16 +4573,23 @@ def _on_qchi_tap(event):
         return
     q_low, q_high = sorted([state["first_q"], q_clicked])
     state["first_q"] = None
+    # Snap only within the selected standard, preserving the user-drawn window.
+    standard = _CALIBRANTS[slot["calibrant"].value]
+    n = standard.nearest((q_low + q_high) / 2.0)
+    slot["updating"] = True
+    try:
+        slot["ring"].value = n
+    finally:
+        slot["updating"] = False
     slot["q_min"].value = round(q_low, 3)
     slot["q_max"].value = round(q_high, 3)
-    # Auto-snap ring order.
-    n = nearest_agbh_order((q_low + q_high) / 2.0)
-    slot["ring"].value = n
+    _invalidate_calibrate_fit(slot)
     slot["pick_btn"].value = False  # arms off
     _draw_pick_lines([q_low, q_high])
     slot["status"].object = (
         f"*Picked q ∈ [{q_low:.3f}, {q_high:.3f}] nm⁻¹.  "
-        f"Auto-snapped to AgBh ring {n} (expected q={agbh_q(n):.3f}).  "
+        f"Auto-snapped to {standard.name}, {standard.labels[n - 1]} "
+        f"(expected q={standard.q(n):.3f} nm⁻¹).  "
         f"Click **Fit {det.upper()} ring** to fit.*"
     )
 
@@ -4687,16 +4730,16 @@ for _slot in (_CAL_SAXS, _CAL_WAXS):
 def _build_calibrate_panel(slot):
     """Lay out one detector's calibrate panel for inclusion in pn.Tabs."""
     label = slot["detector"].upper()
-    geo_row = pn.Row(
-        slot["energy"], slot["dist"], slot["pixel"],
+    geo_row = pn.Column(
+        pn.Row(slot["energy"], slot["dist"]), slot["pixel"],
     )
-    fit_row_1 = pn.Row(slot["ring"], slot["q_min"], slot["q_max"])
-    fit_row_2 = pn.Row(slot["chi_min"], slot["chi_max"], slot["snr"], slot["bg_order"])
+    fit_row_1 = pn.Column(slot["ring"], pn.Row(slot["q_min"], slot["q_max"]))
+    fit_row_2 = pn.Column(pn.Row(slot["chi_min"], slot["chi_max"]), pn.Row(slot["snr"], slot["bg_order"]))
     btn_row = pn.Row(slot["pick_btn"], slot["fit_btn"])
     btn_row_2 = pn.Row(slot["apply_btn"], slot["reset_btn"])
     # Multi-ring section
-    multi_row = pn.Row(
-        slot["multi_start"], slot["multi_end"], slot["multi_q_half"],
+    multi_row = pn.Column(
+        slot["multi_peaks"], slot["multi_q_half"],
     )
     multi_btn_row = pn.Row(slot["multi_fit_btn"], slot["multi_apply_btn"])
     expose = slot["expose_distance"]
@@ -4707,7 +4750,7 @@ def _build_calibrate_panel(slot):
     )
     return pn.Column(
         pn.pane.Markdown(
-            f"**{label} AgBh ring calibration.**  Choose a ring (or click "
+            f"**{label} ring calibration.**  Choose a calibrant and reflection (or click "
             f"twice on the q-χ map above), then **Fit {label} ring** to "
             f"recover the beam-centre offset"
             + (" and distance error" if expose else "")
@@ -4715,6 +4758,7 @@ def _build_calibrate_panel(slot):
             "re-Process and re-fit to verify."
             + extra_md,
         ),
+        slot["calibrant"],
         pn.pane.Markdown("**Detector geometry** *(used to convert q-shift → "
                          "pixels and distance)*"),
         geo_row,
@@ -4727,7 +4771,7 @@ def _build_calibrate_panel(slot):
         slot["result"],
         pn.layout.Divider(),
         pn.pane.Markdown(
-            f"**Multi-ring fit** — fit orders simultaneously for joint "
+            f"**Multi-ring fit** — fit selected reflections simultaneously for joint "
             f"beam-offset + distance (uses shared χ window, SNR, bg order "
             f"from above)."
         ),

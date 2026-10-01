@@ -31,6 +31,8 @@ Built with [Panel](https://panel.holoviz.org/) and
 - **Process** — Transmission and grazing-incidence reduction via
   smi-tiled (`reduce_smi_combined`, `reduce_smi_gi`).
   Produces 2D q-chi / qxy-qz maps and merged I(q) curves.
+  **Calibrate SAXS / WAXS** support silver behenate and gold (111/200), with an
+  [extensible calibrant list](docs/calibrants.md) for lamellar or arbitrary peaks.
 - **Scan Collection** — Add processed scans for side-by-side I(q) comparison.
 
 ## Quickstart

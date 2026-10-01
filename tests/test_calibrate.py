@@ -491,3 +491,29 @@ def test_fit_multi_ring_waxs_convention():
     )
     assert result_px.drow_px == pytest.approx(drow_true, abs=0.3)
     assert result_px.dcol_px == pytest.approx(dcol_true, abs=0.3)
+
+
+def test_gold_nonharmonic_multi_ring_fit():
+    from smi_browser.calibrants import load_calibrants
+    gold = load_calibrants()["gold"]
+    expected = {n: gold.q(n) for n in (1, 2)}
+    q = np.linspace(26.2, 31.3, 1600)
+    chi = np.linspace(-180, 180, 48)
+    ratio, ar, ac = 1.002, .025, -.018
+    intensity = np.full((len(q), len(chi)), 5.)
+    for centre in expected.values():
+        mu = centre * ratio + ar * np.sin(np.deg2rad(chi)) + ac * np.cos(np.deg2rad(chi))
+        intensity += 100 * np.exp(-.5 * ((q[:, None] - mu) / .025) ** 2)
+    ds = xr.Dataset({"intensity": (("q", "chi"), intensity)}, coords={"q": q, "chi": chi})
+    fit = fit_multi_ring(ds, orders=[1, 2], expected_q=expected, q_half_width=.25)
+    assert fit.orders == (1, 2)
+    assert fit.A_r == pytest.approx(ar, abs=1e-5)
+    assert fit.A_c == pytest.approx(ac, abs=1e-5)
+    assert fit.dist_ratio == pytest.approx(ratio, abs=1e-5)
+    assert fit.q0_per_ring[2] == pytest.approx(30.81 * ratio, abs=1e-5)
+
+
+@pytest.mark.parametrize("expected", [{1: 26.68}, {1: 26.68, 2: -1}, {1: 26.68, 2: np.nan}])
+def test_multi_ring_rejects_invalid_references(expected):
+    with pytest.raises(ValueError, match="expected q"):
+        fit_multi_ring(None, orders=[1, 2], expected_q=expected)
