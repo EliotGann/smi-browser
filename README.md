@@ -54,6 +54,29 @@ pixi run serve
 
 This opens the app at `http://localhost:5006/smi_app`.
 
+### Sign in to Tiled
+
+The app restores an existing Tiled session automatically. **Login** rechecks that
+session first; when it is valid, no code is required. Otherwise, copy the displayed
+code and click **Open Microsoft sign-in**.
+Enter the code in the new tab and complete your Microsoft/BNL sign-in, including
+any requested MFA. Return to SMI Browser; it detects approval automatically and
+reloads proposals and scans. The app does not collect your password.
+
+The link opens on your computer even when Panel runs on a remote machine.
+Use **Cancel sign-in** to stop waiting, or click **Login** again if the code
+expires or sign-in is declined. Existing password-era tokens may require a new
+login. Tokens are saved in Tiled's normal local token cache, so subsequent app
+sessions and smi-tiled processing can reconnect and refresh automatically.
+**Logout** clears the locally cached Tiled session; it does not sign your browser
+out of Microsoft or other Microsoft applications.
+
+**Use device code** bypasses the cached-session check when you need to sign in
+again or switch accounts. A Microsoft session in another browser tab alone cannot
+currently replace the code: the server's browser authorization endpoint forces
+login and returns to Tiled, not this app. See [browser SSO requirements](docs/browser_sso.md)
+for the server/Entra configuration needed for a code-free browser login.
+
 ### Configuration
 
 The Tiled catalog URI defaults to `https://tiled.nsls2.bnl.gov` and the

@@ -12680,179 +12680,46 @@ _live: dict[str, Any] = {
 # refreshed credentials.
 
 def _tiled_whoami() -> str | None:
-    """Return the username for the currently cached tiled session, or None."""
-    try:
-        from tiled.client.context import Context
-
-        context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
-        if not context.use_cached_tokens():
-            return None
-        info = context.whoami()
-    except Exception:
-        return None
-    if not info:
-        return None
-    identities = info.get("identities") or []
-    for ident in identities:
-        if ident.get("id"):
-            return str(ident["id"])
-    return None
+    from smi_browser.auth import tiled_whoami
+    return tiled_whoami(DEFAULT_TILED_URI)
 
 
-def _tiled_login(username: str, password: str) -> str:
-    """Authenticate against tiled with username/password.
-
-    Returns the logged-in username on success; raises on failure.
-    """
-    from tiled.client.context import Context, password_grant
-
-    if not username or not password:
-        raise ValueError("Username and password are required.")
-
-    context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
-    providers = context.server_info.authentication.providers
-    if not providers:
-        raise RuntimeError("Tiled server reports no authentication providers.")
-    spec = providers[0]
-    auth_endpoint = spec.links["auth_endpoint"]
-    tokens = password_grant(
-        context.http_client, auth_endpoint, spec.provider, username, password,
-    )
-    context.configure_auth(tokens, remember_me=True)
-
-    # Drop the cached catalog so the next access uses the refreshed tokens.
+def _reset_auth_connection():
+    """Discard lazy nodes bound to the previous credentials as well as the root."""
     global _cat
+    if _live.get("active"):
+        _exit_live_mode()
     _cat = None
-
-    info = context.whoami()
-    identities = (info or {}).get("identities") or []
-    return identities[0]["id"] if identities else username
+    _reset_detail()
 
 
-def _tiled_logout() -> None:
-    """Clear the cached tiled session for this server."""
+def _on_auth_login(user):
+    _reset_auth_connection()
+    # Load proposals and scans using the refreshed standard Tiled token cache.
     try:
-        from tiled.client.context import Context
-
-        context, _ = Context.from_any_uri(DEFAULT_TILED_URI)
-        if context.use_cached_tokens():
-            try:
-                context.logout()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    finally:
-        global _cat
-        _cat = None
-
-
-w_login_status = pn.pane.Markdown("*checking…*", width=220)
-w_btn_login = pn.widgets.Button(
-    name="🔑 Login", button_type="primary", width=90,
-)
-w_btn_logout = pn.widgets.Button(
-    name="Logout", button_type="light", width=80, visible=False,
-)
-
-w_login_user = pn.widgets.TextInput(
-    name="Username", placeholder="bnl username", width=220,
-)
-w_login_pass = pn.widgets.PasswordInput(
-    name="Password", placeholder="password", width=220,
-)
-w_login_submit = pn.widgets.Button(
-    name="Sign in", button_type="success", width=90,
-)
-w_login_msg = pn.pane.Markdown("", width=220)
-w_login_form = pn.Column(
-    pn.pane.Markdown("**Tiled login**"),
-    w_login_user,
-    w_login_pass,
-    pn.pane.Alert(
-        "After signing in, check for Duo confirmation.",
-        alert_type="warning",
-        margin=(0, 0, 8, 0),
-    ),
-    pn.Row(w_login_submit),
-    w_login_msg,
-    visible=False,
-    width=260,
-    styles={
-        "background": "#f8f9fa",
-        "border": "1px solid #ced4da",
-        "border-radius": "6px",
-        "padding": "10px",
-    },
-)
-
-
-def _refresh_login_status():
-    user = _tiled_whoami()
-    if user:
-        w_login_status.object = f"🟢 **Logged in:** `{user}`"
-        w_btn_login.name = "🔄 Re-login"
-        w_btn_logout.visible = True
-    else:
-        w_login_status.object = "🔴 **Not logged in**"
-        w_btn_login.name = "🔑 Login"
-        w_btn_logout.visible = False
-
-
-def _toggle_login_form(event=None):
-    w_login_form.visible = not w_login_form.visible
-    if w_login_form.visible:
-        w_login_msg.object = ""
-        w_login_pass.value = ""
-
-
-def _on_login_submit(event=None):
-    user_in = (w_login_user.value or "").strip()
-    pwd = w_login_pass.value or ""
-    w_login_msg.object = "*signing in... check Duo confirmation prompt*"
-    w_login_submit.disabled = True
-    try:
-        user = _tiled_login(user_in, pwd)
-        w_login_msg.object = f"✅ Signed in as `{user}`"
-        w_login_pass.value = ""
-        w_login_form.visible = False
-        _refresh_login_status()
-        # Load proposals for the newly logged-in user
         _refresh_proposals(w_proposal_cycle.value)
-        # Trigger a search now that we have credentials
-        try:
-            _do_search(page=0)
-        except Exception:
-            pass
-        try:
-            pn.state.notifications.success(f"Tiled login OK ({user})")
-        except Exception:
-            pass
+        _do_search(page=0)
     except Exception as exc:
-        w_login_msg.object = f"❌ {type(exc).__name__}: {exc}"
-    finally:
-        w_login_submit.disabled = False
+        log.warning("Post-login refresh failed: %s", type(exc).__name__)
+        w_status.object = "**Signed in** — refresh proposals or press Search to retry loading data."
 
 
-def _on_logout(event=None):
-    _tiled_logout()
-    _refresh_login_status()
-    # Clear proposals on logout
+def _on_auth_logout():
+    _reset_auth_connection()
     w_proposal_select.options = ["(log in first)"]
     w_proposal_select.value = "(log in first)"
     w_proposal_status.object = ""
-    try:
-        pn.state.notifications.info("Logged out of tiled.")
-    except Exception:
-        pass
+    w_status.object = "**Logged out** — use Login to sign in with Microsoft."
 
 
-w_btn_login.on_click(_toggle_login_form)
-w_login_submit.on_click(_on_login_submit)
-# PasswordInput commits `value` on Enter. Mirror that to button clicks so
-# pressing Enter in the password field submits just like clicking Sign in.
-w_login_pass.jscallback(args={"submit": w_login_submit}, value="submit.clicks += 1")
-w_btn_logout.on_click(_on_logout)
+from smi_browser.ui.auth import AuthControls
+
+_auth_controls = AuthControls(DEFAULT_TILED_URI, _on_auth_login, _on_auth_logout)
+w_login_status = _auth_controls.status
+w_btn_login = _auth_controls.login
+w_btn_logout = _auth_controls.logout
+w_login_form = _auth_controls.form
+_refresh_login_status = _auth_controls.refresh
 
 
 w_btn_live = pn.widgets.Toggle(

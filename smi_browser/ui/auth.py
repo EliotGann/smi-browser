@@ -1,187 +1,182 @@
-"""Authentication UI — tiled login/logout widgets and callbacks."""
-
+"""Per-session Panel controls for Microsoft/Tiled device-code sign-in."""
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING
+from concurrent.futures import CancelledError
+from html import escape
+import queue
+import threading
 
 import panel as pn
 
-if TYPE_CHECKING:
-    from smi_browser.state import AppState
-
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Pure helpers (no widget access)
-# ---------------------------------------------------------------------------
+from smi_browser.auth import begin_login, poll_login, remember_login, tiled_logout, tiled_whoami
 
 
-def tiled_whoami(tiled_uri: str) -> str | None:
-    """Return the username for the currently cached tiled session, or None."""
-    try:
-        from tiled.client.context import Context
+class AuthControls:
+    def __init__(self, uri, on_login, on_logout):
+        self.uri, self.on_login, self.on_logout = uri, on_login, on_logout
+        self.attempt = None
+        self.status = pn.pane.Markdown("*checking…*", width=220)
+        self.login = pn.widgets.Button(name="Login", button_type="primary", width=100)
+        self.logout = pn.widgets.Button(name="Logout", width=80, visible=False)
+        self.cancel = pn.widgets.Button(name="Cancel sign-in", width=140)
+        self.instructions = pn.pane.HTML("", sizing_mode="stretch_width")
+        self.message = pn.pane.Markdown("", sizing_mode="stretch_width")
+        self.device_login = pn.widgets.Button(name="Use device code", width=150)
+        self.form = pn.Column(
+            pn.pane.Markdown("**Microsoft sign-in for Tiled**"),
+            self.instructions, self.message, pn.Row(self.device_login, self.cancel),
+            visible=False, width=380,
+            styles={"background": "#F2F5F7", "border": "1px solid #C0C0C0", "padding": "10px"},
+        )
+        self.login.on_click(self.start)
+        self.device_login.on_click(lambda _: self.start(force_device=True))
+        self.cancel.on_click(self.cancel_login)
+        self.logout.on_click(self.sign_out)
 
-        context, _ = Context.from_any_uri(tiled_uri)
-        if not context.use_cached_tokens():
-            return None
-        info = context.whoami()
-    except Exception:
-        return None
-    if not info:
-        return None
-    identities = info.get("identities") or []
-    for ident in identities:
-        if ident.get("id"):
-            return str(ident["id"])
-    return None
+    def refresh(self, user=None):
+        user = user or tiled_whoami(self.uri)
+        self.status.object = f"**Logged in:** {escape(user)}" if user else "**Not logged in**"
+        self.login.name = "Re-login" if user else "Login"
+        self.logout.visible = bool(user)
 
+    def cancel_login(self, _=None):
+        job, self.attempt = self.attempt, None
+        if job:
+            job["cancel"].set()
+            job["timer"].stop()
+            # A completed worker may have transferred its context to the queue.
+            # Serialize this drain with publication so no context is stranded.
+            with job["lock"]:
+                while not job["events"].empty():
+                    kind, value = job["events"].get_nowait()
+                    if kind == "success":
+                        value[0].close()
+        self.login.disabled = False
+        self.device_login.disabled = False
+        self.cancel.visible = False
+        self.instructions.object = ""
+        self.message.object = "Sign-in cancelled. Click Login to start again."
 
-def tiled_login(tiled_uri: str, username: str, password: str) -> str:
-    """Authenticate against tiled with username/password.
+    def start(self, _=None, *, force_device=False):
+        if self.attempt:
+            return
+        if pn.state.curdoc is None:
+            self.form.visible = True
+            self.message.object = "Open the served Panel app to sign in."
+            return
+        job = {"cancel": threading.Event(), "events": queue.Queue(), "lock": threading.Lock()}
+        self.attempt = job
+        self.form.visible = True
+        self.instructions.object = ""
+        self.message.object = ("*Requesting a Microsoft sign-in code…*" if force_device
+                               else "*Checking the existing Tiled session…*")
+        self.login.disabled = True
+        self.device_login.disabled = True
+        self.cancel.visible = True
 
-    Returns the logged-in username on success; raises on failure.
-    """
-    from tiled.client.context import Context, password_grant
+        def publish(kind, value):
+            with job["lock"]:
+                if job["cancel"].is_set():
+                    return False
+                job["events"].put((kind, value))
+                return True
 
-    if not username or not password:
-        raise ValueError("Username and password are required.")
-
-    context, _ = Context.from_any_uri(tiled_uri)
-    providers = context.server_info.authentication.providers
-    if not providers:
-        raise RuntimeError("Tiled server reports no authentication providers.")
-    spec = providers[0]
-    auth_endpoint = spec.links["auth_endpoint"]
-    tokens = password_grant(
-        context.http_client, auth_endpoint, spec.provider, username, password,
-    )
-    context.configure_auth(tokens, remember_me=True)
-
-    info = context.whoami()
-    identities = (info or {}).get("identities") or []
-    return identities[0]["id"] if identities else username
-
-
-def tiled_logout(tiled_uri: str) -> None:
-    """Clear the cached tiled session for this server."""
-    try:
-        from tiled.client.context import Context
-
-        context, _ = Context.from_any_uri(tiled_uri)
-        if context.use_cached_tokens():
+        def worker():
+            login = None
             try:
-                context.logout()
-            except Exception:
+                if not force_device:
+                    user = tiled_whoami(self.uri)
+                    if job["cancel"].is_set():
+                        return
+                    if user:
+                        publish("cached", user)
+                        return
+                login = begin_login(self.uri)
+                if not publish("code", (login.verification_uri, login.user_code, login.expires_in)):
+                    return
+                tokens, user = poll_login(login, job["cancel"])
+                if publish("success", (login, tokens, user)):
+                    login = None  # the document callback now owns cleanup
+            except CancelledError:
                 pass
-    except Exception:
-        pass
+            except Exception as exc:
+                # HTTP errors may contain credential-bearing URLs/bodies.
+                from smi_browser.auth import LoginError
+                text = str(exc) if isinstance(exc, LoginError) else "Could not complete sign-in. Check the connection and try Login again."
+                publish("error", text)
+            finally:
+                if login is not None:
+                    login.close()
 
+        job["timer"] = pn.state.add_periodic_callback(lambda: self._drain(job), period=200)
+        pn.state.curdoc.on_session_destroyed(lambda _: self.cancel_login() if self.attempt is job else None)
+        threading.Thread(target=worker, daemon=True, name="tiled-login").start()
 
-# ---------------------------------------------------------------------------
-# Widgets
-# ---------------------------------------------------------------------------
-
-login_status = pn.pane.Markdown("*checking…*", width=220)
-btn_login = pn.widgets.Button(
-    name="🔑 Login", button_type="primary", width=90,
-)
-btn_logout = pn.widgets.Button(
-    name="Logout", button_type="light", width=80, visible=False,
-)
-login_user = pn.widgets.TextInput(
-    name="Username", placeholder="bnl username", width=220,
-)
-login_pass = pn.widgets.PasswordInput(
-    name="Password", placeholder="password", width=220,
-)
-login_submit = pn.widgets.Button(
-    name="Sign in", button_type="success", width=90,
-)
-login_msg = pn.pane.Markdown("", width=220)
-login_form = pn.Column(
-    pn.pane.Markdown("**Tiled login**"),
-    login_user,
-    login_pass,
-    pn.pane.Alert(
-        "Check for Duo confirmation after signing in.",
-        alert_type="warning",
-        margin=(0, 0, 8, 0),
-    ),
-    pn.Row(login_submit),
-    login_msg,
-    visible=False,
-    width=260,
-    styles={
-        "background": "#f8f9fa",
-        "border": "1px solid #ced4da",
-        "border-radius": "6px",
-        "padding": "10px",
-    },
-)
-
-
-# ---------------------------------------------------------------------------
-# Wire callbacks
-# ---------------------------------------------------------------------------
-
-
-def wire(app: AppState, tiled_uri: str) -> None:
-    """Connect auth widgets to the app state."""
-
-    def _refresh_login_status():
-        user = tiled_whoami(tiled_uri)
-        if user:
-            login_status.object = f"🟢 **Logged in:** `{user}`"
-            btn_login.name = "🔄 Re-login"
-            btn_logout.visible = True
-        else:
-            login_status.object = "🔴 **Not logged in**"
-            btn_login.name = "🔑 Login"
-            btn_logout.visible = False
-
-    def _toggle_login_form(event=None):
-        login_form.visible = not login_form.visible
-        if login_form.visible:
-            login_msg.object = ""
-            login_pass.value = ""
-
-    def _on_login_submit(event=None):
-        user_in = (login_user.value or "").strip()
-        pwd = login_pass.value or ""
-        login_msg.object = "*signing in…*"
-        login_submit.disabled = True
-        try:
-            user = tiled_login(tiled_uri, user_in, pwd)
-            login_msg.object = f"✅ Signed in as `{user}`"
-            login_pass.value = ""
-            login_form.visible = False
-            app.cat = None  # force reconnect with new credentials
-            _refresh_login_status()
+    def _drain(self, job):
+        """Panel periodic callbacks hold the document lock; workers only queue data."""
+        if self.attempt is not job:
+            return
+        while not job["events"].empty():
+            kind, value = job["events"].get_nowait()
+            if kind == "code":
+                uri, code, expires = value
+                self.instructions.object = (
+                    f'<p>Enter this code: <strong style="font-size:1.5em">{escape(code)}</strong></p>'
+                    f'<p><a href="{escape(uri, quote=True)}" target="_blank" rel="noopener noreferrer" '
+                    'style="color:#105C78">Open Microsoft sign-in</a></p>'
+                    '<p>Complete sign-in in the new tab, then return here. '
+                    'No password is entered in SMI Browser.</p>'
+                )
+                self.message.object = f"*Waiting for approval (code valid for {expires / 60:.0f} minutes)…*"
+                continue
+            self.attempt = None
+            job["timer"].stop()
+            self.login.disabled = False
+            self.device_login.disabled = False
+            self.cancel.visible = False
+            self.instructions.object = ""
+            if kind == "error":
+                self.message.object = value
+                return
+            if kind == "cached":
+                self.refresh(value)
+                self.form.visible = True
+                self.message.object = ("**Existing Tiled session restored** — no code needed. "
+                                       "Use device code below if you need to sign in again or switch accounts.")
+                self.on_login(value)
+                return
+            login, tokens, user = value
             try:
-                pn.state.notifications.success(f"Tiled login OK ({user})")
+                remember_login(login, tokens)
             except Exception:
-                pass
-        except Exception as exc:
-            login_msg.object = f"❌ {type(exc).__name__}: {exc}"
-        finally:
-            login_submit.disabled = False
+                self.message.object = "Signed in, but could not save the Tiled session. Check token-cache permissions and retry."
+                return
+            finally:
+                login.close()
+            self.refresh(user)
+            self.form.visible = False
+            self.message.object = ""
+            self.on_login(user)
 
-    def _on_logout(event=None):
-        tiled_logout(tiled_uri)
-        app.cat = None
-        _refresh_login_status()
+    def sign_out(self, _=None):
+        self.cancel_login()
         try:
-            pn.state.notifications.info("Logged out of tiled.")
+            tiled_logout(self.uri)
         except Exception:
-            pass
+            self.form.visible = True
+            self.message.object = "Could not clear the Tiled session. Check the connection and retry Logout."
+            return
+        self.form.visible = False
+        self.status.object = "**Not logged in**"
+        self.login.name = "Login"
+        self.logout.visible = False
+        self.on_logout()
 
-    btn_login.on_click(_toggle_login_form)
-    login_submit.on_click(_on_login_submit)
-    # PasswordInput has no Enter-key event in Panel 1.8; value commits on Enter,
-    # so mirror that commit to the Sign in button click handler.
-    login_pass.jscallback(args={"submit": login_submit}, value="submit.clicks += 1")
-    btn_logout.on_click(_on_logout)
 
-    # Initial check
-    _refresh_login_status()
+def wire(app, tiled_uri):
+    """Construct controls for package consumers without sharing widget globals."""
+    def reset(*_):
+        app.cat = None
+    controls = AuthControls(tiled_uri, reset, reset)
+    controls.refresh()
+    return controls

@@ -110,9 +110,20 @@ def connect(uri: str = TILED_URI, catalog: str = CATALOG):
     tiled catalog node (lazy).
     """
     import httpx
-    from tiled.client import from_uri
+    from tiled.client.context import Context
+    from tiled.client.constructors import from_context
 
-    root = from_uri(uri, timeout=httpx.Timeout(60.0))
+    # Device login belongs in the user's browser, never a terminal or a browser
+    # launched on the Panel server. Only reconnect with existing credentials.
+    context, node_path_parts = Context.from_any_uri(uri, timeout=httpx.Timeout(60.0))
+    try:
+        if not context.api_key and context.server_info.authentication.providers:
+            context.use_cached_tokens()
+        context.has_external_auth = True
+        root = from_context(context, structure_clients="numpy", node_path_parts=node_path_parts)
+    except Exception:
+        context.close()
+        raise
     for part in catalog.split("/"):
         root = root[part]
     return root
