@@ -332,6 +332,59 @@ class ScanCache:
             stream = stream.replace("/", "_")
         return stream
 
+    # -- ROI definitions and derived scalars (separate from acquired data) --
+
+    def read_rois(self, stream: str) -> dict:
+        """Return latest ROI products by detector, scoped to the exact stream."""
+        import h5py
+        import json
+        import hashlib
+        path = "roi/" + hashlib.sha256(stream.encode()).hexdigest()
+        if not self.path.exists():
+            return {}
+        with self._lock:
+            try:
+                with h5py.File(self.path, "r") as f:
+                    if path not in f:
+                        return {}
+                    return {
+                        g.attrs["field"]: {
+                            "rois": json.loads(g.attrs["rois"]),
+                            "shape": json.loads(g.attrs["shape"]),
+                            "failed": json.loads(g.attrs["failed"]),
+                            "columns": {ds.attrs["name"]: ds[...] for ds in g.values()},
+                        }
+                        for g in f[path].values()
+                    }
+            except (OSError, ValueError, KeyError):
+                log.warning("Could not read ROI cache for %s", self.uid, exc_info=True)
+                return {}
+
+    def write_rois(self, stream: str, field: str, rois: list, shape,
+                   columns: dict, failed=()) -> None:
+        """Replace one detector's product; an edit writes empty columns.
+
+        Hash path components so detector/stream names containing slashes cannot
+        collide. Column names and ROI provenance are retained as metadata.
+        """
+        import h5py
+        import json
+        import hashlib
+        path = "roi/" + hashlib.sha256(stream.encode()).hexdigest()
+        key = hashlib.sha256(field.encode()).hexdigest()
+        with self._lock:
+            with h5py.File(self.path, "a") as f:
+                parent = f.require_group(path)
+                if key in parent:
+                    del parent[key]
+                g = parent.create_group(key)
+                g.attrs.update(field=field, stream=stream, rois=json.dumps(rois),
+                               shape=json.dumps(list(shape)), failed=json.dumps(list(failed)))
+                for i, (name, values) in enumerate(columns.items()):
+                    ds = g.create_dataset(str(i), data=values, compression="gzip")
+                    ds.attrs["name"] = name
+        _maybe_evict()
+
     # -- raw image stacks ---------------------------------------------
 
     def read_image_stack(self, field: str,

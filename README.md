@@ -17,7 +17,17 @@ Built with [Panel](https://panel.holoviz.org/) and
 - **Primary** — Scalar data table with configurable X/Y line plots.
 - **Baseline** — Before/after baseline readings with column filtering.
 - **Explore** — Side-by-side linked 1D plot and 2D detector image with a
-  synced frame cursor.
+  synced frame cursor. The **ROIs** sub-tab lets you draw/name multiple rectangles
+  and explicitly **Compute ROI scalars** across the selected detector's frames.
+  Sum, mean, population std, min, max and finite-pixel count appear in the existing
+  Scalars 1D/2D selectors and Primary table as `roi:detector:ROI:stat` columns.
+  Computation runs in the background with progress/cancellation, processes all
+  ROIs in one frame-by-frame pass, and reuses the stream-aware image cache.
+  Definitions/results persist in the scan cache; edits invalidate old results.
+  ROIs use displayed pixel coordinates and original values (independent of colour
+  scaling and mask overlays); nonfinite pixels are excluded and unreadable frames
+  are reported as NaN. Select one scan and a monochrome detector image; exit live
+  mode before computing. Cache persistence follows `SMI_BROWSER_CACHE_DIR`.
 - **Process** — Transmission and grazing-incidence reduction via
   smi-tiled (`reduce_smi_combined`, `reduce_smi_gi`).
   Produces 2D q-chi / qxy-qz maps and merged I(q) curves.

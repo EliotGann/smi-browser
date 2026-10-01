@@ -68,3 +68,32 @@ def test_populate_stream_select_hides_single_stream(monkeypatch):
     assert app._active_stream() == "primary"
     assert app.w_stream_select.visible is False
     assert app._primary_tab_name == "Primary"
+
+
+def test_roi_products_populate_existing_scalar_selectors(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import numpy as np
+    from smi_browser.cache import ScanCache
+
+    app = _import_smi_app(monkeypatch)
+    monkeypatch.setenv("SMI_BROWSER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_selected_uid", lambda: "roi-scan")
+    monkeypatch.setattr(app, "_selected_uids", lambda: ["roi-scan"])
+    monkeypatch.setattr(app, "_ensure_run", lambda: SimpleNamespace(metadata={"start": {}}))
+    monkeypatch.setattr(app.tb, "stream_names", lambda _: ["arc20"])
+    monkeypatch.setattr(app.tb, "stream_info_for", lambda *a: {"dataset": None})
+    monkeypatch.setattr(app.tb, "fetch_scalars", lambda *a, **kw: {"motor": np.arange(3)})
+    monkeypatch.setattr(app, "_refresh_export_labels", lambda: None)
+    monkeypatch.setattr(app, "_refresh_export_resolved_path", lambda: None)
+    app._detail_cache.update(stream="arc20", primary_loaded=False)
+    cache = ScanCache("roi-scan")
+    cache.write_rois("arc20", "det", [], (2, 2), {"ROI1:sum": [4, 8, 12]})
+    app._load_primary()
+    column = "roi:det:ROI1:sum"
+    for widget in (app.w_primary_y, app.w_explore_y, app.w_primary_2d_z, app.w_explore_2d_z):
+        assert column in widget.options
+    np.testing.assert_allclose(app.w_primary_table.value[column], [4, 8, 12])
+    cache.write_rois("arc20", "det", [], (2, 2), {})
+    app._refresh_roi_scalars("roi-scan", "arc20")
+    assert column not in app.w_explore_y.options
+    assert column not in app.w_primary_table.value

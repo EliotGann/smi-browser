@@ -52,6 +52,7 @@ from smi_browser import nsls2api
 from smi_browser import memlog
 from smi_browser.config import DEFAULT_CYCLE, RECENT_CYCLES
 from smi_browser.data.scalars import derive_virtual_columns
+from smi_browser.models.roi import merge_roi_scalars
 from smi_browser.figures.iq import iq_axis_label, scaled_iq_data
 from smi_browser.cache import (
     ScanCache, cache_path, get_or_fetch_scalars, get_or_fetch_image_frame,
@@ -119,6 +120,7 @@ _PD.set_from_json = _patched_set_from_json
 # UI modules must be imported AFTER pn.extension() so that Tabulator widgets
 # created inside wire() register the JS extension correctly.
 from smi_browser.ui import collection as _coll_mod
+from smi_browser.ui.roi import ROIControls
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -915,6 +917,7 @@ def _update_image_in_place(arr, title):
     # If the current frame is an RGB camera image, drive a dedicated
     # image_rgba figure rather than the scalar-with-colour-mapper path.
     if _is_rgb_frame(arr):
+        _roi_controls.deactivate()
         rgb_arr = np.asarray(arr)
         was_rgb = _image_cache.get("is_rgb", False)
         if fig is None or source is None or not was_rgb:
@@ -954,6 +957,7 @@ def _update_image_in_place(arr, title):
         _image_cache["mapper"] = mapper
         _image_cache["fig_image_shape"] = tuple(arr.shape)
         w_image_thumb.object = fig
+        _roi_controls.attach(fig, arr.shape)
         # Sync color-scale widgets to the initial mapper range; pass the
         # frame so the slider can be widened to the full data span.
         try:
@@ -1016,6 +1020,7 @@ def _update_image_in_place(arr, title):
     # Update image data (keeps zoom/pan state)
     source.data = dict(image=[display], x=[0], y=[0], dw=[w], dh=[h])
     fig.title.text = title
+    _roi_controls.attach(fig, arr.shape)
 
     # Rebuild histogram + refresh any line profile from new frame data
     try:
@@ -1560,6 +1565,45 @@ _image_cache = {"field": None, "n_frames": 0, "dataset": None, "fields": [],
                 "cs_suspend": False,
                 # Alignment / line tools
                 "line_source": None, "line_renderer": None, "line_draw_tool": None}
+
+
+def _roi_context():
+    """Snapshot all I/O state before launching a worker; never read widgets there."""
+    uid = _selected_uid()
+    field = _image_cache.get("field")
+    if (not uid or not field or len(_selected_uids()) != 1
+            or _image_cache.get("is_rgb") or _live.get("active")):
+        return None
+    run = _ensure_run()
+    if run is None:
+        return None
+    stream, n_frames = _active_stream(), _image_cache.get("n_frames", 0)
+    if n_frames < 1:
+        return None
+
+    def read_frame(i):
+        raw = get_or_fetch_image_frame(
+            uid, field, i, n_frames=n_frames, stream=stream,
+            fetch_one_fn=lambda j: tb.fetch_frame(run, stream, field, frame_idx=j),
+        )
+        raw = _coerce_to_2d_frame(raw)
+        return None if raw is None else _orient_frame(raw, field)
+
+    return dict(uid=uid, stream=stream, field=field, n_frames=n_frames, read_frame=read_frame)
+
+
+def _refresh_roi_scalars(uid, stream):
+    if uid != _selected_uid() or stream != _active_stream():
+        return
+    # This loads only scalars/metadata, never image arrays. Re-use the normal
+    # selector population so ROI columns participate in both 1D and 2D plots.
+    _detail_cache["primary_loaded"] = False
+    _load_primary()
+    _update_primary_plot()
+    _build_explore_plot()
+
+
+_roi_controls = ROIControls(_roi_context, _refresh_roi_scalars)
 
 
 # ----- Color scale helpers -----
@@ -2195,6 +2239,7 @@ def _on_image_field(event):
     field = event.new
     if not field or _image_cache.get("loading"):
         return
+    _roi_controls.deactivate()
     _image_cache["field"] = field
     # Reset persistent figure so a new one is created for the new detector
     # (different orientation / dimensions / mask).
@@ -7312,6 +7357,7 @@ def _on_reset(_event=None):
 
 
 def _reset_detail(preserve_figure=False):
+    _roi_controls.deactivate()
     w_detail_title.object = "### Select a scan"
     w_meta_json.object = {}
     w_primary_table.value = pd.DataFrame()
@@ -7450,6 +7496,7 @@ def _on_stream_select(event) -> None:
     new_stream = event.new or "primary"
     if new_stream == _detail_cache.get("stream"):
         return
+    _roi_controls.deactivate()
     _detail_cache["stream"] = new_stream
     # Force the scalar + image tabs to refetch for the new stream.
     _detail_cache["primary_loaded"] = False
@@ -7668,6 +7715,8 @@ def _load_primary():
     else:
         scalar_data = tb.fetch_scalars(run, stream, _dataset=ds)
     df = _scalars_to_dataframe(scalar_data)
+    if uid:
+        df = merge_roi_scalars(df, ScanCache(uid).read_rois(stream))
     dt_ms = (time.perf_counter() - t0) * 1000
     w_primary_table.value = df
     w_primary_spinner.value = False
@@ -8168,11 +8217,16 @@ def _render_explore_layout() -> None:
     if len(uids) <= 1:
         w_image_container.objects = [w_image_thumb]
         w_image_multi_hint.visible = False
+        fig = _image_cache.get("figure")
+        shape = _image_cache.get("fig_image_shape")
+        if fig is not None and shape and not _image_cache.get("is_rgb"):
+            _roi_controls.attach(fig, shape)
         return
 
+    _roi_controls.deactivate()
     w_image_multi_hint.object = (
         f"**{len(uids)} scans selected** — showing one frame per scan.  "
-        "Mask overlay, alignment and line-profile tools are single-scan only "
+        "ROI, mask overlay, alignment and line-profile tools are single-scan only "
         "and don't apply here; reduce the selection to one scan to re-enable them."
     )
     w_image_multi_hint.visible = True
@@ -8581,9 +8635,7 @@ def _get_primary_df_for(uid: str) -> pd.DataFrame | None:
     except Exception:
         log.exception("primary fetch failed for %s", uid[:8])
         return None
-    if not scalar_data:
-        return None
-    return _scalars_to_dataframe(scalar_data)
+    return merge_roi_scalars(_scalars_to_dataframe(scalar_data), ScanCache(uid).read_rois(stream))
 
 
 def _update_primary_plot(*_events, use_table_order: bool = False):
@@ -13996,6 +14048,7 @@ w_detail_tabs = pn.Tabs(
                         )),
                         sizing_mode="stretch_width",
                     )),
+                    ("ROIs", _roi_controls.panel),
                     ("🎨 Color scale", pn.Column(
                         w_cs_cmap,
                         pn.Row(w_cs_log, w_cs_lock),
